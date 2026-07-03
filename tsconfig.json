@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "rootDir": "."
+  },
+  "include": [
+    "main.ts",
+    "shared/**/*.ts",
+    "gateway/**/*.ts",
+    "auth-service/**/*.ts",
+    "trading-service/**/*.ts",
+    "execution-service/**/*.ts",
+    "market-data/**/*.ts",
+    "risk-service/**/*.ts",
+    "portfolio-service/**/*.ts",
+    "wallet-service/**/*.ts",
+    "compliance-engine/**/*.ts",
+    "ai-core/**/*.ts",
+    "notification-service/**/*.ts",
+    "analytics/**/*.ts",
+    "user-service/**/*.ts",
+    "saas-layer/**/*.ts",
+    "events-bus/**/*.ts",
+    "prisma/**/*.ts",
+    "tests/**/*.ts",
+    "security/**/*.ts",
+    "scripts/**/*.ts"
+  ],
+  "exclude": ["dist", "node_modules"]
+}

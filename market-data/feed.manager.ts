@@ -1,0 +1,363 @@
+/**
+ * FeedManager — production-grade market data feed orchestrator.
+ *
+ * Architecture:
+ *   PRIMARY   → TwelveData WebSocket (FX/metals/indices, real bid/ask, lowest latency)
+ *   SECONDARY → Binance WebSocket (crypto — public market-data stream, no API key,
+ *               no plan restrictions, genuinely free and unlimited for this use)
+ *   TERTIARY  → TwelveData REST polling every REST_ROTATION_MS (batch rotation)
+ *
+ * Finnhub was tried as the secondary FX/commodities source but this account's
+ * plan does not actually include real-time OANDA forex data (confirmed via a
+ * direct REST call returning "You don't have access to this resource" for
+ * forex symbols, despite the WS silently accepting the subscription) — so it
+ * was dropped from the price-feed path. Crypto comes from Binance directly
+ * instead of via Finnhub's Binance passthrough, for the same reason: a more
+ * reliable, plan-restriction-free source.
+ *
+ * Each feed independently calls `ingestExternalPrice()` on the liquidity core
+ * so any live source keeps quotes fresh (STALE_THRESHOLD_MS resets on each tick).
+ *
+ * Failover rules:
+ *   If PRIMARY fails:  Binance-WS (crypto only) + TwelveData-REST continue independently.
+ *   If ALL fail simultaneously for CIRCUIT_BREAK_MS:
+ *     - Set `circuitOpen = true`
+ *     - New order placements are blocked at the order controller level
+ *     - Monitoring of existing positions continues via last known prices
+ *     - CRITICAL alert emitted to event bus
+ *     - Circuit resets automatically when any feed recovers
+ *
+ * Feed health monitor:
+ *   Polls `lastQuoteAt` per feed every HEALTH_CHECK_INTERVAL_MS.
+ *   Exposes `getHealth()` for admin API.
+ */
+
+import { TwelveDataFeed }     from "./feeds/twelvedata.feed.js";
+import { BinanceFeed }        from "./feeds/binance.feed.js";
+import { fetchCurrentPrices } from "./feeds/twelvedata.rest.js";
+import { eventBus }         from "../events-bus/event.bus.js";
+import { feedCircuit }      from "../shared/feed.circuit.js";
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+// TwelveData free plan: 8 API credits/minute, ~800/day.
+// REST is tertiary — WebSocket (8 symbols via TwelveData + crypto via Binance) covers real-time.
+// Rotate batches every 5 min: 4 batches × 5 min = 20-min full cycle → ~288 calls/day (within 800/day limit).
+const REST_BATCH_SIZE          = 5;         // symbols per REST /price call
+const REST_ROTATION_MS         = 300_000;   // rotate to next batch every 5 min (was 15s — exhausted 800/day quota in ~3h)
+const HEALTH_CHECK_INTERVAL_MS = 5_000;     // How often to evaluate feed health
+const CIRCUIT_BREAK_MS         = 120_000;   // Time with ALL feeds dead → open circuit (2 min, up from 1 min)
+const FEED_DEAD_THRESHOLD_MS   = 60_000;    // A feed is "dead" if no quotes for this long (up from 30s)
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export type FeedName = "twelvedata-ws" | "binance-ws" | "twelvedata-rest";
+
+export type FeedHealth = {
+  name:        FeedName;
+  status:      "healthy" | "degraded" | "dead";
+  lastQuoteAt: string | null;
+  quoteCount:  number;
+  errorCount:  number;
+};
+
+export type FeedManagerHealth = {
+  circuitOpen:   boolean;
+  activeFeed:    FeedName | "none";
+  feeds:         FeedHealth[];
+  symbolsLive:   number;
+  allDeadSince:  string | null;
+  checkedAt:     string;
+};
+
+export type FeedManagerOptions = {
+  apiKey:        string;
+  symbols:       string[];
+  wsSymbols:     string[];   // subset for TwelveData WS (free plan limit = 8)
+  /**
+   * Routes each external price into InternalLiquidityCore.
+   * This is the single canonical write path for quoteCache.
+   */
+  ingestPrice: (symbol: string, mid: number, bid?: number, ask?: number) => void;
+};
+
+// ─── Per-feed stats ───────────────────────────────────────────────────────────
+
+class FeedStats {
+  lastQuoteAt: number | null = null;
+  quoteCount   = 0;
+  errorCount   = 0;
+
+  record(): void { this.lastQuoteAt = Date.now(); this.quoteCount++; }
+  error():  void { this.errorCount++; }
+
+  status(now: number): "healthy" | "degraded" | "dead" {
+    if (!this.lastQuoteAt) return "dead";
+    const age = now - this.lastQuoteAt;
+    if (age < FEED_DEAD_THRESHOLD_MS / 2) return "healthy";
+    if (age < FEED_DEAD_THRESHOLD_MS)    return "degraded";
+    return "dead";
+  }
+}
+
+// ─── FeedManager ─────────────────────────────────────────────────────────────
+
+export class FeedManager {
+  private readonly stats: Record<FeedName, FeedStats> = {
+    "twelvedata-ws":   new FeedStats(),
+    "binance-ws":      new FeedStats(),
+    "twelvedata-rest": new FeedStats(),
+  };
+
+  private wsFeed:        TwelveDataFeed | null = null;
+  private binanceFeed:   BinanceFeed | null = null;
+  private restTimer:     NodeJS.Timeout | null = null;
+  private healthTimer:   NodeJS.Timeout | null = null;
+  private restBatchIdx   = 0;  // rotating batch pointer
+
+  private circuitOpen   = false;
+  private allDeadSince: number | null = null;
+  private running       = false;
+
+  constructor(private readonly opts: FeedManagerOptions) {}
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+
+    this._startWsFeed();
+    this._startBinanceFeed();
+    this._startRestPolling();
+    this._startHealthMonitor();
+
+    console.log("[feed-manager] started — primary=TwelveData-WS secondary=Binance-WS tertiary=TwelveData-REST");
+  }
+
+  stop(): void {
+    this.running = false;
+    this.wsFeed?.stop();
+    this.binanceFeed?.stop();
+    if (this.restTimer)   clearInterval(this.restTimer);
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    console.log("[feed-manager] stopped");
+  }
+
+  // ── Public API ────────────────────────────────────────────────────────────
+
+  isCircuitOpen(): boolean { return this.circuitOpen; }
+
+  /** Force an immediate TwelveData REST fetch for every symbol (ignores rotation timer). */
+  async forceRefreshAll(): Promise<number> {
+    if (!this.opts.apiKey) return 0;
+    let refreshed = 0;
+    const totalBatches = Math.ceil(this.opts.symbols.length / REST_BATCH_SIZE);
+    for (let i = 0; i < totalBatches; i++) {
+      const batch     = this.opts.symbols.slice(i * REST_BATCH_SIZE, (i + 1) * REST_BATCH_SIZE);
+      const tdSymbols = batch.map((s) => this._toTdSymbol(s));
+      try {
+        const prices = await fetchCurrentPrices(this.opts.apiKey, tdSymbols);
+        for (const [sym, price] of prices) {
+          if (price > 0) {
+            this.stats["twelvedata-rest"].record();
+            this._closeCircuit("twelvedata-rest");
+            this.opts.ingestPrice(sym, price);
+            refreshed++;
+          }
+        }
+      } catch { /* continue to next batch */ }
+    }
+    return refreshed;
+  }
+
+  getHealth(): FeedManagerHealth {
+    const now    = Date.now();
+    const feeds  = (["twelvedata-ws", "binance-ws", "twelvedata-rest"] as FeedName[]).map((name) => {
+      const s = this.stats[name];
+      return {
+        name,
+        status:      s.status(now),
+        lastQuoteAt: s.lastQuoteAt ? new Date(s.lastQuoteAt).toISOString() : null,
+        quoteCount:  s.quoteCount,
+        errorCount:  s.errorCount,
+      } satisfies FeedHealth;
+    });
+
+    const activeFeed = feeds.find((f) => f.status === "healthy")?.name ?? "none";
+
+    return {
+      circuitOpen:   this.circuitOpen,
+      activeFeed,
+      feeds,
+      symbolsLive:   this.opts.symbols.length,
+      allDeadSince:  this.allDeadSince ? new Date(this.allDeadSince).toISOString() : null,
+      checkedAt:     new Date(now).toISOString(),
+    };
+  }
+
+  // ── PRIMARY: TwelveData WebSocket ─────────────────────────────────────────
+
+  private _startWsFeed(): void {
+    if (!this.opts.apiKey) return;
+
+    this.wsFeed = new TwelveDataFeed({
+      apiKey:  this.opts.apiKey,
+      symbols: this.opts.wsSymbols,
+      onQuote: (q) => {
+        this.stats["twelvedata-ws"].record();
+        this._closeCircuit("twelvedata-ws");
+        this.opts.ingestPrice(
+          q.symbol, q.mid,
+          q.isRealSpread ? q.bid  : undefined,
+          q.isRealSpread ? q.ask  : undefined,
+        );
+      },
+      onError: (err) => {
+        this.stats["twelvedata-ws"].error();
+        console.warn("[feed-manager] TwelveData-WS error:", err.message);
+      },
+      onReconnect: (attempt) => {
+        console.warn(`[feed-manager] TwelveData-WS reconnect attempt #${attempt}`);
+      },
+    });
+
+    this.wsFeed.start();
+  }
+
+  // ── SECONDARY: Binance WebSocket (crypto only — free, no API key, no plan limits) ──
+
+  private _startBinanceFeed(): void {
+    this.binanceFeed = new BinanceFeed({
+      symbols: this.opts.symbols,
+      onQuote: (q) => {
+        this.stats["binance-ws"].record();
+        this._closeCircuit("binance-ws");
+        this.opts.ingestPrice(q.symbol, q.mid, q.bid, q.ask);
+      },
+      onError: (err) => {
+        this.stats["binance-ws"].error();
+        console.warn("[feed-manager] Binance-WS error:", err.message);
+      },
+      onReconnect: (attempt) => {
+        console.warn(`[feed-manager] Binance-WS reconnect attempt #${attempt}`);
+      },
+    });
+
+    this.binanceFeed.start();
+  }
+
+  // ── TERTIARY: TwelveData REST polling ────────────────────────────────────
+
+  private _startRestPolling(): void {
+    if (!this.opts.apiKey) {
+      console.warn("[feed-manager] TwelveData-REST disabled — no API key");
+      return;
+    }
+
+    // Rotate batches: call immediately, then every REST_ROTATION_MS
+    void this._pollRestBatch();
+    this.restTimer = setInterval(() => void this._pollRestBatch(), REST_ROTATION_MS);
+    console.log(`[feed-manager] TwelveData-REST batch rotation every ${REST_ROTATION_MS}ms (${REST_BATCH_SIZE} symbols/batch)`);
+  }
+
+  // ─── TwelveData REST symbol normalisation ─────────────────────────────────
+  private _toTdSymbol(igfx: string): string {
+    // 6-letter FX pairs: EURUSD → EUR/USD
+    if (/^[A-Z]{6}$/.test(igfx)) return `${igfx.slice(0, 3)}/${igfx.slice(3)}`;
+    // Commodity futures: WTI → WTI, BRENT → BRENT, keep as-is
+    return igfx;
+  }
+
+  private async _pollRestBatch(): Promise<void> {
+    if (!this.running) return;
+
+    // Rotate through symbol batches
+    const start   = this.restBatchIdx * REST_BATCH_SIZE;
+    const batch   = this.opts.symbols.slice(start, start + REST_BATCH_SIZE);
+    if (batch.length === 0) { this.restBatchIdx = 0; return; }
+
+    this.restBatchIdx = (this.restBatchIdx + 1) % Math.ceil(this.opts.symbols.length / REST_BATCH_SIZE);
+
+    const tdSymbols = batch.map((s) => this._toTdSymbol(s));
+
+    try {
+      const prices = await fetchCurrentPrices(this.opts.apiKey, tdSymbols);
+
+      if (prices.size === 0) {
+        this.stats["twelvedata-rest"].error();
+        return;
+      }
+
+      for (const [sym, price] of prices) {
+        if (price > 0) {
+          this.stats["twelvedata-rest"].record();
+          this._closeCircuit("twelvedata-rest");
+          this.opts.ingestPrice(sym, price);
+        }
+      }
+    } catch {
+      this.stats["twelvedata-rest"].error();
+    }
+  }
+
+  // ── Health monitor + circuit breaker ──────────────────────────────────────
+
+  private _startHealthMonitor(): void {
+    this.healthTimer = setInterval(() => this._checkHealth(), HEALTH_CHECK_INTERVAL_MS);
+  }
+
+  private _checkHealth(): void {
+    const now   = Date.now();
+    const allFeeds = ["twelvedata-ws", "binance-ws", "twelvedata-rest"] as FeedName[];
+    const allDead  = allFeeds.every((name) => this.stats[name].status(now) === "dead");
+
+    if (allDead) {
+      if (!this.allDeadSince) {
+        this.allDeadSince = now;
+        console.error("[feed-manager] ALL feeds are dead — monitoring circuit...");
+      }
+
+      const deadFor = now - this.allDeadSince;
+
+      if (deadFor >= CIRCUIT_BREAK_MS && !this.circuitOpen) {
+        this._openCircuit();
+      }
+    } else {
+      this.allDeadSince = null;
+
+      if (this.circuitOpen) {
+        const recoveredFeed = allFeeds.find((n) => this.stats[n].status(now) !== "dead");
+        console.log(`[feed-manager] circuit CLOSED — feed recovered: ${recoveredFeed}`);
+        this.circuitOpen = false;
+      }
+    }
+  }
+
+  private _openCircuit(): void {
+    this.circuitOpen = true;
+    feedCircuit.open();
+    console.error(
+      "[feed-manager] CIRCUIT OPEN — all market data feeds dead for " +
+      `${CIRCUIT_BREAK_MS / 1000}s. ` +
+      "New orders BLOCKED. Existing positions monitored on last known prices."
+    );
+
+    // Emit CRITICAL alert
+    (eventBus.emit as (...args: unknown[]) => void)("risk.warning", {
+      severity: "CRITICAL",
+      reason:   "FEED_CIRCUIT_OPEN",
+      message:  "All market data feeds offline — new orders blocked",
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  private _closeCircuit(feed: FeedName): void {
+    if (this.circuitOpen) {
+      this.circuitOpen  = false;
+      this.allDeadSince = null;
+      feedCircuit.close();
+      console.log(`[feed-manager] circuit CLOSED — recovered via ${feed}`);
+    }
+  }
+}

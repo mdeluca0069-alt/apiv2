@@ -1,0 +1,192 @@
+groups:
+  # ── Service availability ─────────────────────────────────────────────────────
+  - name: availability
+    rules:
+      - alert: ApiDown
+        expr: up{job="igfxpro_api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team:     oncall
+        annotations:
+          summary:     "IGFXPRO API is down"
+          description: "The backend API has been unreachable for more than 1 minute. Check Docker logs and health endpoint."
+
+      - alert: DatabaseDown
+        expr: up{job="postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team:     oncall
+        annotations:
+          summary:     "PostgreSQL exporter is down"
+          description: "Cannot reach postgres-exporter. Verify PostgreSQL container health."
+
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          team:     oncall
+        annotations:
+          summary:     "Redis is down"
+          description: "Redis has been unreachable for 2 minutes. Rate limiting and session caching are degraded."
+
+  # ── HTTP error rates ──────────────────────────────────────────────────────────
+  - name: http_errors
+    rules:
+      - alert: HighServerErrorRate
+        # Alert if 5xx share exceeds 5% over a 5-minute window
+        expr: |
+          (
+            rate(http_requests_5xx_total[5m])
+          /
+            rate(http_requests_total[5m])
+          ) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+          team:     engineering
+        annotations:
+          summary:     "High 5xx error rate on API ({{ printf \"%.1f\" $value | humanizePercentage }})"
+          description: "More than 5% of requests are returning 5xx errors. Check application logs."
+
+      - alert: CriticalServerErrorRate
+        expr: |
+          (
+            rate(http_requests_5xx_total[5m])
+          /
+            rate(http_requests_total[5m])
+          ) > 0.20
+        for: 1m
+        labels:
+          severity: critical
+          team:     oncall
+        annotations:
+          summary:     "Critical 5xx error rate ({{ printf \"%.1f\" $value | humanizePercentage }})"
+          description: "More than 20% of API requests are failing. Likely a deployment or database issue."
+
+  # ── Process health ────────────────────────────────────────────────────────────
+  - name: process
+    rules:
+      - alert: HighMemoryUsage
+        expr: process_memory_rss_bytes > 600 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+          team:     engineering
+        annotations:
+          summary:     "API process RSS memory above 600 MB"
+          description: "RSS is {{ $value | humanize1024 }}. Possible memory leak. Review heap allocations."
+
+      - alert: CriticalMemoryUsage
+        expr: process_memory_rss_bytes > 1.2 * 1024 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: critical
+          team:     oncall
+        annotations:
+          summary:     "API process RSS memory above 1.2 GB — OOM risk"
+          description: "RSS is {{ $value | humanize1024 }}. Container may be OOM-killed. Restart may be required."
+
+  # ── Trading pipeline ──────────────────────────────────────────────────────────
+  - name: trading
+    rules:
+      - alert: SettlementErrors
+        expr: increase(settlement_errors_total[5m]) > 0
+        labels:
+          severity: critical
+          team:     oncall
+        annotations:
+          summary:     "Settlement errors detected"
+          description: "{{ $value }} settlement error(s) in the last 5 minutes. Positions may not have been closed correctly. Immediate investigation required."
+
+      - alert: HighOrderRejectionRate
+        expr: |
+          (
+            rate(orders_rejected_total[10m])
+          /
+            (rate(orders_placed_total[10m]) + 0.001)
+          ) > 0.30
+        for: 5m
+        labels:
+          severity: warning
+          team:     risk
+        annotations:
+          summary:     "Order rejection rate above 30%"
+          description: "{{ printf \"%.1f\" $value | humanizePercentage }} of orders are being rejected. Check risk engine configuration and liquidity."
+
+      - alert: StopOutSurge
+        expr: increase(stop_out_events_total[30m]) > 5
+        labels:
+          severity: warning
+          team:     risk
+        annotations:
+          summary:     "{{ $value }} stop-out events in the last 30 minutes"
+          description: "Unusual stop-out activity detected. Review margin levels, market volatility, and risk policy."
+
+      - alert: KillSwitchActivated
+        expr: increase(kill_switch_activations_total[5m]) > 0
+        labels:
+          severity: critical
+          team:     oncall
+        annotations:
+          summary:     "Trading kill switch activated"
+          description: "The kill switch was triggered. New orders are blocked. Review system state before deactivating."
+
+  # ── KYC / compliance ──────────────────────────────────────────────────────────
+  - name: compliance
+    rules:
+      - alert: AmlFlagsSurge
+        expr: increase(aml_flags_total[1h]) > 10
+        labels:
+          severity: warning
+          team:     compliance
+        annotations:
+          summary:     "{{ $value }} AML flags in the last hour"
+          description: "Unusual number of AML screening flags. Review flagged transactions in the compliance dashboard."
+
+  # ── Authentication ────────────────────────────────────────────────────────────
+  - name: auth
+    rules:
+      - alert: AuthFailureSurge
+        expr: increase(auth_failures_total[5m]) > 50
+        for: 2m
+        labels:
+          severity: warning
+          team:     security
+        annotations:
+          summary:     "{{ $value }} login failures in 5 minutes — possible brute force"
+          description: "High login failure rate detected. Check IP-based rate limiting and consider temporary lockout."
+
+      - alert: RateLimitSurge
+        expr: increase(rate_limit_hits_total[5m]) > 200
+        labels:
+          severity: warning
+          team:     security
+        annotations:
+          summary:     "{{ $value }} requests rate-limited in 5 minutes"
+          description: "Possible DDoS or automated abuse. Review request sources."
+
+  # ── WebSocket / realtime ─────────────────────────────────────────────────────
+  - name: realtime
+    rules:
+      - alert: OutboxQueueDepthHigh
+        expr: outbox_queue_depth > 500
+        for: 5m
+        labels:
+          severity: warning
+          team:     engineering
+        annotations:
+          summary:     "Outbox queue depth is {{ $value }}"
+          description: "WebSocket outbox has {{ $value }} undelivered events. The outbox pump may be stalled. Check logs."
+
+      - alert: OutboxQueueDepthCritical
+        expr: outbox_queue_depth > 2000
+        for: 2m
+        labels:
+          severity: critical
+          team:     oncall
+        annotations:
+          summary:     "Outbox queue depth critical: {{ $value }} events"
+          description: "Clients are not receiving real-time updates. Possible WebSocket or DB issue."

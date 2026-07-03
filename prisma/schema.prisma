@@ -1,0 +1,856 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model AcademyContent {
+  id             String    @id @default(uuid())
+  title          String
+  description    String
+  category       String
+  level          String
+  contentType    String
+  videoUrl       String?
+  duration       Int?
+  sections       Json
+  caseStudies    Json?
+  resources      Json?
+  prerequisites  String[]  @default([])
+  nextTopics     String[]  @default([])
+  relatedContent String[]  @default([])
+  viewCount      Int       @default(0)
+  completionRate Decimal   @default(0)
+  rating         Decimal?
+  isPublished    Boolean   @default(false)
+  publishedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([category])
+  @@index([isPublished])
+  @@index([level])
+}
+
+model AccountDailySnapshot {
+  id             String   @id @default(uuid())
+  userId         String
+  snapshotDate   DateTime @db.Date
+  balance        Decimal  @db.Decimal(18, 8)
+  equity         Decimal  @db.Decimal(18, 8)
+  marginUsed     Decimal  @db.Decimal(18, 8)
+  freeMargin     Decimal  @db.Decimal(18, 8)
+  unrealizedPnl  Decimal  @db.Decimal(18, 8)
+  realizedPnlDay Decimal  @db.Decimal(18, 8)
+  totalFeesDay   Decimal  @db.Decimal(18, 8)
+  totalSwapsDay  Decimal  @db.Decimal(18, 8)
+  openPositions  Int
+  closedToday    Int
+  createdAt      DateTime @default(now())
+
+  @@unique([userId, snapshotDate])
+  @@index([userId, snapshotDate])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  actor     String
+  action    String
+  entity    String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  @@index([action, createdAt])
+  @@index([actor, createdAt])
+  @@index([entity, createdAt])
+}
+
+model AutopilotConfig {
+  id                  String   @id @default(uuid())
+  userId              String   @unique
+  enabled             Boolean  @default(false)
+  mode                String   @default("BALANCED")
+  minConfidence       Float    @default(0.70)
+  maxRiskPerTrade     Float    @default(0.05)
+  maxOpenTrades       Int      @default(3)
+  maxExposurePct      Float    @default(20.0)
+  allowedSymbols      String[] @default([])
+  blockedSymbols      String[] @default([])
+  stopDrawdownPct     Float    @default(10.0)
+  capitalPct          Float    @default(100.0)
+  eventLockMinutes    Int      @default(30)
+  maxDailyTrades      Int      @default(10)
+  breakEvenTriggerR   Float    @default(1.0)
+  trailingStopEnabled Boolean  @default(true)
+  trailingActivationR Float    @default(1.5)
+  atrTrailMultiple    Float    @default(2.0)
+  regimeExitEnabled   Boolean  @default(true)
+  maxHoursOpen        Int      @default(48)
+  lastDecision        Json?
+  // Task 14 Phase 3 — admin pause, distinct from the client's own `enabled`
+  // toggle so the client's next config save can never silently un-pause them.
+  pausedByAdmin       Boolean   @default(false)
+  pausedReason        String?
+  pausedAt            DateTime?
+  // Real-client safety layer — client consent + per-client daily loss breaker
+  // + spread/slippage guard. consentVersion/consentAcceptedAt are denormalized
+  // here for fast pipeline reads; AutopilotConsent is the append-only source
+  // of truth for disputes.
+  consentVersion       String?
+  consentAcceptedAt    DateTime?
+  maxDailyLossPct      Float     @default(5.0)
+  dailyLossLockedUntil DateTime?
+  maxSpreadBps         Int       @default(15)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  User                User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+// Append-only audit trail of every client acceptance of the autopilot risk
+// disclosure — distinct from the denormalized fields on AutopilotConfig so a
+// client's full consent history survives even if their config is reset.
+model AutopilotConsent {
+  id         String   @id @default(uuid())
+  userId     String
+  version    String
+  acceptedAt DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model BrokerSetting {
+  key       String   @id
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ClientDocument {
+  id              String   @id @default(uuid())
+  userId          String
+  documentKey     String
+  label           String
+  status          String
+  fileName        String?
+  rejectionReason String?
+  updatedAt       DateTime @updatedAt
+  createdAt       DateTime @default(now())
+  User            User     @relation(fields: [userId], references: [id])
+
+  @@unique([userId, documentKey])
+  @@index([status])
+  @@index([userId, status])
+}
+
+model Instrument {
+  symbol            String     @id
+  name              String
+  assetClass        String
+  base              String
+  quote             String
+  precision         Int
+  minTradeSize      Decimal
+  maxLeverageRetail Int
+  createdAt         DateTime   @default(now())
+  Order             Order[]
+  Position          Position[]
+}
+
+model KycCase {
+  id                 String    @id @default(uuid())
+  userId             String    @unique
+  status             String    @default("SUBMITTED")
+  riskScore          Int       @default(0)
+  verificationScore  Int       @default(0)
+  reviewNotes        String?
+  reviewedBy         String?
+  reviewedAt         DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  sumsubApplicantId  String?
+  sumsubReviewStatus String?
+  sumsubReviewAnswer String?
+  sumsubInspectionId String?
+  sumsubWebhookData  Json?
+  User               User      @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+  @@index([status])
+  @@index([sumsubApplicantId])
+  @@index([userId])
+}
+
+model KycDocument {
+  id              String    @id @default(uuid())
+  caseId          String
+  documentKey     String
+  label           String
+  status          String    @default("PENDING")
+  fileName        String?
+  mimeType        String?
+  documentNumber  String?
+  extractedData   Json?
+  livenessScore   Float?
+  matchScore      Float?
+  rejectionReason String?
+  reviewedBy      String?
+  reviewedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([caseId])
+  @@index([documentKey, status])
+}
+
+model KycVerificationStep {
+  id         String   @id @default(uuid())
+  caseId     String
+  stepType   String
+  status     String   @default("PENDING")
+  provider   String?
+  confidence Float?
+  result     Json?
+  errorMsg   String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([caseId])
+  @@index([stepType, status])
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model LedgerEntry {
+  id             String   @id @default(uuid())
+  userId         String
+  currency       String
+  amount         Decimal
+  type           String
+  reference      String
+  status         String   @default("COMPLETED")
+  note           String   @default("")
+  runningBalance Decimal? @db.Decimal(18, 8)
+  debitAccount   String?
+  creditAccount  String?
+  createdAt      DateTime @default(now())
+  User           User     @relation(fields: [userId], references: [id])
+
+  @@index([reference])
+  @@index([type, status])
+  @@index([userId, createdAt])
+  @@index([userId, type, status])
+}
+
+model MarginSnapshot {
+  id             String   @id @default(uuid())
+  userId         String
+  equity         Decimal  @db.Decimal(18, 8)
+  balance        Decimal  @db.Decimal(18, 8)
+  marginUsed     Decimal  @db.Decimal(18, 8)
+  freeMargin     Decimal  @db.Decimal(18, 8)
+  marginLevelPct Decimal  @db.Decimal(10, 4)
+  unrealizedPnl  Decimal  @db.Decimal(18, 8)
+  triggerReason  String
+  createdAt      DateTime @default(now())
+  User           User     @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+}
+
+model Notification {
+  id            String    @id @default(uuid())
+  userId        String
+  channel       String
+  category      String
+  priority      String    @default("NORMAL")
+  title         String
+  body          String
+  templateId    String?
+  payload       Json?
+  sent          Boolean   @default(false)
+  sentAt        DateTime?
+  failureReason String?
+  retries       Int       @default(0)
+  createdAt     DateTime  @default(now())
+
+  @@index([category, createdAt])
+  @@index([channel, sent, createdAt])
+  @@index([userId, sent])
+}
+
+model NotificationPreference {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  emailEnabled Boolean  @default(true)
+  smsEnabled   Boolean  @default(false)
+  pushEnabled  Boolean  @default(true)
+  inAppEnabled Boolean  @default(true)
+  categories   Json     @default("{}")
+  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+}
+
+model OlosSignal {
+  id                  String    @id @default(uuid())
+  userId              String
+  symbol              String
+  timeframe           String
+  signalType          String
+  confidence          Decimal
+  setupPattern        String
+  setupDescription    String
+  supportLevel        Decimal?
+  resistanceLevel     Decimal?
+  confluenceFactors   Json
+  confidenceBreakdown Json
+  entryPrice          Decimal
+  entryRationale      String
+  targetLevels        Json
+  stopLoss            Decimal
+  slRationale         String
+  riskRewardRatio     Decimal
+  macroEvents         Json
+  marketRegime        String
+  volatilityLevel     String
+  expectedRiskPips    Decimal
+  marginRequirement   Decimal
+  liquidityProfile    String
+  status              String    @default("ACTIVE")
+  triggeredAt         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  User                User      @relation(fields: [userId], references: [id])
+
+  @@index([symbol, status])
+  @@index([userId, createdAt])
+  @@index([userId, status])
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model Order {
+  id               String     @id @default(uuid())
+  clientOrderId    String?
+  userId           String
+  symbol           String
+  side             String
+  type             String
+  status           String
+  quantity         Decimal    @db.Decimal(18, 8)
+  filledQuantity   Decimal    @default(0) @db.Decimal(18, 8)
+  requestedPrice   Decimal?   @db.Decimal(18, 8)
+  averageFillPrice Decimal?   @db.Decimal(18, 8)
+  notional         Decimal    @db.Decimal(18, 8)
+  marginRequired   Decimal    @db.Decimal(18, 8)
+  leverage         Int        @default(1)
+  stopLoss         Decimal?   @db.Decimal(18, 8)
+  takeProfit       Decimal?   @db.Decimal(18, 8)
+  slippage         Decimal    @default(0) @db.Decimal(18, 8)
+  fees             Decimal    @default(0) @db.Decimal(18, 8)
+  riskCheckResult  Json?
+  rejectionReason  String?
+  filledAt         DateTime?
+  createdAt        DateTime   @default(now())
+  Instrument       Instrument @relation(fields: [symbol], references: [symbol])
+  User             User       @relation(fields: [userId], references: [id])
+  Position         Position[]
+  fills            Fill[]
+
+  @@unique([userId, clientOrderId])
+  @@index([symbol, status])
+  @@index([userId, createdAt])
+  @@index([userId, status])
+}
+
+model Fill {
+  id                String    @id @default(uuid())
+  orderId           String
+  positionId        String?
+  quantity          Decimal   @db.Decimal(18, 8)
+  price             Decimal   @db.Decimal(18, 8)
+  liquidityProvider String    @default("IGFX_INTERNAL")
+  slippage          Decimal   @default(0) @db.Decimal(18, 8)
+  fees              Decimal   @default(0) @db.Decimal(18, 8)
+  createdAt         DateTime  @default(now())
+  Order             Order     @relation(fields: [orderId], references: [id])
+  Position          Position? @relation(fields: [positionId], references: [id])
+
+  @@index([orderId])
+  @@index([positionId])
+}
+
+model OutboxEvent {
+  id          String    @id @default(uuid())
+  eventType   String
+  payload     Json
+  published   Boolean   @default(false)
+  publishedAt DateTime?
+  retries     Int       @default(0)
+  createdAt   DateTime  @default(now())
+  userId      String?
+
+  @@index([published, createdAt])
+  @@index([userId, published])
+}
+
+model Position {
+  id                String     @id @default(uuid())
+  userId            String
+  orderId           String
+  symbol            String
+  side              String
+  quantity          Decimal    @db.Decimal(18, 8)
+  entryPrice        Decimal    @db.Decimal(18, 8)
+  markPrice         Decimal    @default(0) @db.Decimal(18, 8)
+  pnl               Decimal    @default(0) @db.Decimal(18, 8)
+  pnlPercent        Decimal    @default(0) @db.Decimal(10, 4)
+  marginUsed        Decimal    @db.Decimal(18, 8)
+  leverage          Int
+  stopLoss          Decimal?   @db.Decimal(18, 8)
+  takeProfit        Decimal?   @db.Decimal(18, 8)
+  exitPrice         Decimal?   @db.Decimal(18, 8)
+  status            String     @default("OPEN")
+  openedAt          DateTime   @default(now())
+  closedAt          DateTime?
+  openedByAutopilot Boolean    @default(false)
+  initialStopLoss   Decimal?   @db.Decimal(18, 8)
+  breakEvenApplied  Boolean    @default(false)
+  trailingActive    Boolean    @default(false)
+  Order             Order      @relation(fields: [orderId], references: [id])
+  Instrument        Instrument @relation(fields: [symbol], references: [symbol])
+  User              User       @relation(fields: [userId], references: [id])
+  fills             Fill[]
+
+  @@index([orderId])
+  @@index([symbol, status])
+  @@index([userId, closedAt])
+  @@index([userId, status])
+  @@index([openedByAutopilot, status])
+}
+
+model RiskWarning {
+  id                    String    @id @default(uuid())
+  userId                String
+  riskScore             Int
+  marginLevel           Decimal
+  portfolioAggregate    Json
+  esmaLeverageActive    Boolean   @default(true)
+  negativeBalanceActive Boolean   @default(true)
+  liveTradeDisabled     Boolean   @default(false)
+  scenarios             Json
+  upcomingEvents        Json
+  marginForecast        Json
+  exposureHeatmap       Json
+  killSwitchTriggers    Json
+  regulatoryLevel       String
+  regulatoryText        String?
+  eventCalendarItems    Json
+  severity              String    @default("INFO")
+  acknowledged          Boolean   @default(false)
+  acknowledgedAt        DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  User                  User      @relation(fields: [userId], references: [id])
+
+  @@index([userId, acknowledged])
+  @@index([userId, createdAt])
+  @@index([userId, severity])
+}
+
+model Session {
+  refreshToken String   @id
+  userId       String
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime @default(dbgenerated("(now() + '7 days'::interval)"))
+  User         User     @relation(fields: [userId], references: [id])
+
+  @@index([expiresAt])
+  @@index([userId])
+}
+
+model Watchlist {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String
+  symbols   String[] @default([])
+  isDefault Boolean  @default(false)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  User      User     @relation(fields: [userId], references: [id])
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+model StoredDocument {
+  id              String    @id @default(uuid())
+  userId          String
+  category        String
+  fileName        String
+  mimeType        String
+  sizeBytes       Int
+  storageKey      String
+  storageBucket   String
+  storageProvider String
+  encryptedDek    String?
+  scanStatus      String    @default("PENDING")
+  scanResult      Json?
+  scannedAt       DateTime?
+  status          String    @default("QUARANTINE")
+  retentionPolicy String    @default("STANDARD")
+  retentionUntil  DateTime?
+  kycDocumentId   String?
+  metadata        Json?
+  uploadedAt      DateTime  @default(now())
+  deletedAt       DateTime?
+  User            User      @relation(fields: [userId], references: [id])
+
+  @@index([userId, status])
+  @@index([category, status])
+  @@index([scanStatus])
+  @@index([retentionUntil])
+  @@index([storageKey])
+}
+
+model SupportTicket {
+  id          String    @id @default(uuid())
+  userId      String
+  subject     String
+  message     String
+  status      String    @default("OPEN")
+  priority    String    @default("NORMAL")
+  category    String    @default("GENERAL")
+  resolution  String?
+  resolvedAt  DateTime?
+  slaDeadline DateTime?
+  agentNote   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  User        User      @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+  @@index([status, priority])
+  @@index([userId, status])
+}
+
+model SignalTelemetry {
+  id         String @id @default(uuid())
+  signalId   String @unique
+  symbol     String
+  timeframe  String @default("1H")
+  signalType String // BUY | SELL
+  confidence Float
+
+  // Market context snapshot at signal generation time
+  entryPrice         Decimal @db.Decimal(18, 8)
+  stopLoss           Decimal @db.Decimal(18, 8)
+  target1            Decimal @db.Decimal(18, 8)
+  target2            Decimal @db.Decimal(18, 8)
+  riskRewardRatio    Float
+  marketRegime       String
+  volatilityLevel    String
+  confluenceFactors  Json // string[]
+  indicatorsSnapshot Json // rsi, macd, ema50, ema200, atr values
+
+  // Execution linkage (null = signal not executed by autopilot)
+  positionId       String?  @unique
+  orderId          String?
+  actualEntryPrice Decimal? @db.Decimal(18, 8)
+
+  // Outcome — filled when position closes
+  outcome         String   @default("PENDING") // PENDING | WIN | LOSS | BREAKEVEN | EXPIRED
+  pnl             Decimal? @db.Decimal(18, 8)
+  pnlPips         Float?
+  exitPrice       Decimal? @db.Decimal(18, 8)
+  exitReason      String? // TP_HIT | SL_HIT | MANUAL | STOP_OUT | EXPIRED
+  durationSeconds Int?
+
+  // Max Favorable Excursion / Max Adverse Excursion (in price units)
+  maxFavorableExcursion Decimal? @db.Decimal(18, 8)
+  maxAdverseExcursion   Decimal? @db.Decimal(18, 8)
+
+  generatedAt DateTime
+  executedAt  DateTime?
+  closedAt    DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([symbol, outcome])
+  @@index([marketRegime, outcome])
+  @@index([confidence])
+  @@index([generatedAt])
+  @@index([outcome, generatedAt])
+  @@index([signalType, outcome])
+}
+
+model SwapAccrual {
+  id             String   @id @default(uuid())
+  positionId     String
+  userId         String
+  symbol         String
+  side           String
+  swapAmount     Decimal  @db.Decimal(18, 8)
+  swapRateAnnual Decimal  @db.Decimal(10, 6)
+  nights         Int
+  accrualDate    DateTime @db.Date
+  settlementId   String?
+  createdAt      DateTime @default(now())
+  User           User     @relation(fields: [userId], references: [id])
+
+  @@unique([positionId, accrualDate])
+  @@index([positionId])
+  @@index([userId, accrualDate])
+}
+
+model Tenant {
+  id        String   @id
+  name      String
+  region    String
+  createdAt DateTime @default(now())
+  User      User[]
+}
+
+model TradeAudit {
+  id            String    @id @default(uuid())
+  userId        String
+  orderId       String?
+  positionId    String?
+  symbol        String
+  side          String
+  quantity      Decimal
+  entryPrice    Decimal?
+  exitPrice     Decimal?
+  stopLoss      Decimal?
+  takeProfit    Decimal?
+  pnlRealized   Decimal?
+  pnlUnrealized Decimal?
+  pnlPercent    Decimal?
+  marginUsed    Decimal?
+  leverage      Int?
+  fees          Decimal   @default(0)
+  slippage      Decimal   @default(0)
+  duration      Int?
+  tradeStatus   String
+  lifecycle     Json
+  riskMetrics   Json
+  createdAt     DateTime  @default(now())
+  closedAt      DateTime?
+  updatedAt     DateTime  @updatedAt
+  User          User      @relation(fields: [userId], references: [id])
+
+  @@index([orderId])
+  @@index([positionId])
+  @@index([symbol, tradeStatus])
+  @@index([userId, createdAt])
+  @@index([userId, tradeStatus])
+}
+
+model User {
+  id                  String                @id
+  email               String                @unique
+  password            String
+  fullName            String
+  role                String
+  roles               Json
+  permissions         Json
+  tier                String
+  kycStatus           String
+  tenantId            String
+  createdAt           DateTime              @default(now())
+  AutopilotConfig     AutopilotConfig?
+  ClientDocument      ClientDocument[]
+  KycCase             KycCase?
+  LedgerEntry         LedgerEntry[]
+  MarginSnapshot      MarginSnapshot[]
+  OlosSignal          OlosSignal[]
+  Order               Order[]
+  Position            Position[]
+  RiskWarning         RiskWarning[]
+  Session             Session[]
+  StoredDocument      StoredDocument[]
+  SupportTicket       SupportTicket[]
+  Watchlist           Watchlist[]
+  SwapAccrual         SwapAccrual[]
+  TradeAudit          TradeAudit[]
+  Tenant              Tenant                @relation(fields: [tenantId], references: [id])
+  UserAcademyProgress UserAcademyProgress[]
+  WalletAccount       WalletAccount?
+  DepositTransaction  DepositTransaction[]
+  AffiliateReferral   AffiliateReferral?
+}
+
+// ── Affiliate / IB referral program ───────────────────────────────────────────
+
+model Affiliate {
+  id            String                @id @default(uuid())
+  name          String
+  email         String                @unique
+  code          String                @unique
+  commissionPct Decimal               @default(20) @db.Decimal(5, 2)
+  status        String                @default("PENDING") // PENDING | ACTIVE | INACTIVE
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+  Referrals     AffiliateReferral[]
+  Commissions   AffiliateCommission[]
+
+  @@index([status])
+}
+
+model AffiliateReferral {
+  id          String    @id @default(uuid())
+  affiliateId String
+  userId      String    @unique
+  createdAt   DateTime  @default(now())
+  Affiliate   Affiliate @relation(fields: [affiliateId], references: [id])
+  User        User      @relation(fields: [userId], references: [id])
+
+  @@index([affiliateId, createdAt])
+}
+
+model AffiliateCommission {
+  id          String    @id @default(uuid())
+  affiliateId String
+  userId      String
+  sourceType  String // DEPOSIT
+  sourceRef   String // DepositTransaction.id — also dedupes double-counting
+  amount      Decimal   @db.Decimal(18, 8)
+  currency    String    @default("USD")
+  status      String    @default("PENDING") // PENDING | PAID | VOID
+  createdAt   DateTime  @default(now())
+  paidAt      DateTime?
+  Affiliate   Affiliate @relation(fields: [affiliateId], references: [id])
+
+  @@unique([sourceType, sourceRef])
+  @@index([affiliateId, status])
+}
+
+model UserAcademyProgress {
+  id           String    @id @default(uuid())
+  userId       String
+  contentId    String
+  progress     Decimal   @default(0)
+  completed    Boolean   @default(false)
+  completedAt  DateTime?
+  lastViewedAt DateTime  @default(now())
+  notes        String?
+  rating       Decimal?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  User         User      @relation(fields: [userId], references: [id])
+
+  @@unique([userId, contentId])
+  @@index([userId])
+}
+
+model WalletAccount {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  currency  String   @default("USD")
+  balance   Decimal  @default(0) @db.Decimal(18, 8)
+  equity    Decimal  @default(0) @db.Decimal(18, 8)
+  locked    Decimal  @default(0) @db.Decimal(18, 8)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  User      User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+// DepositTransaction is the source-of-truth for every deposit lifecycle.
+// LedgerEntry is only created once the deposit reaches CREDITED — never before.
+// pspRef is unique: prevents two rows for the same PSP transaction (double-credit guard layer 1).
+// Status transitions are enforced by a serializable DB transaction (layer 2).
+model DepositTransaction {
+  id          String    @id @default(cuid())
+  userId      String
+  psp         String // STRIPE | NUVEI | PRAXIS
+  pspRef      String?   @unique // PSP's canonical transaction / payment-intent ID
+  sessionId   String? // PSP checkout/session ID (may differ from pspRef)
+  amount      Decimal   @db.Decimal(18, 8)
+  currency    String    @default("USD")
+  status      String // REQUESTED | PENDING | CONFIRMED | CREDITED | FAILED | EXPIRED
+  redirectUrl String?
+  returnUrl   String?
+  webhookData Json?
+  failReason  String?
+  requestedAt DateTime  @default(now())
+  pendingAt   DateTime?
+  confirmedAt DateTime?
+  creditedAt  DateTime?
+  User        User      @relation(fields: [userId], references: [id])
+
+  @@index([userId, status])
+  @@index([userId, requestedAt])
+  @@index([psp, status])
+  @@index([status, requestedAt])
+}
+
+// ── OLOS Adaptive Intelligence ────────────────────────────────────────────────
+
+// Versioned confidence weight set produced by the weekly self-optimizer.
+// The highest version is always the active set. Previous versions are retained
+// for audit and rollback purposes.
+model ConfidenceWeights {
+  id           String   @id @default(uuid())
+  version      Int      @unique
+  weights      Json // Record<DimensionKey, number> — normalized to sum 100
+  regimeGates  Json // Record<MarketRegime, minConfidence>
+  symbolConfig Json // Record<symbol, {enabled: boolean, reason: string}>
+  sampleSize   Int
+  winRate      Float
+  profitFactor Float
+  sharpeRatio  Float
+  computedAt   DateTime
+  createdAt    DateTime @default(now())
+
+  @@index([version])
+}
+
+// Economic calendar events from ForexFactory, TradingEconomics, FRED, Finnhub.
+// Refreshed every 6 hours. Drives macroEventInNext4Hours() signal suppression.
+model EconomicEvent {
+  id        String   @id @default(uuid())
+  country   String
+  currency  String
+  title     String
+  impact    String // "low" | "medium" | "high"
+  source    String   @default("UNKNOWN") // "FOREXFACTORY" | "TRADINGECONOMICS" | "FRED" | "FINNHUB"
+  eventTime DateTime
+  actual    String?
+  forecast  String?
+  previous  String?
+  createdAt DateTime @default(now())
+
+  @@unique([currency, eventTime, title, source])
+  @@index([eventTime])
+  @@index([currency, impact, eventTime])
+  @@index([source, eventTime])
+}
+
+// Audit trail for every weekly self-optimization run.
+model OptimizationLog {
+  id                String   @id @default(uuid())
+  runAt             DateTime
+  sampleSize        Int
+  previousVersion   Int?
+  newVersion        Int
+  weightChanges     Json // Record<DimensionKey, {before: number, after: number, delta: number}>
+  symbolChanges     Json // Record<symbol, "enabled" | "disabled" | "unchanged">
+  regimeGateChanges Json // Record<regime, {before: number, after: number}>
+  winRateBefore     Float?
+  winRateAfter      Float
+  profitFactorAfter Float
+  sharpeAfter       Float
+  notes             String
+  createdAt         DateTime @default(now())
+}

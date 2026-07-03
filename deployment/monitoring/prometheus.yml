@@ -1,0 +1,54 @@
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    env:     production
+    service: igfxpro
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  - "alerts.rules.yml"
+
+scrape_configs:
+  # ── Backend API ─────────────────────────────────────────────────────────────
+  - job_name: igfxpro_api
+    scrape_interval: 15s
+    scrape_timeout:  10s
+    metrics_path: /metrics
+    # Remove or leave empty if METRICS_TOKEN is unset
+    authorization:
+      credentials_file: /etc/prometheus/secrets/metrics_token
+    static_configs:
+      - targets: ["api:3001"]
+        labels:
+          component: backend
+
+  # ── PostgreSQL (via postgres_exporter) ────────────────────────────────────
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+        labels:
+          component: database
+
+  # ── Redis (via redis_exporter) ────────────────────────────────────────────
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+        labels:
+          component: cache
+
+  # ── Node exporter (host metrics) ─────────────────────────────────────────
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          component: host
+
+  # ── Prometheus self-monitoring ────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

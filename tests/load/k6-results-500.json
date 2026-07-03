@@ -1,0 +1,19 @@
+{
+  "tier": 500,
+  "timestamp": "2026-06-13T21:17:13.658Z",
+  "order_p50": null,
+  "order_p95": 17254.6,
+  "order_p99": null,
+  "close_p95": 3646.9,
+  "wallet_p95": 8952.15,
+  "orders_filled": 851,
+  "orders_rejected": 2547,
+  "positions_settled": 776,
+  "double_settlement": 0,
+  "swap_duplicates": 0,
+  "http_5xx_count": 0,
+  "http_error_rate": 0,
+  "total_requests": 12237,
+  "test_duration_ms": 95622.2604,
+  "thresholds_passed": true
+}

@@ -1,0 +1,127 @@
+global:
+  resolve_timeout: 5m
+  # SMTP for email alerts — configure via env vars at compose level
+  smtp_smarthost:   "${SMTP_HOST:-localhost}:${SMTP_PORT:-587}"
+  smtp_from:        "${SMTP_FROM:-alerts@igfxpro.com}"
+  smtp_auth_username: "${SMTP_USER:-}"
+  smtp_auth_password: "${SMTP_PASS:-}"
+  smtp_require_tls: true
+
+# ── Routing ────────────────────────────────────────────────────────────────────
+route:
+  receiver:         default
+  group_by:         [alertname, severity, team]
+  group_wait:       30s
+  group_interval:   5m
+  repeat_interval:  4h
+
+  routes:
+    # Critical alerts → PagerDuty + Slack immediately
+    - match:
+        severity: critical
+      receiver: pagerduty-critical
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: true
+
+    - match:
+        severity: critical
+      receiver: slack-critical
+      continue: false
+
+    # Warning alerts → Slack only
+    - match:
+        severity: warning
+      receiver: slack-warning
+
+    # Compliance alerts → compliance team email
+    - match:
+        team: compliance
+      receiver: compliance-email
+
+    # Security alerts → security team
+    - match:
+        team: security
+      receiver: slack-security
+
+# ── Inhibition rules ───────────────────────────────────────────────────────────
+inhibit_rules:
+  # Suppress all other alerts when the API is completely down
+  - source_match:
+      alertname: ApiDown
+    target_match_re:
+      alertname: .+
+    equal: [env]
+
+  # Suppress warning if critical already firing for same alertname
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: [alertname, team]
+
+# ── Receivers ──────────────────────────────────────────────────────────────────
+receivers:
+  - name: default
+    slack_configs:
+      - api_url: "${ALERTMANAGER_SLACK_WEBHOOK}"
+        channel: "#igfxpro-alerts"
+        send_resolved: true
+        title: '{{ template "slack.default.title" . }}'
+        text: '{{ template "slack.default.text" . }}'
+
+  - name: pagerduty-critical
+    pagerduty_configs:
+      - routing_key: "${ALERTMANAGER_PAGERDUTY_KEY}"
+        description: "{{ .CommonAnnotations.summary }}"
+        details:
+          firing:   "{{ .Alerts.Firing | len }}"
+          resolved: "{{ .Alerts.Resolved | len }}"
+
+  - name: slack-critical
+    slack_configs:
+      - api_url: "${ALERTMANAGER_SLACK_WEBHOOK}"
+        channel: "#igfxpro-oncall"
+        send_resolved: true
+        color: danger
+        title: "🚨 CRITICAL: {{ .CommonAnnotations.summary }}"
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Annotations.summary }}
+          *Details:* {{ .Annotations.description }}
+          *Since:* {{ .StartsAt | humanizeDuration }}
+          {{ end }}
+
+  - name: slack-warning
+    slack_configs:
+      - api_url: "${ALERTMANAGER_SLACK_WEBHOOK}"
+        channel: "#igfxpro-alerts"
+        send_resolved: true
+        color: warning
+        title: "⚠️  {{ .CommonAnnotations.summary }}"
+        text: |
+          {{ range .Alerts }}
+          {{ .Annotations.description }}
+          {{ end }}
+
+  - name: slack-security
+    slack_configs:
+      - api_url: "${ALERTMANAGER_SLACK_WEBHOOK}"
+        channel: "#igfxpro-security"
+        send_resolved: true
+        color: danger
+        title: "🔐 Security alert: {{ .CommonAnnotations.summary }}"
+        text: "{{ .CommonAnnotations.description }}"
+
+  - name: compliance-email
+    email_configs:
+      - to: "${COMPLIANCE_EMAIL:-compliance@igfxpro.com}"
+        send_resolved: true
+        html: |
+          <h2>{{ .CommonAnnotations.summary }}</h2>
+          <p>{{ .CommonAnnotations.description }}</p>
+          <ul>
+          {{ range .Alerts }}
+            <li>Started: {{ .StartsAt }}</li>
+          {{ end }}
+          </ul>
