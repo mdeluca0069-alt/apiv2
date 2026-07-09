@@ -25,6 +25,7 @@ import { olosSignalService } from "../signals-engine/olos.signal.service.js";
 import { PLATFORM_SIGNAL_USER_ID } from "../signals-engine/signal.generator.js";
 import { getSystemHealth } from "./health.check.js";
 import { formatAccountNumber } from "./account-number.js";
+import { riskWarningService } from "../risk-service/risk.warning.service.js";
 
 type UserRecord = {
   id: string;
@@ -2367,35 +2368,36 @@ export class BrokerState {
   }
 
   // ===== RISK WARNING METHODS =====
-  getCurrentWarning(_userId: string) {
-    // Stub: In production, integrate with riskWarningService
-    return null;
+  // Fix #9: these used to be hardcoded stubs (always null/"STABLE"/"IDLE")
+  // — every user saw a permanently green risk dashboard. Now delegate to
+  // the real, DB-backed riskWarningService; risk.warning.generator.ts
+  // (wired in main.ts) periodically populates real data for every user
+  // with an open position. A null/empty result now means "genuinely no
+  // warning on record yet" (e.g. a brand-new account), not a lie.
+  async getCurrentWarning(userId: string) {
+    if (!IS_PERSISTENT) return null;
+    return riskWarningService.getCurrentWarning(userId);
   }
 
-  getRiskDashboard(_userId: string) {
-    // Stub: In production, integrate with riskWarningService
-    return {
-      current: null,
-      analysis: {},
-      trend: "STABLE",
-      heatmap: {},
-      upcomingEvents: [],
-      killSwitchStatus: "IDLE",
-    };
+  async getRiskDashboard(userId: string) {
+    if (!IS_PERSISTENT) {
+      return { current: null, analysis: {}, trend: "STABLE", heatmap: {}, upcomingEvents: [], killSwitchStatus: "IDLE" };
+    }
+    const dashboard = await riskWarningService.getRiskDashboard(userId);
+    return dashboard ?? { current: null, analysis: {}, trend: "STABLE", heatmap: {}, upcomingEvents: [], killSwitchStatus: "IDLE" };
   }
 
-  analyzeScenarios(_userId: string) {
-    // Stub: In production, integrate with riskWarningService
-    return {
-      worstCaseScenario: 0,
-      marginCallProbability: 0,
-      recommendedAction: "Monitor closely",
-      urgency: "NORMAL",
-    };
+  async analyzeScenarios(userId: string) {
+    if (!IS_PERSISTENT) {
+      return { worstCaseScenario: 0, marginCallProbability: 0, recommendedAction: "Monitor closely", urgency: "NORMAL" };
+    }
+    const analysis = await riskWarningService.analyzeScenarios(userId);
+    return analysis ?? { worstCaseScenario: 0, marginCallProbability: 0, recommendedAction: "Monitor closely", urgency: "NORMAL" };
   }
 
-  acknowledgeWarning(_warningId: string) {
-    // Stub: In production, integrate with riskWarningService
+  async acknowledgeWarning(warningId: string) {
+    if (!IS_PERSISTENT) return { acknowledged: true };
+    await riskWarningService.acknowledgeWarning(warningId);
     return { acknowledged: true };
   }
 

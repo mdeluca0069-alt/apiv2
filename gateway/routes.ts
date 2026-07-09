@@ -2145,7 +2145,7 @@ export const routes: Route[] = [
     method: "GET",
     path: api("/risk/warning/current"),
     auth: true,
-    handler: ({ state, authHeader }) => {
+    handler: async ({ state, authHeader }) => {
       const principal = state.resolvePrincipal(authHeader);
       if (!principal) return { ok: false, reason: "unauthenticated" };
       return state.getCurrentWarning(principal.sub);
@@ -2155,7 +2155,7 @@ export const routes: Route[] = [
     method: "GET",
     path: api("/risk/warning/dashboard"),
     auth: true,
-    handler: ({ state, authHeader }) => {
+    handler: async ({ state, authHeader }) => {
       const principal = state.resolvePrincipal(authHeader);
       if (!principal) return { ok: false, reason: "unauthenticated" };
       return state.getRiskDashboard(principal.sub);
@@ -2165,7 +2165,7 @@ export const routes: Route[] = [
     method: "GET",
     path: api("/risk/warning/scenarios"),
     auth: true,
-    handler: ({ state, authHeader }) => {
+    handler: async ({ state, authHeader }) => {
       const principal = state.resolvePrincipal(authHeader);
       if (!principal) return { ok: false, reason: "unauthenticated" };
       return state.analyzeScenarios(principal.sub);
@@ -2175,7 +2175,7 @@ export const routes: Route[] = [
     method: "POST",
     path: api("/risk/warning/:id/acknowledge"),
     auth: true,
-    handler: ({ params, state }) => {
+    handler: async ({ params, state }) => {
       const warningId = (params as any)?.id;
       return state.acknowledgeWarning(warningId);
     },

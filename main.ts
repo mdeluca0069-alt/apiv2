@@ -113,6 +113,7 @@ import { pendingOrderBook }         from "./trading-service/pending.order.book.j
 import { orderTriggerWatcher }      from "./trading-service/order.trigger.watcher.js";
 import { pendingOrderExpiryService } from "./trading-service/pending.order.expiry.js";
 import { stopOutEngine }         from "./trading-service/stopout.engine.js";
+import { riskWarningGenerator }  from "./risk-service/risk.warning.generator.js";
 import { swapAccrualService }    from "./settlement/swap.accrual.service.js";
 import { positionPriceMonitor }  from "./trading-service/position.price.monitor.js";
 import { redisPubSub }           from "./realtime-infra/redis.pubsub.js";
@@ -201,6 +202,7 @@ jobCoordinator.register({ id: "signal-expire",         ttlSeconds: 3_500,   inte
 jobCoordinator.register({ id: "olos-self-optimizer",   ttlSeconds: 86_000,  intervalMs: 7 * 24 * 60 * 60_000, description: "Weekly OLOS confidence weight recalibration"         });
 jobCoordinator.register({ id: "autopilot-position-manager", ttlSeconds: 25, intervalMs: 30_000,             description: "Break-even/trailing/regime-exit/time-stop for autopilot positions" });
 jobCoordinator.register({ id: "global-risk-supervisor",     ttlSeconds: 25, intervalMs: 30_000,             description: "Platform-wide autopilot safety evaluation (SAFE/EMERGENCY/STOP modes)" });
+jobCoordinator.register({ id: "risk-warning-generator",      ttlSeconds: 25, intervalMs: 30_000,             description: "Fix #9: persists each active user's real risk-warning/dashboard state" });
 // Task 14: DB hardening jobs
 jobCoordinator.register({ id: "data-retention",           ttlSeconds: 3_500,   intervalMs: 24 * 60 * 60_000,     description: "Daily data retention sweep + partition auto-create"  });
 jobCoordinator.register({ id: "enhanced-recon-daily",     ttlSeconds: 23 * 60 * 60, intervalMs: 24 * 60 * 60_000, description: "Daily enhanced reconciliation (swap/deposit/PnL audit)" });
@@ -1009,6 +1011,23 @@ setInterval(() => {
         console.warn(`[stop-out] stopOuts=${r.stopOuts} marginCalls=${r.marginCalls} warnings=${r.warnings} scanned=${r.scannedUsers}`);
       }
     }).catch((err) => console.error("[stop-out] scan failed:", (err as Error).message));
+  }
+}, 30_000);
+
+// Risk warning generator — every 30 seconds (Fix #9).
+// Persists each active user's REAL current risk state (margin level,
+// exposure heatmap, kill-switch status, etc.) so GET /risk/warning/*
+// reflects reality instead of the previous hardcoded "STABLE"/"IDLE" stub.
+setInterval(async () => {
+  if (!prisma) return;
+  if (!(await jobCoordinator.tryLead("risk-warning-generator"))) return;
+  try {
+    const r = await riskWarningGenerator.generateForAllActiveUsers();
+    if (r.errors > 0) console.warn(`[risk-warning-generator] processed=${r.processed} errors=${r.errors}`);
+  } catch (err) {
+    console.error("[risk-warning-generator] run failed:", (err as Error).message);
+  } finally {
+    await jobCoordinator.release("risk-warning-generator");
   }
 }, 30_000);
 

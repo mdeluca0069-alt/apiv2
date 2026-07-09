@@ -1,5 +1,6 @@
 import { prisma } from "../shared/db.js";
 import { type RiskWarning } from "../shared/contracts.js";
+import { Decimal } from "@prisma/client/runtime/library";
 
 export class RiskWarningService {
   // Crea o aggiorna un warning di rischio
@@ -246,7 +247,5 @@ export class RiskWarningService {
     };
   }
 }
-
-import { Decimal } from "@prisma/client/runtime/library";
 
 export const riskWarningService = new RiskWarningService();
