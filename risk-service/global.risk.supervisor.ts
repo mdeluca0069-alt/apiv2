@@ -31,8 +31,10 @@ import { feedHealthMonitor } from "../market-data/feed.health.monitor.js";
 import { getRegimeSnapshot } from "../ai-core/regime.snapshot.js";
 import { metrics } from "../gateway/metrics.js";
 import { alertManager } from "../alerting/alert.manager.js";
+import { publishControlChannel, subscribeControlChannel } from "../shared/control.channel.js";
 
 const SETTING_KEY = "global_risk_supervisor";
+const CHANNEL      = "risk-supervisor";
 
 export type SupervisorMode = "NORMAL" | "SAFE_MODE" | "EMERGENCY_MODE" | "FULL_AUTOPILOT_STOP";
 
@@ -145,6 +147,20 @@ export class GlobalRiskSupervisor {
     } catch {
       // DB unavailable — keep previous in-memory state
     }
+  }
+
+  /**
+   * Fix #6: subscribes to cross-worker mode changes (admin overrides AND
+   * automatic escalations from whichever worker is the leader-elected
+   * evaluator) so every worker's autopilot.pipeline.ts gate sees the same
+   * mode within milliseconds, instead of only the worker that made the
+   * change. Call once at startup, after load(). No-op with no Redis configured.
+   */
+  async startSync(): Promise<void> {
+    await subscribeControlChannel(CHANNEL, (payload) => {
+      this._cached = payload as PersistedState;
+      console.warn(`[risk-supervisor] state synced from another worker: mode=${this._cached.mode}`);
+    });
   }
 
   getMode(): SupervisorMode {
@@ -268,6 +284,7 @@ export class GlobalRiskSupervisor {
       create: { key: SETTING_KEY, value: this._cached as object },
       update: { value: this._cached as object },
     }).catch(() => undefined);
+    void publishControlChannel(CHANNEL, this._cached);
   }
 
   // ── Signal computation ────────────────────────────────────────────────────

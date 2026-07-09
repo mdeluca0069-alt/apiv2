@@ -1441,11 +1441,22 @@ export const routes: Route[] = [
     method: "POST",
     path: api("/admin/trading/kill-switch"),
     admin: true,
-    handler: ({ authHeader, body, state }) => {
+    // Fix #6: this used to call state.adminToggleKillSwitch(), which only
+    // flipped an in-memory display flag the real pre-trade risk check never
+    // read — an admin using THIS endpoint believed they'd halted trading
+    // platform-wide, but the engine kept accepting orders. Now delegates to
+    // the same real killSwitch singleton /trading/kill-switch uses.
+    handler: async ({ authHeader, body, state }) => {
       const principal = state.resolvePrincipal(authHeader);
       if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
       const parsed = AdminKillSwitchSchema.parse(body);
-      return state.adminToggleKillSwitch(principal, parsed);
+      if (parsed.enabled) {
+        await killSwitch.activate(parsed.reason ?? "Admin action", principal.sub);
+      } else {
+        await killSwitch.deactivate(principal.sub);
+      }
+      state.adminUpdateRiskPolicy(principal, { killSwitchEnabled: parsed.enabled } as Parameters<typeof state.adminUpdateRiskPolicy>[1]);
+      return { ok: true, killSwitch: killSwitch.getState() };
     },
   },
   // Task 13 — Global Risk Supervisor (Phase 1)

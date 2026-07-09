@@ -248,6 +248,19 @@ await Promise.all([
   ),
 ]);
 
+// Fix #6: cluster-wide kill-switch / risk-supervisor sync — must start after
+// load() (above) so this worker doesn't briefly overwrite its own freshly-
+// loaded state with an empty subscribe-time race, and after Redis is
+// connected (initRedis(), earlier in this file). No-op without Redis.
+await Promise.all([
+  killSwitch.startSync().catch((err) =>
+    console.error("[kill-switch] cross-worker sync failed to start:", (err as Error).message),
+  ),
+  globalRiskSupervisor.startSync().catch((err) =>
+    console.error("[risk-supervisor] cross-worker sync failed to start:", (err as Error).message),
+  ),
+]);
+
 // Seed synthetic placeholder candles synchronously so charts have data immediately.
 // TwelveData historical seeder will overwrite these with real OHLCV when ENABLE_HISTORICAL_SEED=true.
 seedSyntheticCandles();

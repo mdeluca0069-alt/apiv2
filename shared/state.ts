@@ -1608,18 +1608,6 @@ export class BrokerState {
     return next;
   }
 
-  adminToggleKillSwitch(actor: Principal, input: { enabled: boolean; reason: string }): BrokerRiskPolicy {
-    this.riskPolicy = {
-      ...this.riskPolicy,
-      killSwitchEnabled: input.enabled,
-      killSwitchReason: input.enabled ? input.reason : undefined,
-      updatedAt: nowIso(),
-    };
-    void this.persistBrokerSetting("riskPolicy", this.riskPolicy);
-    this.recordAudit(actor.sub, "admin.kill_switch", "risk_policy", input);
-    return this.getRiskPolicy();
-  }
-
   adminUpdateRiskPolicy(
     actor: Principal,
     input: {
