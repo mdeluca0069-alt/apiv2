@@ -162,7 +162,11 @@ export class SwapAccrualService {
       openedAt: pos.openedAt,
     }).rateAnnual;
 
-    const reference = `SWAP:${pos.id}:${today()}`;
+    // Derived from accrualDate (the logical day being charged), not a fresh
+    // today() call — a catch-up run for a missed day passes an earlier
+    // accrualDate than the wall-clock date it actually runs on, and the
+    // reference must reflect the day being charged, not the day it ran.
+    const reference = `SWAP:${pos.id}:${accrualDate.toISOString().slice(0, 10)}`;
     const isDebit   = chargeAmount < 0;
 
     // Single Serializable transaction: idempotency check + all writes.

@@ -70,23 +70,28 @@ SELECT COUNT(*) AS check3_violations FROM (
 
 \echo ''
 
--- CHECK 4: Duplicate swap accruals — same positionId + same day
-\echo 'CHECK 4: Duplicate swap accruals (same positionId + day)'
-SELECT reference AS "positionId",
-       DATE("createdAt") AS accrual_date,
-       COUNT(*) AS swap_count
+-- CHECK 4: Duplicate swap accruals — same positionId + same logical accrual day.
+-- `reference` is built as SWAP:{positionId}:{accrualDate} (swap.accrual.service.ts:165)
+-- and already uniquely encodes position+day — grouping additionally by
+-- DATE("createdAt") is wrong: a catch-up/backfill run can insert a row for an
+-- earlier missed accrualDate on a later wall-clock day, which is correct
+-- behavior (one row per accrualDate) but was flagged as a false-positive
+-- duplicate. `reference` alone is the right (and sufficient) grouping key,
+-- same pattern as CHECK 3 above for PNL_SETTLEMENT.
+\echo 'CHECK 4: Duplicate swap accruals (same positionId + accrualDate)'
+SELECT reference AS "positionId_and_accrualDate", COUNT(*) AS swap_count
 FROM "LedgerEntry"
 WHERE type = 'SWAP'
-GROUP BY reference, DATE("createdAt")
+GROUP BY reference
 HAVING COUNT(*) > 1
 ORDER BY swap_count DESC
 LIMIT 20;
 
 SELECT COUNT(*) AS check4_violations FROM (
-  SELECT reference, DATE("createdAt")
+  SELECT reference
   FROM "LedgerEntry"
   WHERE type = 'SWAP'
-  GROUP BY reference, DATE("createdAt")
+  GROUP BY reference
   HAVING COUNT(*) > 1
 ) sub;
 
