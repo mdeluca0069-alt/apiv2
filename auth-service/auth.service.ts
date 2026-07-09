@@ -12,6 +12,12 @@ import { hashPassword, verifyPassword, needsUpgrade }    from "./password.hasher
 import type { Principal }                                from "../shared/contracts.js";
 import { formatAccountNumber }                           from "../shared/account-number.js";
 import { eventBus }                                      from "../events-bus/event.bus.js";
+import { twoFactorService }                              from "./2fa.service.js";
+import {
+  issueLoginMfaChallenge,
+  consumeLoginMfaChallenge,
+  loginMfaChallengeTtlSeconds,
+}                                                         from "./login.mfa.challenge.js";
 
 const TOKEN_TTL = 3_600; // 1 hour
 
@@ -30,6 +36,8 @@ export type AuthResult = {
   tenantId?:    string;
   reason?:      string;
   requiresMfa?: boolean;
+  /** Present only when requiresMfa is true — pass to completeMfaLogin() with the TOTP code. */
+  mfaToken?:    string;
 };
 
 /**
@@ -89,6 +97,57 @@ class AuthService {
       } catch { /* non-fatal */ }
     }
 
+    // ── Fix #3: gate the session on 2FA when the user has it enrolled ──────
+    // Password alone must never be enough to obtain a full session for an
+    // account with TOTP enabled — issue a short-lived challenge instead and
+    // require completeMfaLogin() to actually mint the access/refresh tokens.
+    const mfaEnabled = await twoFactorService.isEnabled(user.id).catch(() => false);
+    if (mfaEnabled) {
+      const mfaToken = await issueLoginMfaChallenge(user.id);
+      return {
+        ok: true,
+        requiresMfa: true,
+        mfaToken,
+        expiresIn: loginMfaChallengeTtlSeconds(),
+      };
+    }
+
+    void suspiciousLogin.recordSuccess(user.id, ctx.ip ?? "unknown", ctx.userAgent ?? "");
+    const fingerprint = computeFingerprintFromParts(ctx.ip ?? "", ctx.userAgent ?? "");
+    void upsertDeviceProfile(user.id, fingerprint, ctx.ip ?? "", "login_success").catch(() => null);
+
+    return this._issueSession(user);
+  }
+
+  /**
+   * Completes a login that was gated on 2FA by login(): consumes the
+   * single-use challenge token and, if the TOTP/backup code is valid, mints
+   * the real access/refresh tokens. This is the ONLY way to obtain a full
+   * session for an account with 2FA enrolled — there is no path that skips it.
+   */
+  async completeMfaLogin(mfaToken: string, code: string, ctx: LoginContext = {}): Promise<AuthResult> {
+    if (!IS_PERSISTENT) return { ok: false, reason: "DB_UNAVAILABLE" };
+
+    const userId = await consumeLoginMfaChallenge(mfaToken);
+    if (!userId) return { ok: false, reason: "MFA_CHALLENGE_INVALID_OR_EXPIRED" };
+
+    const db   = prisma as NonNullable<typeof prisma>;
+    const user = await db.user.findUnique({ where: { id: userId } });
+    if (!user) return { ok: false, reason: "INVALID_CREDENTIALS" };
+
+    const verifyResult = await twoFactorService.verify(userId, code);
+    if (!verifyResult.valid) return { ok: false, reason: "INVALID_MFA_CODE" };
+
+    void suspiciousLogin.recordSuccess(user.id, ctx.ip ?? "unknown", ctx.userAgent ?? "");
+    const fingerprint = computeFingerprintFromParts(ctx.ip ?? "", ctx.userAgent ?? "");
+    void upsertDeviceProfile(user.id, fingerprint, ctx.ip ?? "", "login_success").catch(() => null);
+
+    return this._issueSession(user);
+  }
+
+  private async _issueSession(
+    user: { id: string; email: string; fullName: string; tenantId: string; tier: string; kycStatus: string; roles: unknown; permissions: unknown },
+  ): Promise<AuthResult> {
     const roles       = this._parseJson<string[]>(user.roles, []);
     const permissions = this._parseJson<string[]>(user.permissions,
       accessPolicy.getPermissionsForRoles(roles));
@@ -100,10 +159,6 @@ class AuthService {
       TOKEN_TTL,
     );
     const refreshToken = await sessionManager.create(user.id);
-
-    void suspiciousLogin.recordSuccess(user.id, ctx.ip ?? "unknown", ctx.userAgent ?? "");
-    const fingerprint = computeFingerprintFromParts(ctx.ip ?? "", ctx.userAgent ?? "");
-    void upsertDeviceProfile(user.id, fingerprint, ctx.ip ?? "", "login_success").catch(() => null);
 
     return {
       ok: true, accessToken, refreshToken,

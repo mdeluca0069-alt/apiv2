@@ -65,6 +65,45 @@ export const authController = {
       return { ok: false, reason: result.reason ?? "INVALID_CREDENTIALS" };
     }
 
+    // Fix #3: password was correct but this account has 2FA enrolled — no
+    // token is issued yet, only a short-lived challenge the client must
+    // complete via POST /auth/login/db/mfa with the TOTP/backup code.
+    if (result.requiresMfa) {
+      return { ok: true, requiresMfa: true, mfaToken: result.mfaToken, expiresIn: result.expiresIn };
+    }
+
+    if (result.refreshToken) {
+      setCookieHeader(ctx.res, result.refreshToken);
+    }
+
+    return {
+      ok:           true,
+      accessToken:  result.accessToken,
+      expiresIn:    result.expiresIn,
+      tokenType:    result.tokenType,
+      principal:    result.principal,
+      tenantId:     result.tenantId,
+      refreshToken: undefined, // never expose in body
+    };
+  },
+
+  async completeMfaLogin(ctx: RouteContext) {
+    const body     = ctx.body as Record<string, unknown>;
+    const mfaToken = String(body?.mfaToken ?? "");
+    const code     = String(body?.code     ?? "");
+    const ip       = extractIp(ctx.req);
+    const ua       = String(ctx.req.headers["user-agent"] ?? "");
+
+    if (!mfaToken || !code) {
+      return { ok: false, reason: "MFA_TOKEN_AND_CODE_REQUIRED" };
+    }
+
+    const result = await authService.completeMfaLogin(mfaToken, code, { ip, userAgent: ua });
+
+    if (!result.ok) {
+      return { ok: false, reason: result.reason ?? "INVALID_MFA_CODE" };
+    }
+
     if (result.refreshToken) {
       setCookieHeader(ctx.res, result.refreshToken);
     }

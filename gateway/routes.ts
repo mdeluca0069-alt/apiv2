@@ -2470,6 +2470,18 @@ export const routes: Route[] = [
     },
   },
 
+  // Fix #3: completes a login that /auth/login/db gated on 2FA. Takes the
+  // short-lived mfaToken from that response plus a TOTP/backup code, and is
+  // the only path that mints a real session for a 2FA-enrolled account.
+  {
+    method: "POST",
+    path: api("/auth/login/db/mfa"),
+    handler: async (ctx) => {
+      if (!IS_PERSISTENT) return { ok: false, reason: "DB_UNAVAILABLE" };
+      return authController.completeMfaLogin(ctx as Parameters<typeof authController.completeMfaLogin>[0]);
+    },
+  },
+
   // DB register — falls back to in-memory registration without a DB.
   {
     method: "POST",
