@@ -5235,6 +5235,7 @@ export const routes: Route[] = [
 
       const algo = algoOrderService.submit({
         userId:        principal.sub,
+        tenantId:      principal.tenantId,
         symbol,
         direction,
         totalQuantity,

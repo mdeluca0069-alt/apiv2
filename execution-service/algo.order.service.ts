@@ -15,13 +15,18 @@
  *   BRACKET — OCO (One-Cancels-Other) with entry, take-profit, and stop-loss
  *              as a single atomic unit. Cancels the remaining leg on fill.
  *
- * All algo orders run within in-process interval loops and submit child orders
- * to the real execution engine. On restart they are marked CANCELLED (no
- * persistence of in-flight algo state across restarts is guaranteed).
+ * All algo orders run within in-process, self-scheduling async loops. Each
+ * child slice is placed through the real execution pipeline
+ * (trading-service/order.controller.ts — the same path MARKET orders use)
+ * and awaited before the next slice is considered, so filledQuantity/
+ * remainingQty/avgFillPrice always reflect real fills, never a simulation.
+ * On restart they are marked CANCELLED (no persistence of in-flight algo
+ * state across restarts is guaranteed).
  */
 
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { orderController } from "../trading-service/order.controller.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -89,10 +94,12 @@ export type AlgoParams = TwapParams | VwapParams | IcebergParams | BracketParams
 
 export type AlgoSubmitRequest = {
   userId:        string;
+  tenantId:      string;
   symbol:        string;
   direction:     "BUY" | "SELL";
   totalQuantity: number;
   params:        AlgoParams;
+  /** Fired after each child slice is placed (filled or failed) — for logging/push, not execution. */
   onChildFill?:  (childOrder: ChildOrder, algo: AlgoOrder) => void;
 };
 
@@ -124,8 +131,18 @@ function getVolumeWeights(slices: number, profile: VwapParams["volumeProfile"]):
 
 // ─── AlgoOrderService ─────────────────────────────────────────────────────────
 
+type OrderCtx = { userId: string; tenantId: string };
+
+type ActiveEntry = {
+  algo:           AlgoOrder;
+  ctx:            OrderCtx;
+  /** True once no further child slices will ever be sent (all scheduled). */
+  allSlicesSent:  boolean;
+  cancelRequested:boolean;
+};
+
 export class AlgoOrderService extends EventEmitter {
-  private readonly active = new Map<string, { algo: AlgoOrder; timer: ReturnType<typeof setInterval> | null }>();
+  private readonly active = new Map<string, ActiveEntry>();
 
   submit(req: AlgoSubmitRequest): AlgoOrder {
     const id  = `algo_${randomUUID()}`;
@@ -148,24 +165,33 @@ export class AlgoOrderService extends EventEmitter {
       updatedAt:      now,
     };
 
-    switch (req.params.type) {
-      case "TWAP":
-        this._runTwap(algo, req.params, req.onChildFill);
-        break;
-      case "VWAP":
-        this._runVwap(algo, req.params, req.onChildFill);
-        break;
-      case "ICEBERG":
-        this._runIceberg(algo, req.params, req.onChildFill);
-        break;
-      case "BRACKET":
-        this._runBracket(algo, req.onChildFill);
-        break;
-    }
-
-    this.active.set(id, { algo, timer: null });
+    const entry: ActiveEntry = {
+      algo,
+      ctx:             { userId: req.userId, tenantId: req.tenantId },
+      allSlicesSent:   false,
+      cancelRequested: false,
+    };
+    this.active.set(id, entry);
     this.emit("algo:started", algo);
     console.log(`[algo] ${id} ${req.params.type} ${req.direction} ${req.totalQuantity} ${req.symbol} started`);
+
+    // Fire-and-forget: the async runner drives the algo to completion in the
+    // background. Errors inside it are always caught per-slice (see
+    // _executeChild), so this can never produce an unhandled rejection.
+    switch (req.params.type) {
+      case "TWAP":
+        void this._runTwap(entry, req.params, req.onChildFill);
+        break;
+      case "VWAP":
+        void this._runVwap(entry, req.params, req.onChildFill);
+        break;
+      case "ICEBERG":
+        void this._runIceberg(entry, req.params, req.onChildFill);
+        break;
+      case "BRACKET":
+        void this._runBracket(entry, req.onChildFill);
+        break;
+    }
 
     return algo;
   }
@@ -174,10 +200,12 @@ export class AlgoOrderService extends EventEmitter {
     const entry = this.active.get(algoId);
     if (!entry || entry.algo.userId !== userId) return false;
 
-    if (entry.timer) clearInterval(entry.timer);
-    entry.algo.status    = "CANCELLED";
-    entry.algo.updatedAt = new Date().toISOString();
-    this.active.delete(algoId);
+    // Stop future slices; any slice already in flight (awaiting placeOrder)
+    // still resolves normally and is accounted for via recordChildFill/
+    // recordChildFailure — we don't leave a dangling real order unaccounted.
+    entry.cancelRequested = true;
+    entry.algo.status     = "CANCELLED";
+    entry.algo.updatedAt  = new Date().toISOString();
     this.emit("algo:cancelled", entry.algo);
     console.log(`[algo] ${algoId} cancelled by userId=${userId}`);
     return true;
@@ -195,149 +223,153 @@ export class AlgoOrderService extends EventEmitter {
 
   // ── TWAP execution ─────────────────────────────────────────────────────────
 
-  private _runTwap(
-    algo:       AlgoOrder,
+  private async _runTwap(
+    entry:      ActiveEntry,
     params:     TwapParams,
     onFill?:    AlgoSubmitRequest["onChildFill"],
-  ): void {
-    const sliceQty     = algo.totalQuantity / params.slices;
-    const intervalMs   = params.durationMs / params.slices;
-    let   slicesFired  = 0;
+  ): Promise<void> {
+    const { algo } = entry;
+    const sliceQty = algo.totalQuantity / params.slices;
 
-    const timer = setInterval(() => {
-      if (slicesFired >= params.slices || algo.status !== "RUNNING") {
-        clearInterval(timer);
-        if (algo.status === "RUNNING") this._complete(algo);
-        return;
-      }
+    for (let slicesFired = 0; slicesFired < params.slices; slicesFired++) {
+      if (entry.cancelRequested) return;
+      if (slicesFired > 0) await sleep(params.durationMs / params.slices);
+      if (entry.cancelRequested) return;
 
-      const qty    = slicesFired === params.slices - 1
+      const qty = slicesFired === params.slices - 1
         ? algo.remainingQty     // last slice absorbs rounding residual
         : Math.min(sliceQty, algo.remainingQty);
 
-      this._simulateFill(algo, qty, onFill);
-      slicesFired++;
+      await this._executeChild(entry, qty, onFill);
+    }
 
-      if (algo.remainingQty <= 0) {
-        clearInterval(timer);
-        this._complete(algo);
-      }
-    }, intervalMs);
-
-    const entry = this.active.get(algo.id);
-    if (entry) entry.timer = timer;
+    this._finishSlicing(entry);
   }
 
   // ── VWAP execution ─────────────────────────────────────────────────────────
 
-  private _runVwap(
-    algo:    AlgoOrder,
+  private async _runVwap(
+    entry:   ActiveEntry,
     params:  VwapParams,
     onFill?: AlgoSubmitRequest["onChildFill"],
-  ): void {
+  ): Promise<void> {
+    const { algo } = entry;
     const weights    = getVolumeWeights(params.slices, params.volumeProfile);
     const quantities = weights.map(w => algo.totalQuantity * w);
-    const intervalMs = params.durationMs / params.slices;
-    let   idx        = 0;
 
-    const timer = setInterval(() => {
-      if (idx >= params.slices || algo.status !== "RUNNING") {
-        clearInterval(timer);
-        if (algo.status === "RUNNING") this._complete(algo);
-        return;
-      }
+    for (let idx = 0; idx < params.slices; idx++) {
+      if (entry.cancelRequested) return;
+      if (idx > 0) await sleep(params.durationMs / params.slices);
+      if (entry.cancelRequested) return;
 
       const qty = idx === params.slices - 1
         ? algo.remainingQty
         : Math.min(quantities[idx]!, algo.remainingQty);
 
-      this._simulateFill(algo, qty, onFill);
-      idx++;
+      await this._executeChild(entry, qty, onFill);
+    }
 
-      if (algo.remainingQty <= 0) {
-        clearInterval(timer);
-        this._complete(algo);
-      }
-    }, intervalMs);
-
-    const entry = this.active.get(algo.id);
-    if (entry) entry.timer = timer;
+    this._finishSlicing(entry);
   }
 
   // ── Iceberg execution ──────────────────────────────────────────────────────
 
-  private _runIceberg(
-    algo:    AlgoOrder,
+  private async _runIceberg(
+    entry:   ActiveEntry,
     params:  IcebergParams,
     onFill?: AlgoSubmitRequest["onChildFill"],
-  ): void {
-    const fireSlice = () => {
-      if (algo.status !== "RUNNING" || algo.remainingQty <= 0) {
-        this._complete(algo);
-        return;
-      }
+  ): Promise<void> {
+    const { algo } = entry;
 
+    while (!entry.cancelRequested && algo.remainingQty > 0) {
       const qty = Math.min(params.visibleQty, algo.remainingQty);
-      this._simulateFill(algo, qty, onFill);
+      await this._executeChild(entry, qty, onFill);
 
-      if (algo.remainingQty > 0) {
-        setTimeout(fireSlice, params.reloadDelay);
-      } else {
-        this._complete(algo);
-      }
-    };
+      if (entry.cancelRequested || algo.remainingQty <= 0) break;
+      await sleep(params.reloadDelay);
+    }
 
-    // Fire first slice immediately
-    setTimeout(fireSlice, 0);
+    this._finishSlicing(entry);
   }
 
   // ── Bracket execution ──────────────────────────────────────────────────────
 
-  private _runBracket(
-    algo:    AlgoOrder,
+  private async _runBracket(
+    entry:   ActiveEntry,
     onFill?: AlgoSubmitRequest["onChildFill"],
-  ): void {
-    // Bracket is a logical container — the entry fills immediately (market) or
-    // when price touches limitPrice (limit). TP and SL (algo.params, a
-    // BracketParams) are managed by the existing order.trigger.watcher in
-    // trading-service, not by this simulator.
-    this._simulateFill(algo, algo.totalQuantity, onFill);
-    this._complete(algo);
+  ): Promise<void> {
+    // Bracket is a single entry order carrying its own stopLoss/takeProfit —
+    // _executeChild attaches them from algo.params (BracketParams) so the
+    // resulting position is protected the moment it opens; ongoing SL/TP
+    // enforcement is then the existing position.price.monitor's job, same
+    // as any other position.
+    if (!entry.cancelRequested) {
+      await this._executeChild(entry, entry.algo.totalQuantity, onFill);
+    }
+    this._finishSlicing(entry);
   }
 
-  // ── Fill simulation ────────────────────────────────────────────────────────
+  // ── Child order execution (real, via the order controller) ───────────────
 
-  private _simulateFill(
-    algo:    AlgoOrder,
+  /** Marks that no further slices will be scheduled, then completes if nothing is left pending. */
+  private _finishSlicing(entry: ActiveEntry): void {
+    entry.allSlicesSent = true;
+    this._maybeComplete(entry);
+  }
+
+  private async _executeChild(
+    entry:   ActiveEntry,
     qty:     number,
     onFill?: AlgoSubmitRequest["onChildFill"],
-  ): void {
+  ): Promise<void> {
     if (qty <= 0) return;
+    const { algo, ctx } = entry;
 
     const childId = `co_${randomUUID()}`;
     const now     = new Date().toISOString();
-
-    // In production this fires the real ExecutionEngine. Here we record the
-    // child order and emit an event so the caller can route to real execution.
     const child: ChildOrder = {
-      id:       childId,
-      quantity: qty,
-      fillPrice:null,   // filled by caller after execution
-      status:   "PENDING",
-      sentAt:   now,
-      filledAt: null,
+      id:        childId,
+      quantity:  qty,
+      fillPrice: null,
+      status:    "PENDING",
+      sentAt:    now,
+      filledAt:  null,
     };
-
     algo.childOrders.push(child);
     algo.updatedAt = now;
-
     this.emit("algo:child:sent", { algo, child });
+
+    try {
+      const bracket = algo.params.type === "BRACKET" ? algo.params : undefined;
+      const ack = await orderController.placeOrder(
+        {
+          symbol:     algo.symbol,
+          side:       algo.direction,
+          type:       "MARKET",
+          quantity:   qty,
+          leverage:   1,
+          stopLoss:   bracket?.stopLoss,
+          takeProfit: bracket?.takeProfit,
+        },
+        ctx,
+      );
+
+      if (ack.status === "FILLED" && typeof ack.averageFillPrice === "number") {
+        this.recordChildFill(algo.id, childId, ack.averageFillPrice, qty);
+      } else {
+        this._recordChildFailure(algo.id, childId, ack.rejectionReason ?? `order status ${ack.status}`);
+      }
+    } catch (err) {
+      this._recordChildFailure(algo.id, childId, (err as Error).message);
+    }
+
     onFill?.(child, algo);
   }
 
   recordChildFill(algoId: string, childId: string, fillPrice: number, qty: number): void {
-    const algo = this.get(algoId);
-    if (!algo) return;
+    const entry = this.active.get(algoId);
+    if (!entry) return;
+    const { algo } = entry;
 
     const child = algo.childOrders.find(c => c.id === childId);
     if (!child) return;
@@ -355,18 +387,50 @@ export class AlgoOrderService extends EventEmitter {
     algo.updatedAt = new Date().toISOString();
 
     this.emit("algo:child:filled", { algo, child });
+    this._maybeComplete(entry);
   }
 
-  private _complete(algo: AlgoOrder): void {
-    algo.status      = "COMPLETED";
+  private _recordChildFailure(algoId: string, childId: string, reason: string): void {
+    const entry = this.active.get(algoId);
+    if (!entry) return;
+    const { algo } = entry;
+
+    const child = algo.childOrders.find(c => c.id === childId);
+    if (!child) return;
+
+    child.status   = "CANCELLED";
+    child.filledAt = new Date().toISOString();
+    algo.updatedAt = child.filledAt;
+
+    console.warn(`[algo] ${algoId} child ${childId} failed: ${reason}`);
+    this.emit("algo:child:failed", { algo, child, reason });
+    this._maybeComplete(entry);
+  }
+
+  /** Completes the algo once slicing has finished AND no child order is still PENDING. */
+  private _maybeComplete(entry: ActiveEntry): void {
+    const { algo } = entry;
+    if (algo.status !== "RUNNING") return;
+    if (!entry.allSlicesSent) return;
+    if (algo.childOrders.some(c => c.status === "PENDING")) return;
+    this._complete(entry);
+  }
+
+  private _complete(entry: ActiveEntry): void {
+    const { algo } = entry;
+    algo.status      = algo.filledQuantity > 0 ? "COMPLETED" : "FAILED";
     algo.updatedAt   = new Date().toISOString();
     algo.completedAt = algo.updatedAt;
     this.active.delete(algo.id);
     this.emit("algo:completed", algo);
     console.log(
-      `[algo] ${algo.id} COMPLETED filled=${algo.filledQuantity.toFixed(4)}/${algo.totalQuantity.toFixed(4)} avgPrice=${algo.avgFillPrice.toFixed(5)}`
+      `[algo] ${algo.id} ${algo.status} filled=${algo.filledQuantity.toFixed(4)}/${algo.totalQuantity.toFixed(4)} avgPrice=${algo.avgFillPrice.toFixed(5)}`
     );
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 export const algoOrderService = new AlgoOrderService();
