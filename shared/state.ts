@@ -2309,8 +2309,11 @@ export class BrokerState {
   }
 
   // ===== TRADE AUDIT METHODS =====
+  // Not implemented: detailed per-trade audit history is not backed by a live
+  // service. Real position/order data is available via getPositions()/getOrders();
+  // this endpoint intentionally returns an honest empty result rather than
+  // partial/fake data.
   getTradeHistory(_userId: string, filters?: any) {
-    // Stub: In production, integrate with tradeAuditService
     return {
       trades: [],
       total: 0,
@@ -2320,7 +2323,6 @@ export class BrokerState {
   }
 
   getUserTradeStats(_userId: string) {
-    // Stub: In production, integrate with tradeAuditService
     return {
       totalTrades: 0,
       openTrades: 0,
@@ -2409,71 +2411,4 @@ export class BrokerState {
     return { acknowledged: true };
   }
 
-  // ===== ACADEMY METHODS =====
-  getPublishedContent(filters?: any) {
-    // Stub: In production, integrate with academyService
-    return {
-      content: [],
-      total: 0,
-      limit: filters?.limit || 20,
-      offset: filters?.offset || 0,
-    };
-  }
-
-  getContentById(_contentId: string) {
-    // Stub: In production, integrate with academyService
-    return null;
-  }
-
-  getLearningPath(_userId: string, tier: string) {
-    // Stub: In production, integrate with academyService
-    return {
-      tier,
-      recommendedLevel: "beginner",
-      suggested: [],
-      completedCount: 0,
-      totalCount: 0,
-    };
-  }
-
-  getUserProgress(_userId: string) {
-    // Stub: In production, integrate with academyService
-    return {
-      completed: 0,
-      inProgress: 0,
-      notStarted: 0,
-      total: 0,
-      items: [],
-    };
-  }
-
-  recordProgress(_userId: string, _contentId: string, progress: number, _notes?: string) {
-    // Stub: In production, integrate with academyService
-    return { userId: "", contentId: "", progress, completed: progress >= 100 };
-  }
-
-  getContentByCategory(category: string) {
-    // Stub: In production, integrate with academyService
-    return {
-      category,
-      count: 0,
-      content: [],
-    };
-  }
-
-  getRelatedContent(_contentId: string) {
-    // Stub: In production, integrate with academyService
-    return [];
-  }
-
-  getAcademyStats() {
-    // Stub: In production, integrate with academyService
-    return {
-      totalContent: 0,
-      uniqueUsers: 0,
-      totalCompletions: 0,
-      avgRating: 0,
-      categories: [],
-    };
-  }
 }

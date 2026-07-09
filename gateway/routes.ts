@@ -110,7 +110,6 @@ import { getFixAcceptor }           from "../fix-gateway/fix.acceptor.js";
 import { rbacEngine }               from "../security/rbac.engine.js";
 import { mfaEnforcer }              from "../security/mfa.enforcer.js";
 import { immutableAudit }           from "../security/immutable.audit.js";
-import { sessionSecurity }          from "../security/session.security.js";
 import { soc2Controls }             from "../compliance/soc2.controls.js";
 import { pciDSSControls }           from "../compliance/pci.dss.controls.js";
 // ── Enterprise DR ─────────────────────────────────────────────────────────────
@@ -2168,83 +2167,6 @@ export const routes: Route[] = [
       return state.acknowledgeWarning(warningId);
     },
   },
-  // ===== ACADEMY ROUTES =====
-  {
-    method: "GET",
-    path: api("/academy/content"),
-    handler: ({ query, state }) => {
-      return state.getPublishedContent({
-        category: (query as any)?.category,
-        level: (query as any)?.level,
-        contentType: (query as any)?.contentType,
-        limit: parseInt((query as any)?.limit) || 20,
-        offset: parseInt((query as any)?.offset) || 0,
-      });
-    },
-  },
-  {
-    method: "GET",
-    path: api("/academy/content/:id"),
-    handler: ({ params, state }) => {
-      const contentId = (params as any)?.id;
-      return state.getContentById(contentId);
-    },
-  },
-  {
-    method: "GET",
-    path: api("/academy/learning-path"),
-    auth: true,
-    handler: ({ state, authHeader }) => {
-      const principal = state.resolvePrincipal(authHeader);
-      if (!principal) return { ok: false, reason: "unauthenticated" };
-      return state.getLearningPath(principal.sub, principal.tier);
-    },
-  },
-  {
-    method: "GET",
-    path: api("/academy/progress"),
-    auth: true,
-    handler: ({ state, authHeader }) => {
-      const principal = state.resolvePrincipal(authHeader);
-      if (!principal) return { ok: false, reason: "unauthenticated" };
-      return state.getUserProgress(principal.sub);
-    },
-  },
-  {
-    method: "POST",
-    path: api("/academy/progress"),
-    auth: true,
-    handler: ({ body, state, authHeader }) => {
-      const principal = state.resolvePrincipal(authHeader);
-      if (!principal) return { ok: false, reason: "unauthenticated" };
-      const { contentId, progress, notes } = body as any;
-      return state.recordProgress(principal.sub, contentId, progress, notes);
-    },
-  },
-  {
-    method: "GET",
-    path: api("/academy/category/:category"),
-    handler: ({ params, state }) => {
-      const category = (params as any)?.category as any;
-      return state.getContentByCategory(category);
-    },
-  },
-  {
-    method: "GET",
-    path: api("/academy/related/:contentId"),
-    handler: ({ params, state }) => {
-      const contentId = (params as any)?.contentId;
-      return state.getRelatedContent(contentId);
-    },
-  },
-  {
-    method: "GET",
-    path: api("/academy/stats"),
-    handler: ({ state }) => {
-      return state.getAcademyStats();
-    },
-  },
-
   // ── KYC / Identity Verification ───────────────────────────────────────────────
 
   // Get or create the user's KYC case (status, documents, steps)
@@ -5576,41 +5498,6 @@ export const routes: Route[] = [
     },
   },
 
-  // Admin: active sessions list for a user
-  {
-    method: "GET",
-    path: api("/admin/security/sessions/:userId"),
-    admin: true,
-    handler: async ({ params, state, authHeader }) => {
-      const principal = state.resolvePrincipal(authHeader);
-      if (!principal) return { ok: false, reason: "unauthenticated" };
-      const userId  = params["userId"] ?? principal.sub;
-      const sessions = await sessionSecurity.listUserSessions(userId);
-      return { ok: true, sessions };
-    },
-  },
-
-  // Admin: revoke all sessions for a user
-  {
-    method: "DELETE",
-    path: api("/admin/security/sessions/:userId/all"),
-    admin: true,
-    handler: async ({ params, state, authHeader }) => {
-      const principal = state.resolvePrincipal(authHeader);
-      if (!principal) return { ok: false, reason: "unauthenticated" };
-      const userId = params["userId"];
-      if (!userId) return { ok: false, reason: "userId required" };
-      const count = await sessionSecurity.revokeAllSessions(userId);
-      await immutableAudit.write({
-        actor:   principal.sub,
-        action:  "admin.sessions.revoke_all",
-        entity:  userId,
-        payload: { targetUserId: userId, revokedCount: count },
-        severity: "WARNING",
-      });
-      return { ok: true, revokedCount: count };
-    },
-  },
 
   // Audit chain integrity verification (admin only)
   {

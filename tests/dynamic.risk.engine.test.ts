@@ -4,12 +4,11 @@
  * Unit tests for DynamicRiskEngine — deterministic SL/TP/RR sizing that
  * replaced the old fixed atr*2/atr*3/atr*5 multiples. Coverage: determinism,
  * monotonicity (volatility/trend/conviction/regime), direction correctness,
- * the atr=0 edge case, and (Task 13 Phase 6) the optional marketIntelligence/
- * portfolioContext nudges to convictionScale.
+ * the atr=0 edge case, and (Task 13 Phase 6) the optional portfolioContext
+ * nudge to convictionScale.
  */
 import { describe, it, expect } from "vitest";
 import { DynamicRiskEngine, type RiskInputs } from "../signals-engine/dynamic.risk.engine.js";
-import type { MarketIntelligenceSnapshot } from "../signals-engine/market.intelligence.js";
 import type { PortfolioDecisionContext } from "../risk-service/portfolio.intelligence.js";
 
 function baseInputs(overrides: Partial<RiskInputs> = {}): RiskInputs {
@@ -26,12 +25,8 @@ function baseInputs(overrides: Partial<RiskInputs> = {}): RiskInputs {
   };
 }
 
-// Deliberately partial fixtures — DynamicRiskEngine only ever reads
-// .marketBreadth off MarketIntelligenceSnapshot and .portfolioHeat off
-// PortfolioDecisionContext, so only those fields are populated.
-function withBreadth(pctAboveEma200: number): MarketIntelligenceSnapshot {
-  return { marketBreadth: { universeSize: 5, pctAboveEma200 } } as MarketIntelligenceSnapshot;
-}
+// Deliberately partial fixture — DynamicRiskEngine only ever reads
+// .portfolioHeat off PortfolioDecisionContext, so only that field is populated.
 function withHeat(pctOfEquity: number): PortfolioDecisionContext {
   return { portfolioHeat: { riskAtStakeUsd: 0, pctOfEquity, unprotectedPositions: 0 } } as PortfolioDecisionContext;
 }
@@ -156,34 +151,12 @@ describe("DynamicRiskEngine — risk/reward consistency", () => {
   });
 });
 
-describe("DynamicRiskEngine — Phase 6: optional marketIntelligence/portfolioContext", () => {
-  it("is byte-for-byte unchanged when both optional fields are omitted", () => {
+describe("DynamicRiskEngine — Phase 6: optional portfolioContext", () => {
+  it("is byte-for-byte unchanged when the optional field is omitted", () => {
     const engine = new DynamicRiskEngine();
-    const withoutFields = engine.compute(baseInputs());
-    const explicitlyUndefined = engine.compute(baseInputs({ marketIntelligence: undefined, portfolioContext: undefined }));
-    expect(explicitlyUndefined).toEqual(withoutFields);
-  });
-
-  it("high market breadth raises conviction for a BUY and lowers it for a SELL, relative to the no-breadth baseline", () => {
-    const engine = new DynamicRiskEngine();
-    const baselineBuy  = engine.compute(baseInputs({ direction: 1 }));
-    const highBreadthBuy = engine.compute(baseInputs({ direction: 1, marketIntelligence: withBreadth(90) }));
-    expect(highBreadthBuy.tp1Multiple).toBeGreaterThan(baselineBuy.tp1Multiple);
-
-    const baselineSell  = engine.compute(baseInputs({ direction: -1 }));
-    const highBreadthSell = engine.compute(baseInputs({ direction: -1, marketIntelligence: withBreadth(90) }));
-    expect(highBreadthSell.tp1Multiple).toBeLessThan(baselineSell.tp1Multiple);
-  });
-
-  it("low market breadth lowers conviction for a BUY and raises it for a SELL, relative to the no-breadth baseline", () => {
-    const engine = new DynamicRiskEngine();
-    const baselineBuy = engine.compute(baseInputs({ direction: 1 }));
-    const lowBreadthBuy = engine.compute(baseInputs({ direction: 1, marketIntelligence: withBreadth(10) }));
-    expect(lowBreadthBuy.tp1Multiple).toBeLessThan(baselineBuy.tp1Multiple);
-
-    const baselineSell = engine.compute(baseInputs({ direction: -1 }));
-    const lowBreadthSell = engine.compute(baseInputs({ direction: -1, marketIntelligence: withBreadth(10) }));
-    expect(lowBreadthSell.tp1Multiple).toBeGreaterThan(baselineSell.tp1Multiple);
+    const withoutField = engine.compute(baseInputs());
+    const explicitlyUndefined = engine.compute(baseInputs({ portfolioContext: undefined }));
+    expect(explicitlyUndefined).toEqual(withoutField);
   });
 
   it("higher portfolio heat narrows targets relative to the zero-heat baseline", () => {
@@ -193,32 +166,27 @@ describe("DynamicRiskEngine — Phase 6: optional marketIntelligence/portfolioCo
     expect(highHeat.tp1Multiple).toBeLessThan(noHeat.tp1Multiple);
   });
 
-  it("never pushes convictionScale-derived multiples outside the pre-existing [0.85, 1.6] scale bounds, even at extreme breadth/heat values", () => {
+  it("never pushes convictionScale-derived multiples outside the pre-existing [0.85, 1.6] scale bounds, even at extreme heat values", () => {
     const engine = new DynamicRiskEngine();
-    for (const pctAboveEma200 of [0, 50, 100]) {
-      for (const pctOfEquity of [0, 200, 1000]) {
-        for (const direction of [1, -1] as const) {
-          const r = engine.compute(baseInputs({
-            direction,
-            marketIntelligence: withBreadth(pctAboveEma200),
-            portfolioContext: withHeat(pctOfEquity),
-          }));
-          expect(r.tp1Multiple).toBeGreaterThanOrEqual(3.0 * 0.85);
-          expect(r.tp1Multiple).toBeLessThanOrEqual(3.0 * 1.6);
-          expect(Number.isFinite(r.tp1Multiple)).toBe(true);
-        }
+    for (const pctOfEquity of [0, 200, 1000]) {
+      for (const direction of [1, -1] as const) {
+        const r = engine.compute(baseInputs({
+          direction,
+          portfolioContext: withHeat(pctOfEquity),
+        }));
+        expect(r.tp1Multiple).toBeGreaterThanOrEqual(3.0 * 0.85);
+        expect(r.tp1Multiple).toBeLessThanOrEqual(3.0 * 1.6);
+        expect(Number.isFinite(r.tp1Multiple)).toBe(true);
       }
     }
   });
 
-  it("appends a breadth/heat note to the rationale only when the corresponding optional input is present", () => {
+  it("appends a heat note to the rationale only when the optional input is present", () => {
     const engine = new DynamicRiskEngine();
     const plain = engine.compute(baseInputs());
-    expect(plain.rationale).not.toContain("Market breadth");
     expect(plain.rationale).not.toContain("Portfolio heat");
 
-    const withBoth = engine.compute(baseInputs({ marketIntelligence: withBreadth(70), portfolioContext: withHeat(20) }));
-    expect(withBoth.rationale).toContain("Market breadth");
-    expect(withBoth.rationale).toContain("Portfolio heat");
+    const withHeatCtx = engine.compute(baseInputs({ portfolioContext: withHeat(20) }));
+    expect(withHeatCtx.rationale).toContain("Portfolio heat");
   });
 });

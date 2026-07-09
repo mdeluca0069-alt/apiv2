@@ -1,6 +1,5 @@
 import type { MarketRegime } from "../ai-core/regime.engine.js";
 import type { VolatilityLevel } from "../ai-core/volatility.engine.js";
-import type { MarketIntelligenceSnapshot } from "./market.intelligence.js";
 import type { PortfolioDecisionContext } from "../risk-service/portfolio.intelligence.js";
 
 export type RiskInputs = {
@@ -12,8 +11,6 @@ export type RiskInputs = {
   confidence: number;          // 0-100
   marketRegime: MarketRegime;
   mtfConfidenceMultiplier: number; // from MultiTimeframeEngine, ~0.5-1.15
-  /** Optional — Phase 4. Absent or omitted: zero effect on output (byte-for-byte unchanged). */
-  marketIntelligence?: MarketIntelligenceSnapshot;
   /** Optional — Phase 5. Absent or omitted: zero effect on output (byte-for-byte unchanged). */
   portfolioContext?: PortfolioDecisionContext;
 };
@@ -48,7 +45,6 @@ const MIN_CONFIDENCE_FLOOR = 60; // matches SignalGenerator.MIN_CONFIDENCE — c
 // Phase 6 — small, explicitly bounded nudges applied before the existing
 // convictionScale clamp(0.85, 1.6); these can never push the scale outside
 // that pre-existing range, only shift where it lands within it.
-const BREADTH_ALIGNMENT_WEIGHT = 0.2;   // max swing: +-0.1 (alignment is in [-0.5, 0.5])
 const PORTFOLIO_HEAT_PENALTY_SCALE = 0.5;
 const PORTFOLIO_HEAT_PENALTY_CAP = 0.3;
 
@@ -61,7 +57,7 @@ const PORTFOLIO_HEAT_PENALTY_CAP = 0.3;
  */
 export class DynamicRiskEngine {
   compute(inputs: RiskInputs): RiskOutput {
-    const { entryPrice, atr, direction, trendStrength, volatilityLevel, confidence, marketRegime, mtfConfidenceMultiplier, marketIntelligence, portfolioContext } = inputs;
+    const { entryPrice, atr, direction, trendStrength, volatilityLevel, confidence, marketRegime, mtfConfidenceMultiplier, portfolioContext } = inputs;
 
     // Stop distance: wider in noisy/choppy/extreme-volatility conditions,
     // tighter when a strong trend itself acts as support/resistance.
@@ -81,17 +77,8 @@ export class DynamicRiskEngine {
     if (marketRegime === "COMPRESSION") convictionScale *= 0.85;
     else if (marketRegime === "EXPANSION") convictionScale *= 1.1;
 
-    // Phase 6 — optional Market/Portfolio Intelligence nudges. Absent inputs
-    // leave convictionScale (and every downstream value) byte-for-byte
-    // unchanged from before this phase.
-    let breadthNote = "";
-    const breadth = marketIntelligence?.marketBreadth;
-    if (breadth) {
-      const alignment = direction === 1 ? (breadth.pctAboveEma200 - 50) / 100 : (50 - breadth.pctAboveEma200) / 100;
-      convictionScale += alignment * BREADTH_ALIGNMENT_WEIGHT;
-      breadthNote = ` Market breadth ${breadth.pctAboveEma200.toFixed(0)}% above EMA200 (${alignment >= 0 ? "supports" : "opposes"} this side).`;
-    }
-
+    // Phase 6 — optional Portfolio Intelligence nudge. Absent input leaves
+    // convictionScale (and every downstream value) byte-for-byte unchanged.
     let heatNote = "";
     const heat = portfolioContext?.portfolioHeat;
     if (heat) {
@@ -118,7 +105,7 @@ export class DynamicRiskEngine {
       `${volatilityLevel} volatility, ${trendStrength >= 30 ? "strong" : trendStrength < 15 ? "weak" : "moderate"} trend (ADX ${trendStrength.toFixed(1)}). ` +
       `Targets at ${tp1Multiple.toFixed(2)}×/${tp2Multiple.toFixed(2)}× ATR — conviction scale ${convictionScale.toFixed(2)} ` +
       `(confidence ${confidence.toFixed(0)}%, MTF ×${mtfConfidenceMultiplier.toFixed(2)}, regime ${marketRegime}).` +
-      breadthNote + heatNote;
+      heatNote;
 
     return {
       stopLoss,
