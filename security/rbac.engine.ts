@@ -24,9 +24,6 @@
  *   (none) — implies "all" for backwards compatibility
  */
 
-import { randomUUID }          from "node:crypto";
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
-
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type RoleName =
@@ -292,37 +289,6 @@ export class RBACEngine {
       allowed: false,
       reason:  `No permission for ${resource}:${action} with roles [${roles.join(", ")}]`,
     };
-  }
-
-  /**
-   * Authorize and write to audit log. Use this for all authorization checks in
-   * request handlers to ensure every decision is traceable.
-   */
-  async authorizeAndAudit(ctx: AuthorizationContext): Promise<AuthorizationResult> {
-    const result = this.authorize(ctx);
-
-    if (IS_PERSISTENT && prisma) {
-      await prisma.auditLog.create({
-        data: {
-          id:     randomUUID(),
-          actor:  ctx.userId,
-          action: `rbac.${result.allowed ? "allow" : "deny"}.${ctx.resource}:${ctx.action}`,
-          entity: ctx.resourceOwnerId ?? "system",
-          payload: {
-            roles:       ctx.roles,
-            resource:    ctx.resource,
-            action:      ctx.action,
-            scope:       result.scope,
-            allowed:     result.allowed,
-            reason:      result.reason,
-            matchedRule: result.matchedRule,
-            ...ctx.metadata,
-          } as object,
-        },
-      }).catch(() => undefined);
-    }
-
-    return result;
   }
 
   /**

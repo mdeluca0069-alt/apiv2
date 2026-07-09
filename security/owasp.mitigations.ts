@@ -35,45 +35,7 @@
  * middleware functions and assertion helpers.
  */
 
-import type { IncomingMessage, ServerResponse } from "node:http";
-
-// ─── Security Headers (A05) ───────────────────────────────────────────────────
-
-export const SECURITY_HEADERS: Record<string, string> = {
-  // Prevent MIME type sniffing (A05)
-  "X-Content-Type-Options":         "nosniff",
-  // Prevent clickjacking (A05, A01)
-  "X-Frame-Options":                "DENY",
-  // Block XSS in older browsers (A03)
-  "X-XSS-Protection":               "1; mode=block",
-  // HSTS — force HTTPS (A02, A05)
-  "Strict-Transport-Security":      "max-age=31536000; includeSubDomains; preload",
-  // Restrict browser features (A05)
-  "Permissions-Policy":             "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
-  // Referrer policy (data leakage A02)
-  "Referrer-Policy":                "strict-origin-when-cross-origin",
-  // Cross-origin isolation (A01, A03)
-  "Cross-Origin-Opener-Policy":     "same-origin",
-  "Cross-Origin-Embedder-Policy":   "require-corp",
-  "Cross-Origin-Resource-Policy":   "same-origin",
-  // Remove server fingerprint (A05)
-  "X-Powered-By":                   "",   // Remove
-  "Server":                         "",   // Remove
-};
-
-// Content Security Policy (A03 XSS, A05)
-// Strict CSP for the API: no scripts, no iframes, no mixed content
-export const API_CSP =
-  "default-src 'none'; " +
-  "connect-src 'self'; " +
-  "script-src 'none'; " +
-  "style-src 'none'; " +
-  "img-src 'none'; " +
-  "font-src 'none'; " +
-  "form-action 'none'; " +
-  "frame-ancestors 'none'; " +
-  "base-uri 'none'; " +
-  "upgrade-insecure-requests";
+import type { IncomingMessage } from "node:http";
 
 // ─── A01: Broken Access Control ───────────────────────────────────────────────
 
@@ -177,22 +139,10 @@ export function validateId(id: string): boolean {
 }
 
 // ─── A05: Security Misconfiguration ──────────────────────────────────────────
-
-/**
- * Apply security headers to an HTTP response.
- * Call this at the start of every response handler.
- */
-export function applySecurityHeaders(res: ServerResponse): void {
-  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
-    if (value === "") {
-      res.removeHeader(name);
-    } else {
-      res.setHeader(name, value);
-    }
-  }
-  res.setHeader("Content-Security-Policy", API_CSP);
-  res.setHeader("X-Request-ID", `req_${Date.now()}`);
-}
+// (The response security-header set used to live here — dead code, since the
+// live request pipeline sets its headers in shared/http.ts's setSecurityHeaders().
+// That live set is missing COOP/CORP/COEP and doesn't strip X-Powered-By/Server;
+// closing that gap is worth a follow-up milestone, not folded in here.)
 
 /**
  * Validate CORS origin.

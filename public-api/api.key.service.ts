@@ -1,17 +1,17 @@
 /**
- * ApiKeyService — programmatic API key management for IGFX OLOS Public API.
+ * ApiKeyService — API key issuance/revocation for the IGFX OLOS Public API.
  *
- * Enables algo traders and third-party integrations to:
- *   - Generate API keys with scoped permissions (read / trade / admin)
- *   - Rate-limit requests per key (configurable, default 600 req/min)
- *   - Track usage, last-seen timestamps, and revoke at any time
- *   - HMAC-SHA256 signature verification for order placement (optional, for enhanced security)
+ * Generates scoped, hashed (SHA-256) keys and lets a user list/revoke their
+ * own keys. Key format: `igfx_live_<32-hex>` or `igfx_paper_<32-hex>`;
+ * plaintext is shown only once on creation.
  *
- * Key format: `igfx_live_<32-hex>` or `igfx_paper_<32-hex>`
- * Keys are stored hashed (SHA-256) in DB — the plaintext is shown only once on creation.
+ * NOTE: no request path currently validates an incoming API key against this
+ * store — issuing a key does not yet grant programmatic API access. Wiring
+ * request-time validation (rate limiting, scope checks, HMAC signature
+ * verification) is tracked as follow-up work, not part of this milestone.
  */
 
-import { randomBytes, createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -38,10 +38,6 @@ export type CreateApiKeyResult = {
   key:       ApiKey;
   plaintext: string;          // shown only once — must be stored by client
 };
-
-// Rate limit buckets: keyId → { count, windowStart }
-const rateLimitBuckets = new Map<string, { count: number; windowStart: number }>();
-const WINDOW_MS        = 60_000;
 
 // In-memory key store for non-persistent mode
 const memKeys = new Map<string, ApiKey>();
@@ -88,40 +84,6 @@ export class ApiKeyService {
     return { key, plaintext };
   }
 
-  async validate(plaintext: string): Promise<{ valid: boolean; key: ApiKey | null; rateLimited: boolean }> {
-    const hash = createHash("sha256").update(plaintext).digest("hex");
-    const key  = await this._findByHash(hash);
-
-    if (!key || !key.enabled) return { valid: false, key: null, rateLimited: false };
-
-    if (key.expiresAt && new Date(key.expiresAt) < new Date()) {
-      return { valid: false, key, rateLimited: false };
-    }
-
-    // Rate limit check
-    const now    = Date.now();
-    const bucket = rateLimitBuckets.get(key.id) ?? { count: 0, windowStart: now };
-    if (now - bucket.windowStart > WINDOW_MS) {
-      bucket.count       = 0;
-      bucket.windowStart = now;
-    }
-    bucket.count++;
-    rateLimitBuckets.set(key.id, bucket);
-
-    if (bucket.count > key.rateLimit) {
-      return { valid: true, key, rateLimited: true };
-    }
-
-    // Update usage stats (fire-and-forget)
-    void this._touchKey(key.id);
-
-    return { valid: true, key, rateLimited: false };
-  }
-
-  hasScope(key: ApiKey, scope: ApiKeyScope): boolean {
-    return key.scopes.includes(scope) || key.scopes.includes("admin");
-  }
-
   async listKeys(userId: string): Promise<ApiKey[]> {
     if (IS_PERSISTENT) {
       const db   = prisma as NonNullable<typeof prisma>;
@@ -153,15 +115,6 @@ export class ApiKeyService {
     return keys.length;
   }
 
-  verifyHmacSignature(payload: string, secret: string, signature: string): boolean {
-    const expected = createHmac("sha256", secret).update(payload).digest("hex");
-    try {
-      return timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expected, "hex"));
-    } catch {
-      return false;
-    }
-  }
-
   private async _saveKey(key: ApiKey): Promise<void> {
     if (IS_PERSISTENT) {
       const db = prisma as NonNullable<typeof prisma>;
@@ -175,18 +128,6 @@ export class ApiKeyService {
     }
   }
 
-  private async _findByHash(hash: string): Promise<ApiKey | null> {
-    if (IS_PERSISTENT) {
-      const db   = prisma as NonNullable<typeof prisma>;
-      const rows = await db.brokerSetting.findMany({ where: { key: { startsWith: "api_key:" } } });
-      return (rows.map(r => r.value as ApiKey).find(k => k.keyHash === hash)) ?? null;
-    }
-    for (const k of memKeys.values()) {
-      if (k.keyHash === hash) return k;
-    }
-    return null;
-  }
-
   private async _findById(id: string): Promise<ApiKey | null> {
     if (IS_PERSISTENT) {
       const db  = prisma as NonNullable<typeof prisma>;
@@ -194,12 +135,6 @@ export class ApiKeyService {
       return row ? (row.value as ApiKey) : null;
     }
     return memKeys.get(id) ?? null;
-  }
-
-  private async _touchKey(id: string): Promise<void> {
-    const key = await this._findById(id);
-    if (!key) return;
-    await this._saveKey({ ...key, lastUsedAt: new Date().toISOString(), requestCount: key.requestCount + 1 });
   }
 }
 
