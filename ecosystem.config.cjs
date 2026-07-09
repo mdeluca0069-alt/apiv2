@@ -1,5 +1,11 @@
 /**
- * ecosystem.config.cjs — PM2 production cluster configuration
+ * ecosystem.config.cjs — PM2 bare-metal cluster configuration.
+ *
+ * NOTE: the pipeline CI actually drives (.github/workflows/release.yml) deploys
+ * via Docker Compose over SSH (see docker-compose.prod.yml, api service on
+ * port 3001) — this PM2 path is a documented alternative, not what's currently
+ * live. Its PORT below matches the Docker/nginx.conf convention (3001) so the
+ * two paths stay consistent if this one is ever stood up.
  *
  * Architecture:
  *   - exec_mode: "cluster" uses Node.js cluster module to fork workers.
@@ -85,7 +91,7 @@ module.exports = {
       // ── Environment ───────────────────────────────────────────────────────
       env: {
         NODE_ENV:              "production",
-        PORT:                  3000,
+        PORT:                  3001,
         DATABASE_URL:          dbUrl,
         LIVE_TRADING_ENABLED:  "true",
         QUOTE_INTERVAL_MS:     "1000",
