@@ -171,12 +171,21 @@ class EnhancedReconciliationService {
       let matched = 0;
 
       for (const dep of creditedDeposits) {
-        // Look for LedgerEntry referencing this deposit
+        // Look for LedgerEntry referencing this deposit. Fix #7: the live
+        // PSP flow (payment-service/deposit.state.machine.ts) writes
+        // type="DEPOSIT_CREDIT" with reference=`PSP:${pspRef}` — this
+        // previously matched neither the type filter (only the legacy
+        // admin-approval types) nor the reference filter (which looked for
+        // the DepositTransaction's own id, never present in that string),
+        // so every real deposit was reported as a permanent missingCredit
+        // false positive. ADMIN_CAPITAL_ALLOCATION/DEPOSIT_REQUEST are kept
+        // for any deposit that went through the legacy admin-approval path.
+        const referenceCandidates = [dep.id, ...(dep.pspRef ? [dep.pspRef] : [])];
         const ledgerEntries = await db.ledgerEntry.findMany({
           where: {
-            userId:    dep.userId,
-            type:      { in: ["ADMIN_CAPITAL_ALLOCATION", "DEPOSIT_REQUEST"] },
-            reference: { contains: dep.id },
+            userId: dep.userId,
+            type:   { in: ["DEPOSIT_CREDIT", "ADMIN_CAPITAL_ALLOCATION", "DEPOSIT_REQUEST"] },
+            OR:     referenceCandidates.map((ref) => ({ reference: { contains: ref } })),
           },
           select: { id: true, amount: true },
         });

@@ -91,7 +91,10 @@ export type ReconciliationReport = {
 // negative amount (debitAmount.negated()), so including them correctly
 // reduces the ledger sum.
 const BALANCE_TYPES = new Set([
-  "ADMIN_CAPITAL_ALLOCATION",   // approved deposit credit
+  "ADMIN_CAPITAL_ALLOCATION",   // approved deposit credit (legacy admin-approval flow)
+  "DEPOSIT_CREDIT",             // Fix #7: live PSP deposit credit (payment-service/deposit.state.machine.ts)
+                                 // — omitted before, so every real self-service deposit produced a
+                                 // permanent false-positive ledger/wallet mismatch.
   "WITHDRAW_REQUEST",           // approved withdrawal debit (amount is negative)
   "PNL_CREDIT",                 // positive P&L (legacy path)
   "PNL_DEBIT",                  // negative P&L (legacy path)

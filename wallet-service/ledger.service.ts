@@ -236,6 +236,9 @@ export class LedgerService {
           break;
         case "ADMIN_CAPITAL_ALLOCATION":
         case "DEPOSIT_REQUEST":
+        case "DEPOSIT_CREDIT": // Fix #7: live PSP deposit credit — was missing, so real
+                                // deposits never appeared in the statement's deposits total
+                                // even though openingBalance/closingBalance already reflected them.
           if (amt > 0) deposits += amt;
           break;
         case "WITHDRAW_REQUEST":
