@@ -1,7 +1,13 @@
 node_modules/
 dist/
-.env
-.env.*.local
+# Fix #8: previously only ".env" (exact) and ".env.*.local" were ignored —
+# .env.production, .env.render, and .dev.vars (all of which hold real
+# secrets on this machine) were NOT covered and risked an accidental
+# `git add -A`/`git add .` commit. Ignore every .env* variant, with a single
+# explicit exception for the checked-in template.
+.env*
+!.env.example
+.dev.vars
 *.log
 backups/
 *.dump
