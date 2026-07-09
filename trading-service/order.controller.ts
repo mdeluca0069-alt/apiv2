@@ -3,6 +3,7 @@ import { executionEngine }      from "../execution-service/execution.engine.js";
 import { executionQueue }       from "../execution-service/execution.queue.js";
 import type { CancelToken }     from "../execution-service/execution.queue.js";
 import { orderLifecycle, DuplicateOrderError } from "./order.lifecycle.js";
+import { buildSubmissionKey, isDuplicateSubmission } from "./order.dedup.guard.js";
 import { pendingOrderBook }     from "./pending.order.book.js";
 import { positionPriceMonitor, PositionMonitorCapacityError } from "./position.price.monitor.js";
 import { tradingSuspension }    from "../shared/trading.suspension.js";
@@ -27,6 +28,18 @@ export class OrderController {
   async placeOrder(req: NewOrderRequest, ctx: PlaceOrderContext): Promise<OrderAck> {
     const symbol = req.symbol.toUpperCase();
     const type   = (req.type ?? "MARKET").toUpperCase();
+
+    // ── Fix #2: short-window duplicate-submission guard ─────────────────────
+    // Closes the gap left by clientOrderId-based dedup when a UI bug fires two
+    // distinct requests (two distinct generated IDs) for what was a single
+    // user action. See order.dedup.guard.ts for the full rationale.
+    const dedupKey = buildSubmissionKey(ctx.userId, req);
+    if (isDuplicateSubmission(dedupKey)) {
+      return this._rejectedAck(
+        symbol, req.side,
+        "DUPLICATE_SUBMISSION_WINDOW: identical order was just submitted a moment ago — ignored to prevent an accidental double order",
+      );
+    }
 
     // ── Feed circuit breaker — block orders when all data feeds are dead ──────
     if (feedCircuit.isOpen()) {
