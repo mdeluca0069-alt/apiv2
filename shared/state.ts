@@ -2178,27 +2178,39 @@ export class BrokerState {
   private async persistLedgerEntry(userId: string, entry: LedgerEntryRecord): Promise<void> {
     if (!this.prisma) return;
     try {
-      await this.prisma.ledgerEntry.upsert({
-        where: { id: entry.id },
-        update: {
-          amount: entry.amount,
-          type: entry.type,
-          reference: entry.reference,
-          status: entry.status,
-          note: entry.note,
-        },
-        create: {
-          id: entry.id,
-          userId,
-          currency: "USD",
-          amount: entry.amount,
-          type: entry.type,
-          reference: entry.reference,
-          status: entry.status,
-          note: entry.note,
-          createdAt: new Date(entry.createdAt),
-        },
-      });
+      // Fix #11: LedgerEntry's real PK is composite (id, createdAt), so a
+      // plain upsert({where:{id}}) is no longer valid — id alone isn't a
+      // unique-where. Manual find-then-create-or-update instead; entry.id
+      // is uuid-generated so this is not a race in practice (this sandbox
+      // sync path is not on the hot concurrent-write path real order/
+      // settlement code uses).
+      const existing = await this.prisma.ledgerEntry.findFirst({ where: { id: entry.id } });
+      if (existing) {
+        await this.prisma.ledgerEntry.updateMany({
+          where: { id: entry.id },
+          data: {
+            amount: entry.amount,
+            type: entry.type,
+            reference: entry.reference,
+            status: entry.status,
+            note: entry.note,
+          },
+        });
+      } else {
+        await this.prisma.ledgerEntry.create({
+          data: {
+            id: entry.id,
+            userId,
+            currency: "USD",
+            amount: entry.amount,
+            type: entry.type,
+            reference: entry.reference,
+            status: entry.status,
+            note: entry.note,
+            createdAt: new Date(entry.createdAt),
+          },
+        });
+      }
     } catch (error) {
       console.error("[broker-state] persist ledger failed", error);
     }

@@ -228,7 +228,18 @@ model KycVerificationStep {
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model LedgerEntry {
-  id             String   @id @default(uuid())
+  // Fix #11: composite PK, not a bare `id @id`. The Task-14 monthly-
+  // partitioning migration (20260619001_ledger_partitioning /
+  // 20260619000001_monthly_partitioning_retention) made this table
+  // RANGE-partitioned by createdAt, which requires the partition key to be
+  // part of every unique/primary constraint — so the live DB's real PK has
+  // always been (id, createdAt), named "LedgerEntry_pkey1". This was never
+  // reflected here, causing `prisma migrate diff`/`db pull` to report
+  // permanent drift. `id` alone is no longer unique or a primary key at the
+  // DB level, though it remains globally unique in practice (generated via
+  // uuid()), so existing findUnique({where:{id}})-style call sites still
+  // behave correctly.
+  id             String   @default(uuid())
   userId         String
   currency       String
   amount         Decimal
@@ -242,6 +253,7 @@ model LedgerEntry {
   createdAt      DateTime @default(now())
   User           User     @relation(fields: [userId], references: [id])
 
+  @@id([id, createdAt])
   @@index([reference])
   @@index([type, status])
   @@index([userId, createdAt])
@@ -621,7 +633,10 @@ model Tenant {
 }
 
 model TradeAudit {
-  id            String    @id @default(uuid())
+  // Fix #11: composite PK — see the identical note on LedgerEntry above.
+  // Same Task-14 partitioning migration, same real DB PK shape
+  // ("TradeAudit_pkey1" on (id, createdAt)), same prior drift.
+  id            String    @default(uuid())
   userId        String
   orderId       String?
   positionId    String?
@@ -648,6 +663,7 @@ model TradeAudit {
   updatedAt     DateTime  @updatedAt
   User          User      @relation(fields: [userId], references: [id])
 
+  @@id([id, createdAt])
   @@index([orderId])
   @@index([positionId])
   @@index([symbol, tradeStatus])

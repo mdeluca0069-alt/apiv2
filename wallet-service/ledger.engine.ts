@@ -176,11 +176,14 @@ export class LedgerEngine {
 
   async rejectDeposit(userId: string, entryId: string, adminId: string): Promise<void> {
     await this.db.$transaction(async (tx) => {
-      const entry = await tx.ledgerEntry.findUnique({ where: { id: entryId } });
+      // Fix #11: id alone is no longer a valid unique-where (composite PK
+      // is (id, createdAt)) — findFirst/updateMany behave identically to
+      // the old findUnique/update here since id is uuid-generated.
+      const entry = await tx.ledgerEntry.findFirst({ where: { id: entryId } });
       if (!entry || entry.userId !== userId || entry.type !== "DEPOSIT_REQUEST" || entry.status !== "PENDING_ADMIN") {
         throw new Error("ENTRY_NOT_FOUND_OR_INVALID_STATE");
       }
-      await tx.ledgerEntry.update({ where: { id: entryId }, data: { status: "REJECTED" } });
+      await tx.ledgerEntry.updateMany({ where: { id: entryId }, data: { status: "REJECTED" } });
       await tx.auditLog.create({
         data: {
           id:      randomUUID(),
@@ -195,11 +198,12 @@ export class LedgerEngine {
 
   async rejectWithdrawal(userId: string, entryId: string, adminId: string): Promise<void> {
     await this.db.$transaction(async (tx) => {
-      const entry = await tx.ledgerEntry.findUnique({ where: { id: entryId } });
+      // Fix #11: see rejectDeposit() above for why findFirst/updateMany.
+      const entry = await tx.ledgerEntry.findFirst({ where: { id: entryId } });
       if (!entry || entry.userId !== userId || entry.type !== "WITHDRAW_REQUEST" || entry.status !== "PENDING_ADMIN") {
         throw new Error("ENTRY_NOT_FOUND_OR_INVALID_STATE");
       }
-      await tx.ledgerEntry.update({ where: { id: entryId }, data: { status: "REJECTED" } });
+      await tx.ledgerEntry.updateMany({ where: { id: entryId }, data: { status: "REJECTED" } });
       await tx.auditLog.create({
         data: {
           id:      randomUUID(),

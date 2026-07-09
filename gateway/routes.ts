@@ -2627,7 +2627,11 @@ export const routes: Route[] = [
       if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
 
       const db    = (await import("../shared/db.js")).prisma;
-      const entry = await (db as NonNullable<typeof db>).ledgerEntry.findUnique({
+      // Fix #11: LedgerEntry's real PK is composite (id, createdAt) — id
+      // alone is no longer a valid Prisma unique-where, but remains
+      // effectively unique in practice (uuid-generated), so findFirst
+      // behaves identically to the old findUnique here.
+      const entry = await (db as NonNullable<typeof db>).ledgerEntry.findFirst({
         where: { id: params.entryId },
       });
       if (!entry) return { ok: false, reason: "ENTRY_NOT_FOUND" };
@@ -2651,7 +2655,7 @@ export const routes: Route[] = [
       if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
 
       const db     = (await import("../shared/db.js")).prisma;
-      const entry  = await (db as NonNullable<typeof db>).ledgerEntry.findUnique({
+      const entry  = await (db as NonNullable<typeof db>).ledgerEntry.findFirst({
         where: { id: params.entryId },
       });
       if (!entry) return { ok: false, reason: "ENTRY_NOT_FOUND" };
@@ -2694,7 +2698,11 @@ export const routes: Route[] = [
       if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
 
       const db    = (await import("../shared/db.js")).prisma;
-      const entry = await (db as NonNullable<typeof db>).ledgerEntry.findUnique({
+      // Fix #11: LedgerEntry's real PK is composite (id, createdAt) — id
+      // alone is no longer a valid Prisma unique-where, but remains
+      // effectively unique in practice (uuid-generated), so findFirst
+      // behaves identically to the old findUnique here.
+      const entry = await (db as NonNullable<typeof db>).ledgerEntry.findFirst({
         where: { id: params.entryId },
       });
       if (!entry) return { ok: false, reason: "ENTRY_NOT_FOUND" };
@@ -2718,7 +2726,11 @@ export const routes: Route[] = [
       if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
 
       const db    = (await import("../shared/db.js")).prisma;
-      const entry = await (db as NonNullable<typeof db>).ledgerEntry.findUnique({
+      // Fix #11: LedgerEntry's real PK is composite (id, createdAt) — id
+      // alone is no longer a valid Prisma unique-where, but remains
+      // effectively unique in practice (uuid-generated), so findFirst
+      // behaves identically to the old findUnique here.
+      const entry = await (db as NonNullable<typeof db>).ledgerEntry.findFirst({
         where: { id: params.entryId },
       });
       if (!entry) return { ok: false, reason: "ENTRY_NOT_FOUND" };
