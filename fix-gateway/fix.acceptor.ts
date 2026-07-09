@@ -32,6 +32,7 @@ import {
   buildExecutionReport,
   type FixFields,
 } from "./fix.message.js";
+import { verifyFixCredentials } from "./fix.credentials.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -200,7 +201,7 @@ export class FixAcceptor extends EventEmitter {
     session.inSeqNum = parseInt(fields[Tag.MsgSeqNum] ?? "0", 10);
 
     switch (msgType) {
-      case MsgType.Logon:          return this.handleLogon(id, session, fields);
+      case MsgType.Logon:          return void this.handleLogon(id, session, fields);
       case MsgType.Heartbeat:      return; // just update lastMsgTime (already done)
       case MsgType.TestRequest:    return this.handleTestRequest(id, session, fields);
       case MsgType.Logout:         return this.handleLogout(id, session);
@@ -213,17 +214,29 @@ export class FixAcceptor extends EventEmitter {
 
   // ── Logon ───────────────────────────────────────────────────────────────────
 
-  private handleLogon(id: string, session: FixSession, fields: FixFields): void {
+  private async handleLogon(id: string, session: FixSession, fields: FixFields): Promise<void> {
     const senderCompID = fields[Tag.SenderCompID] ?? "";
     const account      = fields[Tag.Account]      ?? "";
-    const heartBtInt   = parseInt(fields[Tag.HeartBtInt] ?? "30", 10);
+    const username      = fields[Tag.Username]     ?? "";
+    const password      = fields[Tag.Password]     ?? "";
+    const heartBtInt    = parseInt(fields[Tag.HeartBtInt] ?? "30", 10);
 
-    if (!account) {
-      this.send(session, buildLogout(
-        this.compId, senderCompID, session.outSeqNum++,
-        "Logon rejected: Account field (tag 1) required for user identification",
-      ));
-      session.socket.end();
+    // Fix #4: Account (tag 1) alone used to be sufficient to log on AS that
+    // account — anyone reaching the FIX port could claim any userId and
+    // trade on their behalf. Username(553)/Password(554) are now mandatory
+    // and are verified against the real user's credentials, and the
+    // authenticated user's id MUST match the claimed Account.
+    if (!account || !username || !password) {
+      this.rejectLogon(session, senderCompID,
+        "Logon rejected: Account (1), Username (553) and Password (554) are all required",
+      );
+      return;
+    }
+
+    const verifiedUserId = await verifyFixCredentials(username, password).catch(() => null);
+    if (!verifiedUserId || verifiedUserId !== account) {
+      console.warn(`[fix-acceptor] Logon rejected: invalid credentials or Account mismatch for username=${username}`);
+      this.rejectLogon(session, senderCompID, "Logon rejected: invalid credentials");
       return;
     }
 
@@ -239,6 +252,11 @@ export class FixAcceptor extends EventEmitter {
     // Start heartbeat enforcement
     this.startHeartbeat(id, session);
     this.emit("session.active", { id, senderCompID, account });
+  }
+
+  private rejectLogon(session: FixSession, senderCompID: string, reason: string): void {
+    this.send(session, buildLogout(this.compId, senderCompID, session.outSeqNum++, reason));
+    session.socket.end();
   }
 
   // ── Heartbeat ───────────────────────────────────────────────────────────────

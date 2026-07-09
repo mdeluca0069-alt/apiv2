@@ -20,6 +20,8 @@ export enum Tag {
   ResetSeqNumFlag = 141,
   TestReqID    = 112,
   Text         = 58,
+  Username     = 553,
+  Password     = 554,
   // Order fields
   ClOrdID      = 11,
   OrderID      = 37,
