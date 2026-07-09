@@ -83,6 +83,7 @@ import { PaymentService }                       from "../payment-service/payment
 import { positionService }                      from "../trading-service/position.service.js";
 import { registerPsp, listPsps, type PspName }  from "../payment-service/psp/psp.adapter.js";
 import { documentStorageService }    from "../document-storage/document.storage.service.js";
+import { verifyWebhookSignature }    from "../document-storage/virus-scan.hook.js";
 import { watchlistService }          from "../watchlist-service/watchlist.service.js";
 import { retentionPolicyEngine }     from "../document-storage/retention.policy.js";
 // Task 14: DB hardening
@@ -213,6 +214,7 @@ export const routes: Route[] = [
   {
     method: "GET",
     path: api("/dr/status"),
+    admin: true, // Fix #5: disaster-recovery internals were previously exposed with zero auth
     handler: async () => {
       const status = await getDRHealth();
       return status;
@@ -2987,6 +2989,7 @@ export const routes: Route[] = [
   {
     method: "GET",
     path: api("/telemetry/health"),
+    admin: true, // Fix #5: infra/latency telemetry was previously exposed with zero auth
     handler: async () => {
       return latencyAnalyticsService.getTelemetry();
     },
@@ -4149,13 +4152,25 @@ export const routes: Route[] = [
     },
   },
 
-  // Virus scan webhook callback — called by the external scanner (no auth token,
-  // relies on network-level allowlist / HMAC header validated in service)
+  // Virus scan webhook callback — called by the external scanner. No bearer
+  // auth (the scanner is a third party, not a logged-in user); instead the
+  // raw body must carry a valid HMAC-SHA256 signature over VIRUS_SCAN_WEBHOOK_SECRET
+  // in the X-Scan-Signature header (Fix #5 — this check did not previously exist).
   {
     method:  "POST",
     path:    api("/documents/scan-result"),
-    handler: async ({ body }) => {
-      await documentStorageService.handleScanResult(body);
+    rawBody: true,
+    handler: async ({ body, req }) => {
+      const rawBody   = body as Buffer;
+      const signature = req.headers["x-scan-signature"];
+      const sigHeader = Array.isArray(signature) ? signature[0] : signature;
+
+      if (!verifyWebhookSignature(rawBody, sigHeader, process.env.VIRUS_SCAN_WEBHOOK_SECRET)) {
+        throw Object.assign(new Error("Invalid or missing scan webhook signature"), { statusCode: 401 });
+      }
+
+      const parsed = JSON.parse(rawBody.toString("utf8"));
+      await documentStorageService.handleScanResult(parsed);
       return { ok: true };
     },
   },

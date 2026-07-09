@@ -4,13 +4,19 @@
 //   1. File is stored under quarantine/{id} in S3/R2.
 //   2. triggerScan() POSTs file metadata to the configured scanner endpoint.
 //   3. The scanner (e.g. clamav-rest, VirusTotal, CrowdStrike) calls back to
-//      POST /api/v1/documents/scan-result with a ScanCallbackPayload.
+//      POST /api/v1/documents/scan-result with a ScanCallbackPayload, signed
+//      with HMAC-SHA256 over the raw body using VIRUS_SCAN_WEBHOOK_SECRET,
+//      sent in the X-Scan-Signature header. verifyWebhookSignature() below
+//      checks it (Milestone 1 / Fix #5 — this used to not exist at all,
+//      despite gateway/routes.ts's comment claiming it did).
 //   4. documentStorageService.handleScanResult() moves the file or deletes it.
 //
 // Compatible scanners (any that support HTTP webhooks):
 //   - clamav-rest  (https://github.com/benzino77/clamav-rest)
 //   - VirusTotal API v3
 //   - Custom internal scanner
+
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 export type ScanTriggerPayload = {
   documentId:  string;
@@ -31,6 +37,28 @@ export type ScanCallbackPayload = {
   scannedAt:  string;      // ISO 8601
   scanner?:   string;      // scanner name/version
 };
+
+/**
+ * Verifies the HMAC-SHA256 signature the scanner must send on its callback,
+ * over the exact raw request bytes. Fails closed: no configured secret, no
+ * signature header, or a mismatch are all rejections, never a silent allow.
+ */
+export function verifyWebhookSignature(
+  rawBody:   Buffer,
+  signature: string | undefined,
+  secret:    string | undefined,
+): boolean {
+  if (!secret || !signature) return false;
+
+  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
+  const provided = signature.trim();
+
+  const expectedBuf = Buffer.from(expected, "hex");
+  const providedBuf = Buffer.from(provided, "hex");
+  if (expectedBuf.length !== providedBuf.length) return false;
+
+  return timingSafeEqual(expectedBuf, providedBuf);
+}
 
 export class VirusScanHook {
   private readonly url: string;
