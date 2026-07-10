@@ -60,26 +60,37 @@ export class MarginController {
     db?: Db,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const run = async (tx: Db): Promise<{ ok: true } | { ok: false; reason: string }> => {
-      // FASE 2.2 perf: atomic check-and-lock in ONE statement instead of
-      // SELECT FOR UPDATE + a separate conditional UPDATE. The WHERE clause
-      // enforces sufficient available margin as part of the same statement
-      // Postgres uses to take the row lock, so a concurrent second lock
-      // attempt on the same wallet still can't both succeed (same guarantee
-      // as before) — this just removes one round trip from the common
-      // (sufficient-margin) path. Cuts held-connection time inside the
-      // caller's transaction (execution.engine.ts now runs this alongside
-      // position/fill/outbox writes in one unit — see FASE 2.2), which
-      // matters under concurrent load against a fixed connection pool.
-      const locked = await tx.$queryRaw<Array<{ balance: string; locked: string }>>`
-        UPDATE "WalletAccount"
-        SET locked = locked + ${new Decimal(required)}
-        WHERE "userId" = ${userId}
-          AND balance > 0
-          AND (balance - locked) >= ${new Decimal(required)}
-        RETURNING balance, locked
+      // FASE 2.2/2.3 perf: the conditional wallet UPDATE and the MARGIN_LOCK
+      // ledger INSERT are one round trip via a data-modifying CTE, instead of
+      // two separate statements. The INSERT's SELECT ... FROM locked draws
+      // its row from the UPDATE's own RETURNING — if the WHERE clause matched
+      // 0 rows (insufficient margin), `locked` is empty and the INSERT
+      // naturally inserts nothing too, so this stays all-or-nothing with one
+      // round trip either way. This matters more than usual now: this runs
+      // inside execution.engine.ts's unified transaction (FASE 2.2) while
+      // holding the FASE 2.3 per-symbol advisory lock, so every round trip
+      // shaved off here directly shortens how long that lock — and therefore
+      // every other order queued behind it for the same symbol — is held.
+      const inserted = await tx.$queryRaw<Array<{ id: string }>>`
+        WITH locked AS (
+          UPDATE "WalletAccount"
+          SET locked = locked + ${new Decimal(required)}
+          WHERE "userId" = ${userId}
+            AND balance > 0
+            AND (balance - locked) >= ${new Decimal(required)}
+          RETURNING "userId"
+        )
+        INSERT INTO "LedgerEntry"
+          (id, "userId", currency, amount, type, reference, status, note, "debitAccount", "creditAccount")
+        SELECT
+          ${randomUUID()}, locked."userId", 'USD', ${new Decimal(-required)}, 'MARGIN_LOCK', ${orderId},
+          'COMPLETED', ${`Margin locked for order ${orderId}`},
+          ${`CLIENT_FREE:${userId}`}, ${`CLIENT_MARGIN:${userId}`}
+        FROM locked
+        RETURNING id
       `;
 
-      if (locked.length === 0) {
+      if (inserted.length === 0) {
         // Off the hot path — only reached on rejection, to produce a precise
         // reason. A plain read is fine here (no FOR UPDATE needed): worst
         // case a concurrent change makes the message slightly stale, but the
@@ -94,21 +105,6 @@ export class MarginController {
           reason: `INSUFFICIENT_MARGIN: need ${required.toFixed(2)}, available=${available.toFixed(2)}`,
         };
       }
-
-      await tx.ledgerEntry.create({
-        data: {
-          id:            randomUUID(),
-          userId,
-          currency:      "USD",
-          amount:        -required,
-          type:          "MARGIN_LOCK",
-          reference:     orderId,
-          status:        "COMPLETED",
-          note:          `Margin locked for order ${orderId}`,
-          debitAccount:  `CLIENT_FREE:${userId}`,
-          creditAccount: `CLIENT_MARGIN:${userId}`,
-        },
-      });
 
       return { ok: true as const };
     };

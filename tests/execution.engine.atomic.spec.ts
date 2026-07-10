@@ -42,8 +42,14 @@ vi.mock("../execution-service/fill.engine.js", () => ({
   fillEngine: { fill: mockFill, providerId: "MOCK_LP" },
 }));
 
+const { mockCheckCanOpenAtomic } = vi.hoisted(() => ({
+  mockCheckCanOpenAtomic: vi.fn().mockResolvedValue({ ok: true }),
+}));
 vi.mock("../risk-service/exposure.limits.js", () => ({
-  exposureRegistry: { openPosition: vi.fn(), closePosition: vi.fn() },
+  exposureRegistry: {
+    openPosition: vi.fn(), closePosition: vi.fn(),
+    checkCanOpenAtomic: mockCheckCanOpenAtomic,
+  },
 }));
 
 vi.mock("../gateway/metrics.js", () => ({
@@ -87,7 +93,9 @@ function makeQueryRawDispatcher(walletBalance: string, walletLocked: string) {
       const requiredNum = typeof required?.toNumber === "function" ? required.toNumber() : parseFloat(String(required));
       const available = parseFloat(walletBalance) - parseFloat(walletLocked);
       if (available < requiredNum || parseFloat(walletBalance) <= 0) return Promise.resolve([]);
-      return Promise.resolve([{ balance: walletBalance, locked: walletLocked }]);
+      // FASE 2.3 perf: this is now a CTE returning the LedgerEntry INSERT's
+      // RETURNING id, not the wallet's balance/locked.
+      return Promise.resolve([{ id: "ledger-1" }]);
     }
     if (sql.includes("WalletAccount")) {
       // Diagnostic-only fallback SELECT — plain snapshot read.
@@ -107,6 +115,7 @@ beforeEach(() => {
   mockTx.$queryRaw.mockImplementation(makeQueryRawDispatcher("10000", "0"));
   mockTx.position.create.mockResolvedValue({});
   mockTx.outboxEvent.create.mockResolvedValue({ id: "outbox-1" });
+  mockCheckCanOpenAtomic.mockResolvedValue({ ok: true });
 });
 
 describe("ExecutionEngine.execute() — full fill is one atomic transaction", () => {
@@ -123,10 +132,11 @@ describe("ExecutionEngine.execute() — full fill is one atomic transaction", ()
     expect(result.status).toBe("FILLED");
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
     // All the writes happened against the SAME tx passed into the transaction
-    // callback, not against the top-level prisma client. Margin lock is a
-    // conditional $queryRaw UPDATE (FASE 2.2 perf), not walletAccount.update.
+    // callback, not against the top-level prisma client. Margin lock + its
+    // MARGIN_LOCK ledger leg are one $queryRaw CTE now (FASE 2.2/2.3 perf),
+    // not walletAccount.update / ledgerEntry.create.
     expect(mockTx.$queryRaw).toHaveBeenCalled();
-    expect(mockTx.ledgerEntry.create).toHaveBeenCalledTimes(1); // MARGIN_LOCK leg
+    expect(mockTx.ledgerEntry.create).not.toHaveBeenCalled();
     expect(mockTx.position.create).toHaveBeenCalledTimes(1);
     expect(mockTx.outboxEvent.create).toHaveBeenCalledTimes(1);
     expect(mockTx.outboxEvent.create.mock.calls[0][0].data.eventType).toBe("order.filled");
@@ -136,6 +146,27 @@ describe("ExecutionEngine.execute() — full fill is one atomic transaction", ()
     // creating a redundant second row.
     expect(emitted).toHaveLength(1);
     expect((emitted[0] as { outboxId: string }).outboxId).toBe("outbox-1");
+  });
+
+  it("instrument exposure halted: throws inside the transaction (not a plain return) so the already-written margin lock rolls back too", async () => {
+    mockFill.mockReturnValue(fullFillResult());
+    mockCheckCanOpenAtomic.mockResolvedValue({
+      ok: false, reason: "INSTRUMENT_HALTED", detail: "EURUSD gross exposure would be 99999999 USD (limit: 10000000 USD)",
+    });
+
+    const result = await executionEngine.execute(REQ, QUOTE);
+
+    expect(result.status).toBe("REJECTED");
+    expect((result as { reason?: string }).reason).toBe("INSTRUMENT_HALTED");
+    expect(mockCheckCanOpenAtomic).toHaveBeenCalledWith(mockTx, REQ.symbol, REQ.side, REQ.notional);
+    // By the time the exposure check runs, margin.controller.ts has already
+    // written the lock (this mock can't observe a real Postgres rollback,
+    // but the code path here must THROW rather than return {ok:false} — a
+    // plain return would let the callback "succeed" and commit those writes
+    // instead of rolling them back; a real-DB regression test for this
+    // exact class of bug lives in the k6 benchmark / invariants.sql gate).
+    expect(mockTx.position.create).not.toHaveBeenCalled();
+    expect(mockTx.outboxEvent.create).not.toHaveBeenCalled();
   });
 
   it("insufficient margin: rejects before any position, fill, or outbox row is created", async () => {

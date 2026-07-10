@@ -19,6 +19,16 @@ class ExecutionCancelledError extends Error {
   constructor() { super("EXECUTION_TIMEOUT: cancelled after margin lock"); this.name = "ExecutionCancelledError"; }
 }
 
+/** Thrown (never returned) inside the unified transaction when the FASE 2.3
+ *  exposure check fails — by this point margin.controller.ts has already
+ *  written the lock (wallet.locked increment + MARGIN_LOCK ledger entry), so
+ *  a `return {ok:false}` would let those writes COMMIT along with the rest of
+ *  the no-op callback result. Throwing is what rolls them back too, same as
+ *  ExecutionCancelledError above. */
+class ExposureHaltedError extends Error {
+  constructor(detail: string) { super(detail); this.name = "ExposureHaltedError"; }
+}
+
 // Retries releaseMargin up to 5 times with exponential backoff (50→800ms).
 // Prevents orphan wallet.locked when the connection pool is momentarily exhausted
 // during the window between checkAndLockMargin() committing and createPosition() completing.
@@ -154,6 +164,19 @@ export class ExecutionEngine {
         // everything else in this transaction — no manual release needed.
         if (cancelled()) throw new ExecutionCancelledError();
 
+        // ── Atomic, cluster-wide exposure check (FASE 2.3) ────────────────
+        // Re-validates the instrument exposure limit under an advisory lock
+        // against LIVE Position data — the same "re-check under lock at the
+        // last moment" pattern already used for margin above. The earlier
+        // pre-trade check (RiskEngine.preTradeCheck → exposureRegistry.
+        // checkCanOpen) only reads a per-worker cache and is not authoritative
+        // cluster-wide; this is. A failure here rolls back the margin lock
+        // too, same as insufficient margin.
+        const exposureCheck = await exposureRegistry.checkCanOpenAtomic(
+          tx, req.symbol, req.side, effectiveNotional,
+        );
+        if (!exposureCheck.ok) throw new ExposureHaltedError(exposureCheck.detail);
+
         // ── 4. Create position ────────────────────────────────────────────
         // For a partial fill, the position covers only the filled portion,
         // with proportional margin; the unfilled remainder is the caller's
@@ -226,6 +249,10 @@ export class ExecutionEngine {
       if (err instanceof ExecutionCancelledError) {
         await orderLifecycle.rejectOrder(req.orderId, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: "EXECUTION_TIMEOUT" };
+      }
+      if (err instanceof ExposureHaltedError) {
+        await orderLifecycle.rejectOrder(req.orderId, err.message);
+        return { status: "REJECTED", orderId: req.orderId, reason: "INSTRUMENT_HALTED" };
       }
       await orderLifecycle.rejectOrder(req.orderId, `Execution failed: ${(err as Error).message}`);
       return { status: "REJECTED", orderId: req.orderId, reason: "LP_UNAVAILABLE" };

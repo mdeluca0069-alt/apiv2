@@ -20,7 +20,11 @@
  *   - closePosition(symbol, side, quantity, price) — called by SettlementEngine after close
  */
 
+import type { Prisma } from "@prisma/client";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+
+/** See order.lifecycle.ts — same composability contract. */
+type Db = Prisma.TransactionClient | typeof prisma;
 
 // ─── Configurable limits (USD notional) ──────────────────────────────────────
 //
@@ -147,6 +151,85 @@ export class ExposureRegistry {
       };
     }
 
+    return { ok: true };
+  }
+
+  /**
+   * FASE 2.3 — atomic, cluster-wide exposure check.
+   *
+   * checkCanOpen() above is a fast, non-authoritative pre-trade read of the
+   * in-process Map — still used by RiskEngine.preTradeCheck() to reject
+   * obviously-over-limit orders early, before any DB work happens. But that
+   * Map is per-worker: in a multi-worker cluster it is never synchronized
+   * across processes, so its numbers can diverge from the real cluster-wide
+   * total (up to ~N× under-enforcement with N workers — see
+   * SYSTEM_ARCHITECTURE_FREEZE.md). It is not, and must never become, a
+   * second source of truth: `Position` rows are the only authority.
+   *
+   * This method is the authoritative gate. It must be called inside the same
+   * DB transaction that will create the position, so the check and the write
+   * it gates are atomic together:
+   *   1. Acquires a Postgres advisory lock scoped to `symbol`
+   *      (pg_advisory_xact_lock — auto-released at transaction end, no
+   *      manual unlock). This serializes concurrent opens on the same
+   *      instrument across every worker in the cluster, not just this
+   *      process — two different workers can no longer both read a
+   *      still-under-limit exposure and both proceed to breach it.
+   *   2. Computes gross/net exposure LIVE from `Position` (status=OPEN)
+   *      under that lock, never from the in-process cache.
+   */
+  async checkCanOpenAtomic(
+    tx:       Db,
+    symbol:   string,
+    side:     "BUY" | "SELL",
+    notional: number,
+  ): Promise<ExposureCheckResult> {
+    const key = symbol.toUpperCase();
+
+    // FASE 2.3 perf: lock acquisition and the exposure read are one round
+    // trip via a CTE, instead of two separate statements — this lock is held
+    // until the caller's transaction commits (that's what makes it correct —
+    // see the doc comment above), so every order for this symbol queued
+    // behind it pays for each round trip done while holding it. `lock_acquired`
+    // always has exactly one row (a bodyless SELECT), so the CROSS JOIN can't
+    // drop any Position rows; pg_advisory_xact_lock() is VOLATILE, so Postgres
+    // cannot skip or reorder its evaluation out of the query.
+    const rows = await tx.$queryRaw<Array<{ side: string; notional: string | null }>>`
+      WITH lock_acquired AS (SELECT pg_advisory_xact_lock(hashtext(${key})))
+      SELECT p.side, SUM(p.quantity * p."entryPrice") AS notional
+      FROM "Position" p, lock_acquired
+      WHERE p.symbol = ${key} AND p.status = 'OPEN'
+      GROUP BY p.side
+    `;
+
+    let longNotional  = 0;
+    let shortNotional = 0;
+    for (const row of rows) {
+      const n = row.notional ? parseFloat(row.notional) : 0;
+      if (row.side === "BUY") longNotional = n;
+      else if (row.side === "SELL") shortNotional = n;
+    }
+
+    const limits   = EXPOSURE_LIMITS[key] ?? DEFAULT_LIMIT;
+    const newLong  = longNotional  + (side === "BUY"  ? notional : 0);
+    const newShort = shortNotional + (side === "SELL" ? notional : 0);
+    const newGross = newLong + newShort;
+    const newNet   = Math.abs(newLong - newShort);
+
+    if (newGross > limits.grossUsd) {
+      return {
+        ok:     false,
+        reason: "INSTRUMENT_HALTED",
+        detail: `${key} gross exposure would be ${newGross.toFixed(0)} USD (limit: ${limits.grossUsd.toFixed(0)} USD)`,
+      };
+    }
+    if (newNet > limits.netUsd) {
+      return {
+        ok:     false,
+        reason: "INSTRUMENT_HALTED",
+        detail: `${key} net exposure would be ${newNet.toFixed(0)} USD (limit: ${limits.netUsd.toFixed(0)} USD)`,
+      };
+    }
     return { ok: true };
   }
 
