@@ -158,6 +158,7 @@ export class SettlementEngine {
     let newBalance!: Decimal;
     let safeRelease = 0;
     let discrepancy = 0;
+    let outboxId!: string;
 
     await withSettlementRetry(() =>
     (prisma as NonNullable<typeof prisma>).$transaction(async (tx) => {
@@ -272,10 +273,35 @@ export class SettlementEngine {
         ],
       });
 
+      // ── 2f. OutboxEvent — same transaction as position/wallet/ledger ────
+      // FASE 2.1: previously written fire-and-forget after commit (below,
+      // "Audit / outbox"), so a crash between commit and that write could
+      // silently lose the client's only durable notification of the close.
+      // Now the row is guaranteed to exist the instant the close is durable.
+      const outbox = await tx.outboxEvent.create({
+        data: {
+          eventType: "position.closed",
+          userId:    input.userId,
+          payload: {
+            positionId:  input.positionId,
+            userId:      input.userId,
+            symbol:      input.symbol,
+            side:        input.side,
+            pnl:         pnl.cappedPnl,
+            netCredit,
+            exitPrice:   input.exitPrice,
+            reason:      input.reason,
+            detail:      input.detail ?? "",
+          } as object,
+        },
+      });
+      outboxId = outbox.id;
+
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 15000 })
     ); // end withSettlementRetry
 
-    // ── 2f-i. Audit / outbox — fire-and-forget (outside transaction) ───────
+    // ── 2f-i. Audit — fire-and-forget (outside transaction) ────────────────
+    // FASE 2.4 replaces this with a reliable outbox-driven audit consumer.
     // TradeAudit, AuditLog, and OutboxEvent are non-financial audit records.
     // The financial state (position + wallet + ledger) is committed above.
     // Moving these outside the transaction cuts per-settlement connection-hold
@@ -356,26 +382,6 @@ export class SettlementEngine {
           },
         });
       } catch { /* non-fatal */ }
-
-      try {
-        await db.outboxEvent.create({
-          data: {
-            eventType: "position.closed",
-            userId:    input.userId,
-            payload: {
-              positionId:  input.positionId,
-              userId:      input.userId,
-              symbol:      input.symbol,
-              side:        input.side,
-              pnl:         pnl.cappedPnl,
-              netCredit,
-              exitPrice:   input.exitPrice,
-              reason:      input.reason,
-              detail:      input.detail ?? "",
-            } as object,
-          },
-        });
-      } catch { /* non-fatal */ }
     })();
 
     // ── 3. Release global exposure (after transaction commits) ─────────────
@@ -405,6 +411,7 @@ export class SettlementEngine {
       exitPrice:  input.exitPrice,
       pnl:        pnl.cappedPnl,
       timestamp:  ts,
+      outboxId,
     });
 
     eventBus.emit("wallet.event", {

@@ -826,20 +826,31 @@ function onBroadcastEvent(eventType: string, payload: Record<string, unknown>): 
  *   publish to Redis with __outboxId so a remote node that has the user
  *   connected can deliver it AND mark the outbox row published — preventing
  *   the background sweep from re-delivering the same event.
+ *
+ * FASE 2.1 — existingOutboxId: for financial events (order.filled,
+ * order.partial_filled, position.closed) the OutboxEvent row is now created
+ * inside the same DB transaction as the position/wallet/ledger update
+ * (execution.engine.ts / settlement.engine.ts), so it already exists by the
+ * time this runs. Passing its id here means this function only ever marks it
+ * published or references it for cross-node relay — it never creates a
+ * second, redundant row for the same financial event. When omitted (every
+ * other event type), behavior is unchanged: create-on-demand as before.
  */
 function enqueueAndPush(
   userId: string,
   wsType: string,
   data:   Record<string, unknown>,
+  existingOutboxId?: string,
 ): void {
   const delivered = pushToUser(userId, wsType, data);
   if (delivered) {
     // User is connected here — also notify other nodes (multi-device / multi-tab)
     void redisPubSub.publishUser(userId, wsType, data);
+    if (existingOutboxId) void outboxService.markPublished(existingOutboxId);
   } else {
-    // User not connected on this node — persist then notify remote nodes
+    // User not connected on this node — persist (unless already durable) then notify remote nodes
     void (async () => {
-      const outboxId = await outboxService.enqueue(wsType, data, userId);
+      const outboxId = existingOutboxId ?? await outboxService.enqueue(wsType, data, userId);
       const payload  = outboxId ? { ...data, __outboxId: outboxId } : data;
       void redisPubSub.publishUser(userId, wsType, payload);
     })();
@@ -868,10 +879,21 @@ function broadcast(type: string, data: unknown): void {
 // Use consistent names that match the frontend stream subscriptions.
 
 eventBus.on("order.filled", (event) => {
-  // "execution" for backward compat + "order.filled" canonical
-  const payload = { ...event, status: "FILLED" } as Record<string, unknown>;
-  enqueueAndPush(event.userId, "order.filled", payload);
+  // FASE 2.1: outboxId (if present) points at the row already committed
+  // atomically with the fill in execution.engine.ts — strip it from the
+  // client-facing payload and thread it through so enqueueAndPush marks that
+  // row published instead of creating a new one.
+  const { outboxId, ...rest } = event;
+  const payload = { ...rest, status: "FILLED" } as Record<string, unknown>;
+  // "execution" for backward compat + "order.filled" canonical — the alias
+  // keeps its own independent outbox-on-demand behavior (unchanged).
+  enqueueAndPush(event.userId, "order.filled", payload, outboxId);
   enqueueAndPush(event.userId, "execution", payload);
+});
+eventBus.on("order.partial_filled", (event) => {
+  const { outboxId, ...rest } = event;
+  const payload = { ...rest, status: "PARTIALLY_FILLED" } as Record<string, unknown>;
+  enqueueAndPush(event.userId, "order.partial_filled", payload, outboxId);
 });
 eventBus.on("order.rejected", (event) => {
   const payload = { ...event, status: "REJECTED" } as Record<string, unknown>;
@@ -917,7 +939,10 @@ eventBus.on("position.opened", (event) => {
   enqueueAndPush(event.userId, "position.opened", event as unknown as Record<string, unknown>);
 });
 eventBus.on("position.closed", (event) => {
-  enqueueAndPush(event.userId, "position.closed", event as unknown as Record<string, unknown>);
+  // FASE 2.1: see order.filled above — outboxId points at the row already
+  // committed atomically with the close in settlement.engine.ts.
+  const { outboxId, ...rest } = event;
+  enqueueAndPush(event.userId, "position.closed", rest as unknown as Record<string, unknown>, outboxId);
 });
 eventBus.on("position.pnl_updated", (event) => {
   // High-frequency streaming — no outbox persistence

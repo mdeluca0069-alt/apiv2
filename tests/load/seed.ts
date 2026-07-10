@@ -42,8 +42,16 @@ async function seedUsers(count: number): Promise<{ userIds: string[]; tokens: st
           email,
           password,
           fullName:    `Load Test User ${i}`,
-          role:        "client",
-          roles:       ["client"],
+          // "trader" is the canonical role (see UserRoleSchema in
+          // shared/contracts.ts and auth.service.ts's real signup default) —
+          // this was seeding "client", a role that has never been valid;
+          // shared/state.ts:resolvePrincipal() filters JWT roles against a
+          // fixed whitelist that doesn't include "client", so every seeded
+          // load-test user silently lost all permissions on every
+          // authenticated request (discovered via FASE 2's k6 benchmark gate,
+          // which found 0 orders filled/rejected out of ~4000 iterations).
+          role:        "trader",
+          roles:       ["trader"],
           permissions: [],
           tier:        "STANDARD",
           kycStatus:   "approved",

@@ -4,6 +4,9 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../shared/db.js";
 import type { MarginState } from "../shared/contracts.js";
 
+/** See order.lifecycle.ts — same composability contract. */
+type Db = Prisma.TransactionClient | typeof prisma;
+
 export class MarginController {
   async getMarginState(userId: string): Promise<MarginState> {
     const [wallet, openPositions] = await Promise.all([
@@ -33,66 +36,86 @@ export class MarginController {
 
   /**
    * Atomically checks margin availability then locks it.
-   * Runs under Serializable isolation so concurrent pre-trade reads cannot
-   * both see sufficient free margin and then over-commit.
+   *
+   * Concurrency is provided by SELECT ... FOR UPDATE on the wallet row, which
+   * serializes concurrent margin-lock attempts per user under plain
+   * ReadCommitted isolation — no Serializable/SSI retry loop needed, and no
+   * risk of the position range-scan false positives SSI can produce.
    *
    * Returns { ok: true } on success or { ok: false, reason } if the
    * margin is no longer available (race was won by another order).
+   *
+   * FASE 2.2: pass `db` (an already-open Prisma.TransactionClient) to compose
+   * this check-and-lock into a larger caller-owned transaction (see
+   * execution.engine.ts, where it now runs in the same transaction as position
+   * creation and the FILLED transition — a failure anywhere in that unit rolls
+   * back the margin lock too, instead of leaving orphaned locked margin behind).
+   * Omit `db` for the original standalone behavior (own transaction, unchanged
+   * for any other caller).
    */
   async checkAndLockMargin(
     userId:   string,
     orderId:  string,
     required: number,
+    db?: Db,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    try {
-      const result = await prisma.$transaction(async (tx) => {
-        // SELECT FOR UPDATE acquires an exclusive row lock on the wallet.
-        // This serializes concurrent margin-lock attempts per user without SSI,
-        // eliminating the position range-scan that causes SSI false positives.
+    const run = async (tx: Db): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      // FASE 2.2 perf: atomic check-and-lock in ONE statement instead of
+      // SELECT FOR UPDATE + a separate conditional UPDATE. The WHERE clause
+      // enforces sufficient available margin as part of the same statement
+      // Postgres uses to take the row lock, so a concurrent second lock
+      // attempt on the same wallet still can't both succeed (same guarantee
+      // as before) — this just removes one round trip from the common
+      // (sufficient-margin) path. Cuts held-connection time inside the
+      // caller's transaction (execution.engine.ts now runs this alongside
+      // position/fill/outbox writes in one unit — see FASE 2.2), which
+      // matters under concurrent load against a fixed connection pool.
+      const locked = await tx.$queryRaw<Array<{ balance: string; locked: string }>>`
+        UPDATE "WalletAccount"
+        SET locked = locked + ${new Decimal(required)}
+        WHERE "userId" = ${userId}
+          AND balance > 0
+          AND (balance - locked) >= ${new Decimal(required)}
+        RETURNING balance, locked
+      `;
+
+      if (locked.length === 0) {
+        // Off the hot path — only reached on rejection, to produce a precise
+        // reason. A plain read is fine here (no FOR UPDATE needed): worst
+        // case a concurrent change makes the message slightly stale, but the
+        // conditional UPDATE above is what actually decided the outcome.
         const rows = await tx.$queryRaw<Array<{ balance: string; locked: string }>>`
-          SELECT balance, locked
-          FROM "WalletAccount"
-          WHERE "userId" = ${userId}
-          FOR UPDATE
+          SELECT balance, locked FROM "WalletAccount" WHERE "userId" = ${userId}
         `;
-
         if (rows.length === 0) return { ok: false as const, reason: `WALLET_NOT_FOUND:${userId}` };
+        const available = parseFloat(rows[0].balance) - parseFloat(rows[0].locked);
+        return {
+          ok:     false as const,
+          reason: `INSUFFICIENT_MARGIN: need ${required.toFixed(2)}, available=${available.toFixed(2)}`,
+        };
+      }
 
-        const balance   = parseFloat(rows[0].balance);
-        const locked    = parseFloat(rows[0].locked);
-        const available = balance - locked;
+      await tx.ledgerEntry.create({
+        data: {
+          id:            randomUUID(),
+          userId,
+          currency:      "USD",
+          amount:        -required,
+          type:          "MARGIN_LOCK",
+          reference:     orderId,
+          status:        "COMPLETED",
+          note:          `Margin locked for order ${orderId}`,
+          debitAccount:  `CLIENT_FREE:${userId}`,
+          creditAccount: `CLIENT_MARGIN:${userId}`,
+        },
+      });
 
-        if (available < required || balance <= 0) {
-          return {
-            ok:     false as const,
-            reason: `INSUFFICIENT_MARGIN: need ${required.toFixed(2)}, available=${available.toFixed(2)}`,
-          };
-        }
+      return { ok: true as const };
+    };
 
-        await tx.walletAccount.update({
-          where: { userId },
-          data:  { locked: { increment: new Decimal(required) } },
-        });
-
-        await tx.ledgerEntry.create({
-          data: {
-            id:            randomUUID(),
-            userId,
-            currency:      "USD",
-            amount:        -required,
-            type:          "MARGIN_LOCK",
-            reference:     orderId,
-            status:        "COMPLETED",
-            note:          `Margin locked for order ${orderId}`,
-            debitAccount:  `CLIENT_FREE:${userId}`,
-            creditAccount: `CLIENT_MARGIN:${userId}`,
-          },
-        });
-
-        return { ok: true as const };
-      }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 3000, timeout: 8000 });
-
-      return result;
+    try {
+      if (db) return await run(db);
+      return await prisma.$transaction(run, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 3000, timeout: 8000 });
     } catch (err) {
       return { ok: false, reason: (err as Error).message };
     }

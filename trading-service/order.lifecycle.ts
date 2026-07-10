@@ -1,7 +1,13 @@
 import { randomUUID }  from "node:crypto";
 import { Decimal }     from "@prisma/client/runtime/library";
+import { Prisma }      from "@prisma/client";
 import { prisma }      from "../shared/db.js";
 import type { LifecycleEvent, OrderStatus, OrderFillRecord } from "../shared/contracts.js";
+
+/** Accepts either the top-level PrismaClient or a $transaction callback's tx — every
+ *  method below runs identically on both, letting callers compose them inside a
+ *  shared transaction (see execution.engine.ts FASE 2.1) or call them standalone. */
+type Db = Prisma.TransactionClient | typeof prisma;
 
 /**
  * Thrown when an order with the same (userId, clientOrderId) already exists.
@@ -102,6 +108,7 @@ export class OrderLifecycle {
       fees?:             number;
       filledAt?:         Date;
     },
+    db: Db = prisma,
   ): Promise<void> {
     const eventJson = JSON.stringify([{
       status:    toStatus,
@@ -112,7 +119,7 @@ export class OrderLifecycle {
 
     if (extra?.averageFillPrice !== undefined) {
       // FILLED transition — update status, lifecycle, and fill-specific fields
-      await prisma.$executeRaw`
+      await db.$executeRaw`
         UPDATE "Order" SET
           status = ${toStatus},
           "riskCheckResult" = jsonb_set(
@@ -128,7 +135,7 @@ export class OrderLifecycle {
       `;
     } else if (extra?.rejectionReason) {
       // REJECTED transition — update status, lifecycle, and rejection reason
-      await prisma.$executeRaw`
+      await db.$executeRaw`
         UPDATE "Order" SET
           status = ${toStatus},
           "riskCheckResult" = jsonb_set(
@@ -141,7 +148,7 @@ export class OrderLifecycle {
       `;
     } else {
       // ACCEPTED or other transitions — status + lifecycle only
-      await prisma.$executeRaw`
+      await db.$executeRaw`
         UPDATE "Order" SET
           status = ${toStatus},
           "riskCheckResult" = jsonb_set(
@@ -154,10 +161,10 @@ export class OrderLifecycle {
     }
   }
 
-  async rejectOrder(orderId: string, reason: string): Promise<void> {
+  async rejectOrder(orderId: string, reason: string, db: Db = prisma): Promise<void> {
     await this.transition(orderId, "REJECTED", reason, "RISK", {
       rejectionReason: reason,
-    });
+    }, db);
   }
 
   /**
@@ -176,10 +183,10 @@ export class OrderLifecycle {
     leverage:    number;
     stopLoss?:   number;
     takeProfit?: number;
-  }): Promise<string> {
+  }, db: Db = prisma): Promise<string> {
     const id = randomUUID();
 
-    await prisma.position.create({
+    await db.position.create({
       data: {
         id,
         orderId:    params.orderId,
@@ -226,11 +233,11 @@ export class OrderLifecycle {
     liquidityProvider: string;
     slippage:          number;
     fees:              number;
-  }): Promise<OrderFillRecord> {
+  }, db: Db = prisma): Promise<OrderFillRecord> {
     const id = randomUUID();
     const now = new Date();
 
-    await prisma.$executeRaw`
+    await db.$executeRaw`
       INSERT INTO "Fill"
         ("id","orderId","positionId","quantity","price","liquidityProvider","slippage","fees","createdAt")
       VALUES
@@ -268,8 +275,9 @@ export class OrderLifecycle {
   async incrementFilledQuantity(
     orderId:    string,
     addedQty:   number,
+    db: Db = prisma,
   ): Promise<{ newFilledQty: number; originalQty: number }> {
-    const rows = await prisma.$queryRaw<Array<{ filledQty: string; qty: string }>>`
+    const rows = await db.$queryRaw<Array<{ filledQty: string; qty: string }>>`
       UPDATE "Order"
       SET "filledQuantity" = "filledQuantity" + ${new Decimal(addedQty)}
       WHERE id = ${orderId}
@@ -281,6 +289,62 @@ export class OrderLifecycle {
     return {
       newFilledQty: parseFloat(rows[0].filledQty),
       originalQty:  parseFloat(rows[0].qty),
+    };
+  }
+
+  /**
+   * FASE 2.2 perf: merges incrementFilledQuantity + transition(FILLED |
+   * PARTIALLY_FILLED) into ONE round trip instead of two.
+   *
+   * The terminal status can't be decided in JS before this call the way the
+   * two-step version did (call incrementFilledQuantity, then decide FILLED vs
+   * PARTIALLY_FILLED, then call transition) — that ordering is exactly why it
+   * was two round trips. Instead the status is computed inside the same SQL
+   * statement via a CASE expression against the post-increment
+   * filledQuantity, so this needs only one UPDATE ... RETURNING.
+   *
+   * Safe for both the full-fill path (addedQty == quantity, always resolves
+   * to FILLED) and the partial-fill path (multiple legs accumulate
+   * filledQuantity across calls; resolves to FILLED only once the sum
+   * reaches the original quantity).
+   */
+  async recordFillLeg(
+    orderId: string,
+    addedQty: number,
+    detail: { filled: string; partial: string },
+    fill: { averageFillPrice: number; slippage: number; fees: number },
+    db: Db = prisma,
+  ): Promise<{ newFilledQty: number; originalQty: number; isNowFullyFilled: boolean }> {
+    const now = new Date().toISOString();
+    const filledEvent  = JSON.stringify([{ status: "FILLED",           timestamp: now, detail: detail.filled,  actor: "LP" }]);
+    const partialEvent = JSON.stringify([{ status: "PARTIALLY_FILLED", timestamp: now, detail: detail.partial, actor: "LP" }]);
+    const addedQtyDec  = new Decimal(addedQty);
+
+    const rows = await db.$queryRaw<Array<{ status: string; filledQty: string; qty: string }>>`
+      UPDATE "Order" SET
+        "filledQuantity"  = "filledQuantity" + ${addedQtyDec},
+        status            = CASE WHEN "filledQuantity" + ${addedQtyDec} >= quantity THEN 'FILLED' ELSE 'PARTIALLY_FILLED' END,
+        "riskCheckResult" = jsonb_set(
+          COALESCE("riskCheckResult", '{}'),
+          '{lifecycle}',
+          COALESCE("riskCheckResult"->'lifecycle', '[]') ||
+            (CASE WHEN "filledQuantity" + ${addedQtyDec} >= quantity
+                  THEN ${filledEvent}::jsonb ELSE ${partialEvent}::jsonb END)
+        ),
+        "averageFillPrice" = ${new Decimal(fill.averageFillPrice)},
+        slippage            = ${new Decimal(fill.slippage)},
+        fees                = ${new Decimal(fill.fees)},
+        "filledAt"          = ${new Date()}
+      WHERE id = ${orderId}
+      RETURNING status, "filledQuantity" AS "filledQty", quantity AS qty
+    `;
+
+    if (!rows[0]) throw new Error(`Order ${orderId} not found during recordFillLeg`);
+
+    return {
+      newFilledQty:     parseFloat(rows[0].filledQty),
+      originalQty:      parseFloat(rows[0].qty),
+      isNowFullyFilled: rows[0].status === "FILLED",
     };
   }
 }

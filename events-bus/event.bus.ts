@@ -13,6 +13,10 @@ export type OrderFilledEvent = {
   notional: number;
   leverage: number;
   timestamp: string;
+  /** FASE 2.1: id of the OutboxEvent row already committed in the same DB
+   *  transaction as the fill — lets the WS delivery bridge mark it published
+   *  on live delivery instead of creating a second, redundant row. */
+  outboxId?: string;
 };
 
 export type OrderRejectedEvent = {
@@ -45,6 +49,8 @@ export type PositionClosedEvent = {
   exitPrice: number;
   pnl: number;
   timestamp: string;
+  /** FASE 2.1: see OrderFilledEvent.outboxId. */
+  outboxId?: string;
 };
 
 export type MarketQuoteEvent = {
@@ -345,6 +351,8 @@ export type OrderPartialFilledEvent = {
   remainingQuantity: number;
   averageFillPrice:  number;
   timestamp:         string;
+  /** FASE 2.1: see OrderFilledEvent.outboxId. */
+  outboxId?:         string;
 };
 
 export type OrderLimitExpiredEvent = {
