@@ -59,16 +59,24 @@ export class OrderController {
     }
 
     // ── 1. Resolve current quote ────────────────────────────────────────────
-    // Policy: trade off the last known REAL price even if the live feed has
-    // gone stale (TwelveData/Finnhub free-tier plans don't cover every
-    // instrument — e.g. indices/commodities). A stale quote still reflects
-    // the last real market tick, so we degrade gracefully instead of hard-
-    // blocking orders. feedHealthMonitor/alertManager still raise
-    // MARKET_DATA_OUTAGE alerts for monitoring — staleness is observed, not
-    // hidden, just no longer fatal to trading.
+    // FASE 3.4 (Internal Liquidity Engine): this used to trade off the last
+    // known price no matter how old — the comment here used to justify that
+    // as graceful degradation for REST-only instruments (TwelveData/Finnhub
+    // free-tier plans don't cover every instrument via WS), but the check it
+    // actually skipped was `quoteCache.isStale()` itself, which is ALREADY
+    // calibrated for exactly that gap (STALE_THRESHOLD_MS=6min, tuned to
+    // tolerate the ~5min REST batch cadence — see internal.liquidity.core.ts).
+    // Skipping the check didn't just tolerate a normal REST gap, it let a
+    // quote of ANY age — hours, days, from a feed that silently died
+    // entirely — still fill real orders. quoteCache.isStale()'s own
+    // docstring already claimed "order.controller uses this to reject
+    // orders"; it never actually did until now.
     const quote = quoteCache.get(symbol);
     if (!quote) {
       return this._rejectedAck(symbol, req.side, "NO_LIVE_MARKET_DATA: instrument not in live feed");
+    }
+    if (quoteCache.isStale(symbol)) {
+      return this._rejectedAck(symbol, req.side, "NO_LIVE_MARKET_DATA: quote is stale — no fresh tick received recently");
     }
     if (!brokerSpreadConfig.isEnabled(symbol)) {
       return this._rejectedAck(symbol, req.side, "INSTRUMENT_DISABLED: symbol is halted for new orders");
@@ -188,6 +196,12 @@ export class OrderController {
   async executePendingOrder(pending: PendingOrder, execPrice: number): Promise<void> {
     const quote = quoteCache.get(pending.symbol);
     if (!quote)                               throw new Error(`No quote for ${pending.symbol}`);
+    // FASE 3.4: same staleness gate as placeOrder() — this is normally a
+    // no-op here (a trigger only fires in direct response to a live tick,
+    // so the quote just fetched is normally fresh), but it closes the same
+    // class of gap consistently rather than leaving this one call site as
+    // the sole place still willing to fill against an arbitrarily old quote.
+    if (quoteCache.isStale(pending.symbol))   throw new Error(`NO_LIVE_MARKET_DATA: ${pending.symbol} quote is stale`);
     if (!brokerSpreadConfig.isEnabled(pending.symbol)) throw new Error(`INSTRUMENT_DISABLED: ${pending.symbol} is halted`);
     if (quote.spread === 0)                   throw new Error(`NO_VALID_SPREAD: ${pending.symbol} has zero spread`);
 
