@@ -16,6 +16,7 @@
  *   KILL_SWITCH_ACTIVATED    — kill switch enabled by admin
  *   AUTOPILOT_CIRCUIT_BREAKER — autopilot auto-disabled platform-wide (daily drawdown breach)
  *   AUTOPILOT_FALLBACK_SPIKE  — autopilot correlation/regime fallback paths firing unusually often
+ *   AUDIT_CONSUMER_FAILURE    — an OutboxEvent has failed TradeAudit/AuditLog processing repeatedly
  *
  * Deduplication: identical alerts are suppressed for DEDUP_WINDOW_MS (5 min).
  * All alerts are also written to AuditLog for compliance.
@@ -269,6 +270,16 @@ class AlertManager {
       title:    "Swap Accrual Errors",
       message:  `${errors} of ${positionCount} positions failed swap accrual tonight.`,
       metadata: { positionCount, errors },
+    });
+  }
+
+  auditConsumerFailure(eventId: string, eventType: string, retries: number, error: string): Promise<void> {
+    return this.send({
+      type:     "AUDIT_CONSUMER_FAILURE",
+      severity: "CRITICAL",
+      title:    "Trade Audit Delivery Failing Persistently",
+      message:  `OutboxEvent ${eventId} (${eventType}) has failed audit processing ${retries} time(s) and will keep retrying.`,
+      metadata: { eventId, eventType, retries, error },
     });
   }
 }

@@ -278,10 +278,18 @@ export class SettlementEngine {
       // "Audit / outbox"), so a crash between commit and that write could
       // silently lose the client's only durable notification of the close.
       // Now the row is guaranteed to exist the instant the close is durable.
+      //
+      // FASE 2.4: the payload also carries every field the audit consumer
+      // (compliance/audit.outbox.consumer.ts) needs to build the TradeAudit
+      // CLOSE update and the AuditLog entry — same reasoning as the
+      // equivalent execution.engine.ts change: cheap to capture once here,
+      // while everything is already in scope and hasn't moved yet, instead
+      // of a consumer re-fetch that risks a torn read against later writes.
       const outbox = await tx.outboxEvent.create({
         data: {
           eventType: "position.closed",
           userId:    input.userId,
+          auditProcessed: false,
           payload: {
             positionId:  input.positionId,
             userId:      input.userId,
@@ -292,6 +300,18 @@ export class SettlementEngine {
             exitPrice:   input.exitPrice,
             reason:      input.reason,
             detail:      input.detail ?? "",
+            // Audit-only fields (not used by the WS client payload above):
+            entryPrice:          input.entryPrice,
+            quantity:            input.quantity,
+            leverage:            input.leverage,
+            openedAt:            input.openedAt.toISOString(),
+            rawPnl:              pnl.rawPnl,
+            pnlPercent:          pnl.pnlPercent,
+            commission:          commResult.commission,
+            swap:                swapResult.totalSwap,
+            marginUsedRequested: input.marginUsed,
+            marginUsedReleased:  safeRelease,
+            marginDiscrepancy:   discrepancy > 0.001 ? discrepancy : 0,
           } as object,
         },
       });
@@ -300,89 +320,15 @@ export class SettlementEngine {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 15000 })
     ); // end withSettlementRetry
 
-    // ── 2f-i. Audit — fire-and-forget (outside transaction) ────────────────
-    // FASE 2.4 replaces this with a reliable outbox-driven audit consumer.
-    // TradeAudit, AuditLog, and OutboxEvent are non-financial audit records.
-    // The financial state (position + wallet + ledger) is committed above.
-    // Moving these outside the transaction cuts per-settlement connection-hold
-    // from ~380 ms to ~190 ms, preventing pool saturation at 250+ users.
-    const db = prisma as NonNullable<typeof prisma>;
-    void (async () => {
-      try {
-        const closedData = {
-          exitPrice:   new Decimal(input.exitPrice),
-          pnlRealized: new Decimal(pnl.cappedPnl),
-          pnlPercent:  new Decimal(pnl.pnlPercent),
-          fees:        new Decimal(commResult.commission),
-          tradeStatus: "CLOSED",
-          closedAt:    new Date(),
-          duration:    Math.floor((Date.now() - input.openedAt.getTime()) / 60_000),
-        };
-        const updated = await db.tradeAudit.updateMany({
-          where: { positionId: input.positionId },
-          data:  closedData,
-        });
-        if (updated.count === 0) {
-          await db.tradeAudit.create({
-            data: {
-              userId:      input.userId,
-              orderId:     null,
-              positionId:  input.positionId,
-              symbol:      input.symbol,
-              side:        input.side,
-              quantity:    new Decimal(input.quantity),
-              entryPrice:  new Decimal(input.entryPrice),
-              exitPrice:   new Decimal(input.exitPrice),
-              pnlRealized: new Decimal(pnl.cappedPnl),
-              pnlPercent:  new Decimal(pnl.pnlPercent),
-              marginUsed:  new Decimal(input.marginUsed),
-              leverage:    input.leverage,
-              fees:        new Decimal(commResult.commission),
-              tradeStatus: "CLOSED",
-              closedAt:    new Date(),
-              duration:    Math.floor((Date.now() - input.openedAt.getTime()) / 60_000),
-              lifecycle:   JSON.stringify([{
-                status:    "CLOSED",
-                timestamp: new Date().toISOString(),
-                detail:    `${input.reason} close @ ${input.exitPrice}`,
-                actor:     "SYSTEM",
-              }]),
-              riskMetrics: JSON.stringify({ reason: input.reason, netCredit }),
-            },
-          });
-        }
-      } catch { /* non-fatal — recoverable from position history */ }
-
-      try {
-        await db.auditLog.create({
-          data: {
-            id:      randomUUID(),
-            actor:   input.userId,
-            action:  `position.${input.reason.toLowerCase()}`,
-            entity:  input.positionId,
-            payload: {
-              positionId:          input.positionId,
-              symbol:              input.symbol,
-              side:                input.side,
-              quantity:            input.quantity,
-              entryPrice:          input.entryPrice,
-              exitPrice:           input.exitPrice,
-              rawPnl:              pnl.rawPnl,
-              cappedPnl:           pnl.cappedPnl,
-              commission:          commResult.commission,
-              swap:                swapResult.totalSwap,
-              netCredit,
-              marginUsedRequested: input.marginUsed,
-              marginUsedReleased:  safeRelease,
-              marginDiscrepancy:   discrepancy > 0.001 ? discrepancy : 0,
-              reason:              input.reason,
-              detail:              input.detail ?? "",
-            } as object,
-            createdAt: new Date(),
-          },
-        });
-      } catch { /* non-fatal */ }
-    })();
+    // ── 2f-i. Audit ──────────────────────────────────────────────────────
+    // FASE 2.4: TradeAudit (CLOSE update) and AuditLog are no longer written
+    // here, fire-and-forget. The OutboxEvent row created inside the
+    // transaction above (with every field this used to build them from) is
+    // durable the instant the close is; compliance/audit.outbox.consumer.ts
+    // reliably turns it into both records, with retry and alerting on
+    // persistent failure — see that file for the delivery guarantee. This
+    // also keeps the ~380ms → ~190ms per-settlement connection-hold win from
+    // FASE 2.1 (audit writes still happen after, not inside, the transaction).
 
     // ── 3. Release global exposure (after transaction commits) ─────────────
     // notional at close = quantity × exitPrice

@@ -408,9 +408,19 @@ model OutboxEvent {
   retries     Int       @default(0)
   createdAt   DateTime  @default(now())
   userId      String?
+  // FASE 2.4: separate delivery track for the audit consumer
+  // (compliance/audit.outbox.consumer.ts). Defaults to true — most event
+  // types (risk warnings, wallet events, etc.) don't need a TradeAudit/
+  // AuditLog row, only order.filled/order.partial_filled/position.closed do,
+  // and those three explicitly set it false when the row is created. This
+  // keeps `published` (WS delivery) and audit-consumption as independent,
+  // non-interfering completion flags on the same durable row.
+  auditProcessed Boolean @default(true)
+  auditRetries   Int     @default(0)
 
   @@index([published, createdAt])
   @@index([userId, published])
+  @@index([auditProcessed, createdAt])
 }
 
 model Position {
@@ -662,8 +672,24 @@ model TradeAudit {
   closedAt      DateTime?
   updatedAt     DateTime  @updatedAt
   User          User      @relation(fields: [userId], references: [id])
+  // FASE 2.4: idempotency key for compliance/audit.outbox.consumer.ts — the
+  // OutboxEvent row this TradeAudit row was built from. A retry after the
+  // audit transaction committed but whose ack was lost (rare, but the
+  // transaction alone can't rule it out) hits this unique constraint on the
+  // re-attempted INSERT instead of writing a second, duplicate row; the
+  // consumer treats that as success. Nullable: only rows created via the
+  // outbox path (FASE 2.4 onward) set it — pre-2.4 rows have none.
+  //
+  // Composite with createdAt (not a plain unique) because TradeAudit is
+  // partitioned by createdAt (Task 14) — Postgres requires every unique
+  // index on a partitioned table to include the partition key. This only
+  // works because the consumer sets createdAt explicitly from the source
+  // OutboxEvent's own createdAt, not `now()` — deterministic across retries,
+  // so the composite key is exactly as unique as sourceOutboxId alone.
+  sourceOutboxId String?
 
   @@id([id, createdAt])
+  @@unique([sourceOutboxId, createdAt])
   @@index([orderId])
   @@index([positionId])
   @@index([symbol, tradeStatus])

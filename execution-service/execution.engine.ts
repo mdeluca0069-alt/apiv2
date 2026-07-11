@@ -1,5 +1,3 @@
-import { randomUUID }      from "node:crypto";
-import { Decimal }          from "@prisma/client/runtime/library";
 import { prisma }           from "../shared/db.js";
 import { eventBus }         from "../events-bus/event.bus.js";
 import { fillEngine }       from "./fill.engine.js";
@@ -230,15 +228,27 @@ export class ExecutionEngine {
         // if the process crashes immediately after. Its id is threaded through
         // eventBus so the WS bridge (main.ts) marks it published on delivery
         // instead of creating a second, redundant row.
+        //
+        // FASE 2.4: the payload also carries every field the audit consumer
+        // (compliance/audit.outbox.consumer.ts) needs to build a TradeAudit
+        // record — leverage/stopLoss/takeProfit aren't derivable from the
+        // financial tables alone without a re-fetch, so they're captured here
+        // once, cheaply, while already in scope, rather than making the
+        // consumer re-fetch Order/Position (and risk it reading state that
+        // has since changed, e.g. a stopLoss the client edited afterward).
         const outbox = await tx.outboxEvent.create({
           data: {
             eventType: isNowFullyFilled ? "order.filled" : "order.partial_filled",
             userId:    req.userId,
+            auditProcessed: false,
             payload: {
               orderId: req.orderId, positionId, userId: req.userId, symbol: req.symbol,
               side: req.side, fillPrice: execPrice, marginUsed: effectiveMargin,
               notional: effectiveNotional, filledQuantity: effectiveFill,
               slippage: fillResult.slippage, fees: fillResult.fees,
+              leverage: req.leverage, stopLoss: req.stopLoss ?? null, takeProfit: req.takeProfit ?? null,
+              tradeStatus: isPartial ? "PARTIAL" : "OPEN",
+              ...(isPartial ? { remainingQty: fillResult.remainingQuantity, cumulativeFilled: newFilledQty } : {}),
             } as object,
           },
         });
@@ -263,7 +273,7 @@ export class ExecutionEngine {
       return { status: "REJECTED", orderId: req.orderId, reason: "MARGIN_INSUFFICIENT" };
     }
 
-    const { positionId, newFilledQty, originalQty, isNowFullyFilled, outboxId } = outcome;
+    const { positionId, isNowFullyFilled, outboxId } = outcome;
     const ts = new Date().toISOString();
 
     // ── Release unused margin for a genuine partial fill ────────────────────
@@ -285,39 +295,12 @@ export class ExecutionEngine {
     exposureRegistry.openPosition(req.symbol, req.side, effectiveNotional);
 
     // ── Record trade audit ─────────────────────────────────────────────────
-    // Fire-and-forget: position/wallet/ledger/outbox are already durable above.
-    // FASE 2.4 replaces this with a reliable outbox-driven audit consumer —
-    // for now audit failure remains a compliance concern, not a financial one.
-    void prisma.tradeAudit.create({
-      data: {
-        id:          randomUUID(),
-        userId:      req.userId,
-        orderId:     req.orderId,
-        positionId,
-        symbol:      req.symbol,
-        side:        req.side,
-        quantity:    new Decimal(effectiveFill),
-        entryPrice:  new Decimal(execPrice),
-        marginUsed:  new Decimal(effectiveMargin),
-        leverage:    req.leverage,
-        fees:        new Decimal(fillResult.fees),
-        slippage:    new Decimal(fillResult.slippage),
-        stopLoss:    req.stopLoss   ? new Decimal(req.stopLoss)   : null,
-        takeProfit:  req.takeProfit ? new Decimal(req.takeProfit) : null,
-        tradeStatus: isPartial ? "PARTIAL" : "OPEN",
-        lifecycle: JSON.stringify([{
-          status:    isPartial ? "PARTIAL" : "OPEN",
-          timestamp: new Date().toISOString(),
-          detail:    isPartial ? `Partial fill ${effectiveFill}/${originalQty} @ ${execPrice}` : `Opened @ ${execPrice}`,
-        }]),
-        riskMetrics: JSON.stringify({
-          marginRequired:   effectiveMargin,
-          notional:         effectiveNotional,
-          leverage:         req.leverage,
-          ...(isPartial ? { remainingQty: fillResult.remainingQuantity, cumulativeFilled: newFilledQty } : {}),
-        }),
-      },
-    });
+    // FASE 2.4: TradeAudit is no longer written here, fire-and-forget. The
+    // OutboxEvent row created inside the transaction above (with the same
+    // fields this used to build TradeAudit from) is durable the instant the
+    // fill is; compliance/audit.outbox.consumer.ts reliably turns it into a
+    // TradeAudit row, with retry and alerting on persistent failure — see
+    // that file for the delivery guarantee.
 
     metrics.inc(isPartial ? "orders_partial_filled_total" : "orders_filled_total");
     metrics.inc("positions_opened_total");
