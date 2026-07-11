@@ -967,15 +967,27 @@ eventBus.on("margin.warning", (event) => {
 
 // P6 — Background retry sweep: recover events for users who just came online.
 // Runs every 30 s; only looks at events from the last 24 h.
-// Leader-elected: one worker per cycle sweeps the DB; others skip.
+// Leader-elected: one worker per cycle sweeps the DB — but the user it's
+// trying to reach could be connected to ANY node, not just this leader.
+// FASE 2.7: a local miss now falls back to the same Redis cross-node relay
+// enqueueAndPush uses for the first delivery attempt — onUserEvent on
+// whichever node actually has the user's socket marks the row published
+// itself, asynchronously. Without this, a user on a non-leader node would
+// never receive a re-delivery from this sweep no matter how many cycles ran.
 setInterval(async () => {
   if (!(await jobCoordinator.tryLead("outbox-retry-sweep"))) return;
   try {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1_000);
-    const n = await outboxService.retryUnpublished(cutoff, (userId, eventType, payload) =>
-      pushToUser(userId, eventType, payload),
-    );
-    if (n > 0) console.log(`[outbox] background sweep recovered ${n} event(s)`);
+    const n = await outboxService.retryUnpublished(cutoff, (userId, eventType, payload, outboxId) => {
+      const delivered = pushToUser(userId, eventType, payload);
+      if (!delivered) {
+        void redisPubSub.publishUser(userId, eventType, {
+          ...(payload as Record<string, unknown>), __outboxId: outboxId,
+        });
+      }
+      return delivered;
+    });
+    if (n > 0) console.log(`[outbox] background sweep recovered ${n} event(s) locally (cross-node relay attempted for the rest)`);
   } finally {
     await jobCoordinator.release("outbox-retry-sweep");
   }
