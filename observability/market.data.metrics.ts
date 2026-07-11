@@ -52,11 +52,20 @@ export function initMarketDataMetrics(): void {
   setInterval(() => {
     try {
       const snapshot = feedHealthMonitor.getSnapshot();
+      // FASE 3.1: this used to do `Object.entries(snapshot)`, which iterates
+      // the snapshot's own top-level keys (checkedAt, circuitOpen,
+      // staleSymbols, ...) as if they were [symbol, health] pairs — none of
+      // those values have a `quoteAgeMs` property, so `age` was always 0 and
+      // this loop never detected a single stale symbol regardless of real
+      // feed state. The real per-symbol data is `snapshot.qualityMetrics`
+      // (SymbolHealth[], each with `symbol`/`ageMs`). `ageMs` is -1 when a
+      // symbol has never received a quote at all — that's the most-stale
+      // case, not "0ms old", so it must count as stale too.
       let stale = 0;
-      for (const [symbol, health] of Object.entries(snapshot)) {
-        const age = (health as { quoteAgeMs?: number }).quoteAgeMs ?? 0;
-        if (age > 5_000) { stale++; metrics.setL("igfx_market_stale_symbols", { symbol }, 1); }
-        else             { metrics.setL("igfx_market_stale_symbols", { symbol }, 0); }
+      for (const health of snapshot.qualityMetrics) {
+        const isStale = health.ageMs < 0 || health.ageMs > 5_000;
+        if (isStale) stale++;
+        metrics.setL("igfx_market_stale_symbols", { symbol: health.symbol }, isStale ? 1 : 0);
       }
       metrics.set("igfx_market_stale_symbols", stale);
       metrics.set("market_data_stale_symbols", stale);
