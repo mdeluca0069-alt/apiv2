@@ -16,6 +16,12 @@
  *   GBM fallback — pricing.engine.ts has been deleted.
  *   Synthetic spread generation — spread.engine.ts now tracks only real spreads.
  *
+ * Dev-only exception: _seedDemoQuotes() can inject synthetic quotes into
+ * quoteCache, but ONLY when both TWELVEDATA_API_KEY is absent AND
+ * ALLOW_SYNTHETIC_QUOTES=true is explicitly set (never a default). Without
+ * that opt-in, a missing key correctly leaves every symbol stale and orders
+ * rejected — it must never silently substitute fake prices for real ones.
+ *
  * Stale policy (STALE_THRESHOLD_MS without a real tick):
  *   - Symbol is marked stale.
  *   - quoteCache is NOT updated with generated prices.
@@ -159,14 +165,26 @@ export class InternalLiquidityCore {
       `[liquidity-core] started — ${this.instruments.size} instruments, interval=${this.tickMs}ms`
     );
 
-    // Demo / paper-trading mode: no live feed configured.
-    // Seed all instruments with synthetic quotes (DB warm-up prices preferred;
-    // fall back to BASE_PRICES + broker spread) so orders can be placed immediately.
-    // Refresh every 5 min to keep timestamps within STALE_THRESHOLD_MS.
-    if (!process.env.TWELVEDATA_API_KEY) {
+    // FASE 3 pre-work (2026-07-11): this used to seed synthetic quotes into
+    // the SAME global quoteCache real trading reads from, gated only by
+    // "TWELVEDATA_API_KEY happens to be unset" — with hasExternal:true and
+    // isStale:false, i.e. indistinguishable downstream from a real tick.
+    // TWELVEDATA_API_KEY has gone missing/rate-limited in this exact
+    // deployment repeatedly (not hypothetical), and paper-trading already
+    // has its own correct design — "Prices come from the exact same live
+    // market data feed as real trading" (paper.trading.service.ts) — so it
+    // never needed this either. A missing key must mean "no live data,
+    // orders rejected" (which is what the log line below already claimed),
+    // not a silent, unannounced switch to fabricated prices for every
+    // account, real-money included. Synthetic quotes now require BOTH the
+    // key to be absent AND an explicit opt-in — never a default, and never
+    // reachable when live trading is possible.
+    if (!process.env.TWELVEDATA_API_KEY && process.env.ALLOW_SYNTHETIC_QUOTES === "true") {
       this._seedDemoQuotes();
       setInterval(() => this._seedDemoQuotes(), 5 * 60_000);
-      console.log("[liquidity-core] demo mode: synthetic quotes active — no TWELVEDATA_API_KEY");
+      console.log("[liquidity-core] ALLOW_SYNTHETIC_QUOTES=true — synthetic quotes active (dev-only, never enable this against a live-trading deployment)");
+    } else if (!process.env.TWELVEDATA_API_KEY) {
+      console.log("[liquidity-core] no TWELVEDATA_API_KEY — instruments stay stale, orders will be rejected with NO_LIVE_MARKET_DATA (set ALLOW_SYNTHETIC_QUOTES=true to opt into synthetic dev quotes instead)");
     }
   }
 
@@ -468,9 +486,13 @@ export class InternalLiquidityCore {
     return this._buildQuoteFromState(symbol, state);
   }
 
-  // Injects fresh synthetic quotes for all instruments so paper trading works
-  // without a live data feed. Prefers prices already in quoteCache (e.g. from
-  // DB warm-up) over BASE_PRICES so users see realistic market levels.
+  // Dev-only fallback (see class docstring — requires explicit opt-in via
+  // ALLOW_SYNTHETIC_QUOTES=true, never a default). NOT what paper trading
+  // uses: paper-trading/paper.trading.service.ts reads the same real
+  // quoteCache as live trading, it never needed this. This exists purely
+  // so a local dev environment without a TwelveData key can still place
+  // orders. Prefers prices already in quoteCache (e.g. from DB warm-up)
+  // over BASE_PRICES so they look like realistic market levels.
   private _seedDemoQuotes(): void {
     const now = new Date().toISOString();
     for (const [key, state] of this.instruments) {
