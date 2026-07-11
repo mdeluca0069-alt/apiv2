@@ -6,6 +6,8 @@ import { marginController } from "../risk-service/margin.controller.js";
 import { exposureRegistry } from "../risk-service/exposure.limits.js";
 import { metrics }          from "../gateway/metrics.js";
 import { reconciliationEngine } from "../settlement/reconciliation.engine.js";
+import { quoteCache }       from "../market-data/quote.cache.js";
+import { checkRequote }     from "./requote.policy.js";
 import type { ExecutionRequest, ExecutionResult } from "../shared/contracts.js";
 import type { CancelToken }  from "./execution.queue.js";
 
@@ -93,6 +95,32 @@ export class ExecutionEngine {
     // ── 1. Transition RECEIVED → ACCEPTED ────────────────────────────────
     await orderLifecycle.transition(req.orderId, "ACCEPTED",
       "Pre-trade risk passed — routing to IGFX Internal LP", "RISK");
+
+    // ── FASE 3.3: requote check ──────────────────────────────────────────
+    // `quote` was captured once at order.controller.ts's placeOrder(), before
+    // this order sat in the per-user execution queue (up to ~15-27s under
+    // contention — execution.queue.ts's own timeout/max-wait). fillEngine.fill()
+    // below uses `quote` exactly as passed, with no re-fetch of its own — so
+    // without this check, a client could be filled against a price that's
+    // been stale for the entire time their order was queued, never told the
+    // market moved. Re-fetch the live quote right here, right before the
+    // fill price is computed, and reject (cheaply — no margin locked yet)
+    // if it drifted beyond the asset class's tolerance. Fails open (skips
+    // the check, keeps the original behavior) if quoteCache has no live
+    // quote at all right now — this is a new protective check, it should
+    // never itself become a new way to block an order.
+    const freshQuote = quoteCache.get(req.symbol);
+    if (freshQuote) {
+      const rq = checkRequote(req.symbol, req.side, quote, freshQuote);
+      if (rq.requoted) {
+        await orderLifecycle.rejectOrder(
+          req.orderId,
+          `REQUOTE: price moved ${rq.movePct.toFixed(3)}% while your order was queued (tolerance ${rq.threshold}%) — please resubmit`,
+        );
+        metrics.inc("requotes_total");
+        return { status: "REJECTED", orderId: req.orderId, reason: "REQUOTE" };
+      }
+    }
 
     // ── 2. Calculate fill ─────────────────────────────────────────────────
     // Price source: real TwelveData bid/ask only. Never GBM, never synthetic.
