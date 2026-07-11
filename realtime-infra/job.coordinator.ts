@@ -30,6 +30,7 @@
  *   │ outbox-retry-sweep              │ every 30s        │ 25s        │ WS re-push   │ ALL workers ran      │
  *   │ audit-outbox-consumer           │ every 10s        │ 8s         │ tx-per-event │ new (FASE 2.4)       │
  *   │ notification-outbox-consumer    │ every 15s        │ 12s        │ upsert       │ new (FASE 2.6)       │
+ *   │ symbol-circuit-breaker-recovery │ every 30s        │ 25s        │ ownership map│ new (FASE 3.2)       │
  *   │ outbox-cleanup                  │ every 15min      │ 13min      │ deleteMany   │ ALL workers ran OK   │
  *   │ signal-generator                │ every 60s        │ 50s        │ 4h cooldown  │ ALL workers ran      │
  *   │ reconciliation-sweep            │ every 5min       │ 4min       │ read-only    │ ✓ already locked     │

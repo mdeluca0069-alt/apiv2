@@ -117,6 +117,7 @@ import { pendingOrderExpiryService } from "./trading-service/pending.order.expir
 import { stopOutEngine }         from "./trading-service/stopout.engine.js";
 import { riskWarningGenerator }  from "./risk-service/risk.warning.generator.js";
 import { liquidationEngine }     from "./risk-service/liquidation.engine.js";
+import { symbolCircuitBreaker }  from "./risk-service/symbol.circuit.breaker.js";
 import { swapAccrualService }    from "./settlement/swap.accrual.service.js";
 import { positionPriceMonitor }  from "./trading-service/position.price.monitor.js";
 import { redisPubSub }           from "./realtime-infra/redis.pubsub.js";
@@ -202,6 +203,7 @@ jobCoordinator.register({ id: "outbox-cleanup",        ttlSeconds: 780,     inte
 jobCoordinator.register({ id: "audit-outbox-consumer", ttlSeconds: 8,       intervalMs: 10_000,             description: "FASE 2.4: turn order.filled/partial_filled/position.closed outbox rows into TradeAudit/AuditLog" });
 jobCoordinator.register({ id: "liquidation-watchdog", ttlSeconds: 25,       intervalMs: 30_000,             description: "FASE 2.5: periodic SL/TP recovery sweep — catches positions missed by the tick-level monitor" });
 jobCoordinator.register({ id: "notification-outbox-consumer", ttlSeconds: 12, intervalMs: 15_000,           description: "FASE 2.6: turn order.filled/position.closed outbox rows into reliable Notification rows + email" });
+jobCoordinator.register({ id: "symbol-circuit-breaker-recovery", ttlSeconds: 25, intervalMs: 30_000,         description: "FASE 3.2: auto re-enable symbols the circuit breaker halted, once their cooldown elapses" });
 jobCoordinator.register({ id: "signal-generator",      ttlSeconds: 50,      intervalMs: signalIntervalMs,   description: "OLOS technical signal evaluation"                      });
 jobCoordinator.register({ id: "economic-calendar",     ttlSeconds: 20_000,  intervalMs: 6 * 60 * 60_000,   description: "Refresh economic calendar from Finnhub (every 6h)"     });
 jobCoordinator.register({ id: "signal-expire",         ttlSeconds: 3_500,   intervalMs: 60 * 60_000,        description: "Expire unexecuted OLOS signals past 24h TTL"           });
@@ -1115,6 +1117,25 @@ setInterval(async () => {
     console.error("[liquidation-watchdog] sweep failed:", (err as Error).message);
   } finally {
     await jobCoordinator.release("liquidation-watchdog");
+  }
+}, 30_000);
+
+// FASE 3.2 — Symbol circuit breaker recovery: every 30 seconds.
+// Auto re-enables a symbol the breaker itself halted, once its cooldown
+// elapses (unless it re-tripped, which just extends the cooldown in-memory —
+// see symbol.circuit.breaker.ts). Never touches a symbol an admin disabled
+// directly through /admin/broker/spread.
+setInterval(async () => {
+  if (!(await jobCoordinator.tryLead("symbol-circuit-breaker-recovery"))) return;
+  try {
+    const r = await symbolCircuitBreaker.runRecoverySweep();
+    if (r.recovered.length > 0) {
+      console.log(`[symbol-circuit-breaker] resumed trading: ${r.recovered.join(", ")}`);
+    }
+  } catch (err) {
+    console.error("[symbol-circuit-breaker] recovery sweep failed:", (err as Error).message);
+  } finally {
+    await jobCoordinator.release("symbol-circuit-breaker-recovery");
   }
 }, 30_000);
 

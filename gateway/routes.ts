@@ -3961,6 +3961,40 @@ export const routes: Route[] = [
     },
   },
 
+  // ── FASE 3.2: Admin — per-symbol circuit breaker ─────────────────────────
+  {
+    method: "GET",
+    path: api("/admin/symbol-circuit-breaker"),
+    admin: true,
+    handler: async () => {
+      const { symbolCircuitBreaker } = await import("../risk-service/symbol.circuit.breaker.js");
+      return { halted: symbolCircuitBreaker.getHaltedSymbols() };
+    },
+  },
+  // Manually clear a halt before its cooldown elapses. Only works for
+  // symbols this engine itself halted — if the symbol was disabled by an
+  // admin through /admin/broker/spread instead, use that route to re-enable
+  // it (this one deliberately never touches a halt it didn't cause).
+  {
+    method: "POST",
+    path: api("/admin/symbol-circuit-breaker/:symbol/reset"),
+    admin: true,
+    handler: async ({ params, authHeader, state }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
+      const { symbol } = params;
+      if (!symbol) return { ok: false, reason: "MISSING_SYMBOL" };
+
+      const { symbolCircuitBreaker } = await import("../risk-service/symbol.circuit.breaker.js");
+      const key = symbol.toUpperCase();
+      if (!symbolCircuitBreaker.isHaltedByBreaker(key)) {
+        return { ok: false, reason: "NOT_HALTED_BY_BREAKER: this symbol isn't currently halted by the circuit breaker" };
+      }
+      await symbolCircuitBreaker.clear(key, principal.sub);
+      return { ok: true, symbol: key };
+    },
+  },
+
   // ── P0-5: Admin — Trading Suspension Management ──────────────────────────
   // Lists all users whose trading is suspended due to margin deficit.
   // Only admin/risk roles can view or unsuspend.

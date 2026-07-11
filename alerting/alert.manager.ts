@@ -18,6 +18,7 @@
  *   AUTOPILOT_FALLBACK_SPIKE  — autopilot correlation/regime fallback paths firing unusually often
  *   AUDIT_CONSUMER_FAILURE    — an OutboxEvent has failed TradeAudit/AuditLog processing repeatedly
  *   NOTIFICATION_CONSUMER_FAILURE — an OutboxEvent has failed Notification processing repeatedly
+ *   SYMBOL_CIRCUIT_BREAKER_TRIPPED — a symbol moved too fast in a short window and was auto-halted
  *
  * Deduplication: identical alerts are suppressed for DEDUP_WINDOW_MS (5 min).
  * All alerts are also written to AuditLog for compliance.
@@ -291,6 +292,16 @@ class AlertManager {
       title:    "Order Notification Delivery Failing Persistently",
       message:  `OutboxEvent ${eventId} (${eventType}) has failed notification processing ${retries} time(s) and will keep retrying.`,
       metadata: { eventId, eventType, retries, error },
+    });
+  }
+
+  symbolCircuitBreakerTripped(symbol: string, movePct: number, windowSec: number): Promise<void> {
+    return this.send({
+      type:     "SYMBOL_CIRCUIT_BREAKER_TRIPPED",
+      severity: "CRITICAL",
+      title:    "Per-Symbol Circuit Breaker Tripped",
+      message:  `${symbol} moved ${movePct.toFixed(3)}% in ${windowSec}s — new orders halted for this symbol pending cooldown.`,
+      metadata: { symbol, movePct: movePct.toFixed(3), windowSec },
     });
   }
 }

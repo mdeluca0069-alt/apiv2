@@ -37,6 +37,7 @@ import { quoteCache }           from "../market-data/quote.cache.js";
 import { eventBus }             from "../events-bus/event.bus.js";
 import { assetClassOf }         from "./liquidity.provider.js";
 import { dynamicSpreadEngine }  from "./dynamic.spread.engine.js";
+import { symbolCircuitBreaker } from "../risk-service/symbol.circuit.breaker.js";
 import type { Quote }           from "../shared/contracts.js";
 
 // How long without a real external tick before a symbol is marked stale.
@@ -271,6 +272,14 @@ export class InternalLiquidityCore {
     const ac   = state.assetClass;
     const prec = precisionFor(key, ac);
     const now  = Date.now();
+
+    // FASE 3.2: per-symbol circuit breaker — halts new order acceptance for
+    // THIS symbol if the price moved abnormally fast within a short window.
+    // Independent of dynamic spread widening below (that reacts to the
+    // DAILY change from open, this reacts to short-window velocity) and of
+    // staleness detection (that's the opposite condition — no ticks, not
+    // too-fast ticks). Never blocks the tick itself from being processed.
+    symbolCircuitBreaker.recordTick(key, externalMid, ac);
 
     let bid: number;
     let ask: number;

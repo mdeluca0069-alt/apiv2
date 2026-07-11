@@ -364,6 +364,20 @@ export class BrokerSpreadConfig {
 
     return entry;
   }
+
+  /**
+   * FASE 3.2: toggle only the enabled flag, preserving the current spread —
+   * for automated callers (the per-symbol circuit breaker) that have no
+   * business deciding a spread value when they trip or clear a halt.
+   * Same storage as update(), just without forcing the caller to also pass
+   * a spread number.
+   */
+  async setEnabled(symbol: string, enabled: boolean, actor: string): Promise<SpreadEntry> {
+    const key     = symbol.toUpperCase();
+    const current = this.cache.get(key);
+    const spread  = current?.spread ?? BROKER_SPREAD_DEFAULTS[key] ?? 0;
+    return this.update(key, spread, enabled, actor);
+  }
 }
 
 export const brokerSpreadConfig = new BrokerSpreadConfig();
