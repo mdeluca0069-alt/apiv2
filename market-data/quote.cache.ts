@@ -1,6 +1,5 @@
 import { prisma }           from "../shared/db.js";
 import { eventBus }         from "../events-bus/event.bus.js";
-import { liquidationEngine } from "../risk-service/liquidation.engine.js";
 import type { Quote }        from "../shared/contracts.js";
 import { STALE_THRESHOLD_MS } from "../liquidity-engine/internal.liquidity.core.js";
 
@@ -11,8 +10,14 @@ import { STALE_THRESHOLD_MS } from "../liquidity-engine/internal.liquidity.core.
  * On every update it:
  *  1. Stores the quote in memory (O(1) lookup for OrderController)
  *  2. Persists to BrokerSetting for durability across restarts
- *  3. Runs mark-to-market + liquidation check via LiquidationEngine
- *  4. Broadcasts a market.quote event to frontend subscribers
+ *  3. Broadcasts a market.quote event to frontend subscribers — real-time
+ *     mark-to-market/SL-TP/stop-out all react to that event
+ *     (trading-service/position.price.monitor.ts), not to this module
+ *     directly. FASE 2.5: this used to also call liquidationEngine on every
+ *     tick, redundantly re-doing the same DB-backed SL/TP/stop-out check
+ *     position.price.monitor.ts already does in-memory — removed;
+ *     LiquidationEngine is now a periodic watchdog (risk-service/
+ *     liquidation.engine.ts), not a second per-tick execution engine.
  */
 
 const _quotes = new Map<string, Quote>();
@@ -24,15 +29,6 @@ export const quoteCache = {
 
     // Fire-and-forget — do not block the quote ingestion path
     void _persist(sym, quote);
-    void liquidationEngine.onQuoteUpdate(sym, {
-      bid:       quote.bid,
-      ask:       quote.ask,
-      mid:       quote.mid,
-      symbol:    sym,
-      spread:    quote.spread,
-      changePct: quote.changePct,
-      ts:        quote.ts,
-    });
 
     eventBus.emit("market.quote", {
       symbol:    sym,

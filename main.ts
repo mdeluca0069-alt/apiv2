@@ -115,6 +115,7 @@ import { orderTriggerWatcher }      from "./trading-service/order.trigger.watche
 import { pendingOrderExpiryService } from "./trading-service/pending.order.expiry.js";
 import { stopOutEngine }         from "./trading-service/stopout.engine.js";
 import { riskWarningGenerator }  from "./risk-service/risk.warning.generator.js";
+import { liquidationEngine }     from "./risk-service/liquidation.engine.js";
 import { swapAccrualService }    from "./settlement/swap.accrual.service.js";
 import { positionPriceMonitor }  from "./trading-service/position.price.monitor.js";
 import { redisPubSub }           from "./realtime-infra/redis.pubsub.js";
@@ -198,6 +199,7 @@ jobCoordinator.register({ id: "pending-order-expiry",  ttlSeconds: 25,      inte
 jobCoordinator.register({ id: "outbox-retry-sweep",    ttlSeconds: 25,      intervalMs: 30_000,             description: "Replay undelivered WebSocket outbox events"            });
 jobCoordinator.register({ id: "outbox-cleanup",        ttlSeconds: 780,     intervalMs: 15 * 60_000,        description: "Prune published OutboxEvent rows older than 2h"        });
 jobCoordinator.register({ id: "audit-outbox-consumer", ttlSeconds: 8,       intervalMs: 10_000,             description: "FASE 2.4: turn order.filled/partial_filled/position.closed outbox rows into TradeAudit/AuditLog" });
+jobCoordinator.register({ id: "liquidation-watchdog", ttlSeconds: 25,       intervalMs: 30_000,             description: "FASE 2.5: periodic SL/TP recovery sweep — catches positions missed by the tick-level monitor" });
 jobCoordinator.register({ id: "signal-generator",      ttlSeconds: 50,      intervalMs: signalIntervalMs,   description: "OLOS technical signal evaluation"                      });
 jobCoordinator.register({ id: "economic-calendar",     ttlSeconds: 20_000,  intervalMs: 6 * 60 * 60_000,   description: "Refresh economic calendar from Finnhub (every 6h)"     });
 jobCoordinator.register({ id: "signal-expire",         ttlSeconds: 3_500,   intervalMs: 60 * 60_000,        description: "Expire unexecuted OLOS signals past 24h TTL"           });
@@ -1060,6 +1062,27 @@ setInterval(() => {
         console.warn(`[stop-out] stopOuts=${r.stopOuts} marginCalls=${r.marginCalls} warnings=${r.warnings} scanned=${r.scannedUsers}`);
       }
     }).catch((err) => console.error("[stop-out] scan failed:", (err as Error).message));
+  }
+}, 30_000);
+
+// FASE 2.5 — Liquidation watchdog: every 30 seconds.
+// Periodic SL/TP recovery sweep — catches positions the tick-level monitor
+// (position.price.monitor.ts) missed (capacity cap, restart gap, or a
+// position whose ticks land on a different PM2 worker's cache). Not a
+// second real-time engine: a stop-loss still reacts to the tick first,
+// this only mops up what that path missed.
+setInterval(async () => {
+  if (!prisma) return;
+  if (!(await jobCoordinator.tryLead("liquidation-watchdog"))) return;
+  try {
+    const r = await liquidationEngine.scanForMissedSlTp();
+    if (r.closed > 0) {
+      console.warn(`[liquidation-watchdog] recovered ${r.closed} missed SL/TP (scanned=${r.scanned} skippedStale=${r.skippedStale})`);
+    }
+  } catch (err) {
+    console.error("[liquidation-watchdog] sweep failed:", (err as Error).message);
+  } finally {
+    await jobCoordinator.release("liquidation-watchdog");
   }
 }, 30_000);
 

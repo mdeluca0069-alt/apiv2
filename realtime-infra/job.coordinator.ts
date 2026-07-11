@@ -25,6 +25,7 @@
  *   │ Job ID                          │ Schedule         │ TTL        │ Idempotency  │ Prior state          │
  *   ├─────────────────────────────────┼──────────────────┼────────────┼──────────────┼──────────────────────┤
  *   │ stop-out-scan                   │ every 30s        │ 25s        │ DB tx lock   │ ALL workers ran      │
+ *   │ liquidation-watchdog            │ every 30s        │ 25s        │ close-error  │ new (FASE 2.5)       │
  *   │ pending-order-expiry            │ every 30s        │ 25s        │ markTriggered│ ALL workers ran      │
  *   │ outbox-retry-sweep              │ every 30s        │ 25s        │ WS re-push   │ ALL workers ran      │
  *   │ audit-outbox-consumer           │ every 10s        │ 8s         │ tx-per-event │ new (FASE 2.4)       │
