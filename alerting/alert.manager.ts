@@ -17,6 +17,7 @@
  *   AUTOPILOT_CIRCUIT_BREAKER — autopilot auto-disabled platform-wide (daily drawdown breach)
  *   AUTOPILOT_FALLBACK_SPIKE  — autopilot correlation/regime fallback paths firing unusually often
  *   AUDIT_CONSUMER_FAILURE    — an OutboxEvent has failed TradeAudit/AuditLog processing repeatedly
+ *   NOTIFICATION_CONSUMER_FAILURE — an OutboxEvent has failed Notification processing repeatedly
  *
  * Deduplication: identical alerts are suppressed for DEDUP_WINDOW_MS (5 min).
  * All alerts are also written to AuditLog for compliance.
@@ -279,6 +280,16 @@ class AlertManager {
       severity: "CRITICAL",
       title:    "Trade Audit Delivery Failing Persistently",
       message:  `OutboxEvent ${eventId} (${eventType}) has failed audit processing ${retries} time(s) and will keep retrying.`,
+      metadata: { eventId, eventType, retries, error },
+    });
+  }
+
+  notificationConsumerFailure(eventId: string, eventType: string, retries: number, error: string): Promise<void> {
+    return this.send({
+      type:     "NOTIFICATION_CONSUMER_FAILURE",
+      severity: "WARNING", // UX/compliance-adjacent, not financial — lower than AUDIT_CONSUMER_FAILURE
+      title:    "Order Notification Delivery Failing Persistently",
+      message:  `OutboxEvent ${eventId} (${eventType}) has failed notification processing ${retries} time(s) and will keep retrying.`,
       metadata: { eventId, eventType, retries, error },
     });
   }

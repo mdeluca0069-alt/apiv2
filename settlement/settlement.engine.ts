@@ -285,11 +285,15 @@ export class SettlementEngine {
       // equivalent execution.engine.ts change: cheap to capture once here,
       // while everything is already in scope and hasn't moved yet, instead
       // of a consumer re-fetch that risks a torn read against later writes.
+      // FASE 2.6: also drives notification.outbox.consumer.ts — the pnl
+      // field above is already everything the "Position closed" IN_APP
+      // notification needs.
       const outbox = await tx.outboxEvent.create({
         data: {
           eventType: "position.closed",
           userId:    input.userId,
           auditProcessed: false,
+          notificationProcessed: false,
           payload: {
             positionId:  input.positionId,
             userId:      input.userId,

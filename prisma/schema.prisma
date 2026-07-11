@@ -291,10 +291,18 @@ model Notification {
   failureReason String?
   retries       Int       @default(0)
   createdAt     DateTime  @default(now())
+  // FASE 2.6: idempotency key for notification.outbox.consumer.ts, same
+  // reasoning as TradeAudit.sourceOutboxId — a retry after a lost commit
+  // ack must land on the same row instead of duplicating it in the user's
+  // notification inbox. Composite with `channel` (not a plain unique on
+  // sourceOutboxId alone): a single order.filled event creates two rows,
+  // one IN_APP and one EMAIL, from the same OutboxEvent id.
+  sourceOutboxId String?
 
   @@index([category, createdAt])
   @@index([channel, sent, createdAt])
   @@index([userId, sent])
+  @@unique([sourceOutboxId, channel])
 }
 
 model NotificationPreference {
@@ -417,10 +425,22 @@ model OutboxEvent {
   // non-interfering completion flags on the same durable row.
   auditProcessed Boolean @default(true)
   auditRetries   Int     @default(0)
+  // FASE 2.6: same pattern as auditProcessed, for the notification consumer
+  // (notification-service/notification.outbox.consumer.ts). Only
+  // order.filled and position.closed — the two order-lifecycle notification
+  // triggers that already have this transactionally-written row — set it
+  // false. Every other event type (margin/risk warnings, wallet events,
+  // KYC, support, autopilot, signals, account) is unrelated to the order
+  // lifecycle this OutboxEvent row exists for, so it defaults to true and
+  // keeps going through notification.router.ts's existing fire-and-forget
+  // path unchanged — out of scope for this phase.
+  notificationProcessed Boolean @default(true)
+  notificationRetries   Int     @default(0)
 
   @@index([published, createdAt])
   @@index([userId, published])
   @@index([auditProcessed, createdAt])
+  @@index([notificationProcessed, createdAt])
 }
 
 model Position {

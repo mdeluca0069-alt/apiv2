@@ -110,6 +110,7 @@ import { notificationRouter }   from "./notification-service/notification.router
 import { dailySnapshotService }  from "./settlement/daily.snapshot.service.js";
 import { reconciliationEngine }  from "./settlement/reconciliation.engine.js";
 import { auditOutboxConsumer }   from "./compliance/audit.outbox.consumer.js";
+import { notificationOutboxConsumer } from "./notification-service/notification.outbox.consumer.js";
 import { pendingOrderBook }         from "./trading-service/pending.order.book.js";
 import { orderTriggerWatcher }      from "./trading-service/order.trigger.watcher.js";
 import { pendingOrderExpiryService } from "./trading-service/pending.order.expiry.js";
@@ -200,6 +201,7 @@ jobCoordinator.register({ id: "outbox-retry-sweep",    ttlSeconds: 25,      inte
 jobCoordinator.register({ id: "outbox-cleanup",        ttlSeconds: 780,     intervalMs: 15 * 60_000,        description: "Prune published OutboxEvent rows older than 2h"        });
 jobCoordinator.register({ id: "audit-outbox-consumer", ttlSeconds: 8,       intervalMs: 10_000,             description: "FASE 2.4: turn order.filled/partial_filled/position.closed outbox rows into TradeAudit/AuditLog" });
 jobCoordinator.register({ id: "liquidation-watchdog", ttlSeconds: 25,       intervalMs: 30_000,             description: "FASE 2.5: periodic SL/TP recovery sweep — catches positions missed by the tick-level monitor" });
+jobCoordinator.register({ id: "notification-outbox-consumer", ttlSeconds: 12, intervalMs: 15_000,           description: "FASE 2.6: turn order.filled/position.closed outbox rows into reliable Notification rows + email" });
 jobCoordinator.register({ id: "signal-generator",      ttlSeconds: 50,      intervalMs: signalIntervalMs,   description: "OLOS technical signal evaluation"                      });
 jobCoordinator.register({ id: "economic-calendar",     ttlSeconds: 20_000,  intervalMs: 6 * 60 * 60_000,   description: "Refresh economic calendar from Finnhub (every 6h)"     });
 jobCoordinator.register({ id: "signal-expire",         ttlSeconds: 3_500,   intervalMs: 60 * 60_000,        description: "Expire unexecuted OLOS signals past 24h TTL"           });
@@ -997,21 +999,39 @@ setInterval(async () => {
   }
 }, 10_000);
 
-// Outbox cleanup — delete published+audited events older than 2 hours.
+// FASE 2.6 — Notification outbox consumer: turn order.filled/position.closed
+// OutboxEvent rows into reliable Notification rows (+ best-effort email).
+// Runs every 15s — less urgent than audit (UX, not compliance), still close
+// enough to real time that the client's in-app inbox and email land promptly.
+// Leader-elected: one worker per cycle processes the batch; others skip.
+setInterval(async () => {
+  if (!prisma) return;
+  if (!(await jobCoordinator.tryLead("notification-outbox-consumer"))) return;
+  try {
+    const r = await notificationOutboxConsumer.processPending();
+    if (r.failed > 0) console.warn(`[notification-consumer] processed=${r.processed} failed=${r.failed} skipped=${r.skipped}`);
+  } catch (err) {
+    console.error("[notification-consumer] run failed:", (err as Error).message);
+  } finally {
+    await jobCoordinator.release("notification-outbox-consumer");
+  }
+}, 15_000);
+
+// Outbox cleanup — delete published+audited+notified events older than 2h.
 // Keeps the OutboxEvent table small (< 10k rows) to prevent INSERT latency
 // growth as the index pages expand. Runs every 15 minutes.
 // Leader-elected: prevents N workers each issuing the same DELETE at once.
-// auditProcessed defaults to true for event types the audit consumer never
-// touches, so this stays a no-op filter change for everything except the
-// three trade-lifecycle types — those must survive until the audit consumer
-// (above) has actually turned them into TradeAudit/AuditLog.
+// auditProcessed/notificationProcessed default to true for event types
+// those consumers never touch, so this stays a no-op filter change for
+// everything except the trade-lifecycle types — those must survive until
+// both consumers (above) have actually processed them.
 setInterval(async () => {
   if (!prisma) return;
   if (!(await jobCoordinator.tryLead("outbox-cleanup"))) return;
   try {
     const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1_000);
     const r = await (prisma as NonNullable<typeof prisma>).outboxEvent.deleteMany({
-      where: { published: true, auditProcessed: true, createdAt: { lt: cutoff } },
+      where: { published: true, auditProcessed: true, notificationProcessed: true, createdAt: { lt: cutoff } },
     });
     if (r.count > 0) console.log(`[outbox] pruned ${r.count} published events`);
   } catch {

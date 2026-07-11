@@ -236,11 +236,18 @@ export class ExecutionEngine {
         // once, cheaply, while already in scope, rather than making the
         // consumer re-fetch Order/Position (and risk it reading state that
         // has since changed, e.g. a stopLoss the client edited afterward).
+        //
+        // FASE 2.6: notificationProcessed is only false for a full fill —
+        // notification.router.ts never notified on partial fills either
+        // (no listener existed for order.partial_filled), so the consumer
+        // shouldn't start doing that now; that would be a new feature, not
+        // a reliability fix.
         const outbox = await tx.outboxEvent.create({
           data: {
             eventType: isNowFullyFilled ? "order.filled" : "order.partial_filled",
             userId:    req.userId,
             auditProcessed: false,
+            notificationProcessed: !isNowFullyFilled,
             payload: {
               orderId: req.orderId, positionId, userId: req.userId, symbol: req.symbol,
               side: req.side, fillPrice: execPrice, marginUsed: effectiveMargin,

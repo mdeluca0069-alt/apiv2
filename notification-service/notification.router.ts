@@ -209,14 +209,15 @@ export class NotificationRouter {
 
   /** Wire all EventBus subscriptions. Call once at startup. */
   subscribe(): void {
-    // Order fills
-    eventBus.on("order.filled", (e) => {
-      void this.sendAll(e.userId, "fill", "HIGH",
-        `Order filled — ${e.symbol}`,
-        `${e.side} ${e.quantity} ${e.symbol} @ ${Number(e.averageFillPrice).toFixed(5)}`,
-        e as unknown as Record<string, unknown>,
-      );
-    });
+    // Order fills, position closes: FASE 2.6 — moved to
+    // notification-service/notification.outbox.consumer.ts. Both events
+    // already write a transactional OutboxEvent row (FASE 2.1); the
+    // fire-and-forget `void this.sendAll(...)`/`void this.send(...)` this
+    // used to do here had no retry and no durable record that a
+    // notification should have existed if the process crashed mid-send.
+    // Every other listener below is unrelated to the order lifecycle this
+    // OutboxEvent row exists for and stays fire-and-forget — out of scope
+    // for this phase (see SYSTEM_ARCHITECTURE_FREEZE.md, FASE 2.6).
 
     // Order rejections
     eventBus.on("order.rejected", (e) => {
@@ -242,18 +243,6 @@ export class NotificationRouter {
         userId:   e.userId, channel: "IN_APP", category: "risk", priority: "HIGH",
         title:    "Risk alert",
         body:     String((e as Record<string, unknown>).message ?? "Risk threshold breached"),
-        payload:  e as unknown as Record<string, unknown>,
-      });
-    });
-
-    // Position closed
-    eventBus.on("position.closed", (e) => {
-      const pnl = Number((e as Record<string, unknown>).pnl ?? 0);
-      void this.send({
-        userId:   e.userId, channel: "IN_APP", category: "fill",
-        priority: "NORMAL",
-        title:    `Position closed — ${e.symbol}`,
-        body:     `Realized P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USD`,
         payload:  e as unknown as Record<string, unknown>,
       });
     });
