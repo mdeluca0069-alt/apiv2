@@ -104,6 +104,11 @@ export const NewOrderRequestSchema = z.object({
   expiresAt: z.string().datetime().optional(),
 });
 
+export const PlaceOcoRequestSchema = z.object({
+  legA: NewOrderRequestSchema,
+  legB: NewOrderRequestSchema,
+});
+
 export const OrderAckSchema = z.object({
   id: z.string(),
   clientOrderId: z.string().optional(),

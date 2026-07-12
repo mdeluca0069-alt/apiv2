@@ -79,6 +79,7 @@ function makeOrder(
     notional:         number;
     armedByStopLimit?: boolean;
     expiresAt?:       Date;
+    ocoGroupId?:      string;
   }> = {},
 ) {
   return {
@@ -504,6 +505,105 @@ describe("updateTrailingStops()", () => {
 
     // Clean up
     pendingOrderBook.markTriggered(order.id);
+  });
+});
+
+// ─── 8. OCO (One-Cancels-Other) cascade — FASE 3.6 ───────────────────────────
+// Two orders sharing an ocoGroupId: whichever resolves first (client cancel
+// OR trigger) cancels the other. Orders with no ocoGroupId (the overwhelming
+// majority — existing coverage above) must be completely unaffected.
+
+describe("OCO cascade", () => {
+
+  it("cancel(): cancelling one leg also cancels its sibling", async () => {
+    const groupId = "oco-group-1";
+    const legA = await pendingOrderBook.add(makeOrder({ userId: "user-1", symbol: "EURUSD", ocoGroupId: groupId }));
+    const legB = await pendingOrderBook.add(makeOrder({ userId: "user-1", symbol: "EURUSD", ocoGroupId: groupId }));
+
+    const result = await pendingOrderBook.cancel(legA.id, "user-1");
+
+    expect(result).toBe(true);
+    expect(pendingOrderBook.getAll().some((o) => o.id === legA.id)).toBe(false);
+    expect(pendingOrderBook.getAll().some((o) => o.id === legB.id)).toBe(false);
+  });
+
+  it("cancel(): sibling cancellation is emitted with reason OCO_SIBLING_CANCELLED", async () => {
+    const groupId = "oco-group-2";
+    const legA = await pendingOrderBook.add(makeOrder({ userId: "user-1", ocoGroupId: groupId }));
+    const legB = await pendingOrderBook.add(makeOrder({ userId: "user-1", ocoGroupId: groupId }));
+    vi.clearAllMocks();
+
+    await pendingOrderBook.cancel(legA.id, "user-1");
+
+    expect(emitSpy).toHaveBeenCalledWith(
+      "order.cancelled",
+      expect.objectContaining({ pendingId: legA.id, reason: "CLIENT_CANCEL" }),
+    );
+    expect(emitSpy).toHaveBeenCalledWith(
+      "order.cancelled",
+      expect.objectContaining({ pendingId: legB.id, reason: "OCO_SIBLING_CANCELLED" }),
+    );
+  });
+
+  it("cancel(): an order with no ocoGroupId cancels alone (no sibling side-effects)", async () => {
+    const solo  = await pendingOrderBook.add(makeOrder({ userId: "user-1", symbol: "EURUSD" }));
+    const other = await pendingOrderBook.add(makeOrder({ userId: "user-1", symbol: "GBPUSD" }));
+
+    await pendingOrderBook.cancel(solo.id, "user-1");
+
+    expect(pendingOrderBook.getAll().some((o) => o.id === other.id)).toBe(true);
+  });
+
+  it("cancelOcoSiblingsOnTrigger(): cancels the sibling with reason OCO_SIBLING_TRIGGERED", async () => {
+    const groupId = "oco-group-3";
+    const legA = await pendingOrderBook.add(makeOrder({ userId: "user-1", ocoGroupId: groupId }));
+    const legB = await pendingOrderBook.add(makeOrder({ userId: "user-1", ocoGroupId: groupId }));
+    vi.clearAllMocks();
+
+    // legA "triggers" — caller (order.trigger.watcher.ts) removes it via
+    // markTriggered() first, then asks the book to cancel legA's sibling(s).
+    pendingOrderBook.markTriggered(legA.id);
+    await pendingOrderBook.cancelOcoSiblingsOnTrigger(legA.id, groupId);
+
+    expect(pendingOrderBook.getAll().some((o) => o.id === legB.id)).toBe(false);
+    expect(emitSpy).toHaveBeenCalledWith(
+      "order.cancelled",
+      expect.objectContaining({ pendingId: legB.id, reason: "OCO_SIBLING_TRIGGERED" }),
+    );
+  });
+
+  it("cancelOcoSiblingsOnTrigger(): no-op when ocoGroupId is undefined", async () => {
+    const solo = await pendingOrderBook.add(makeOrder({ userId: "user-1" }));
+    vi.clearAllMocks();
+
+    await expect(pendingOrderBook.cancelOcoSiblingsOnTrigger(solo.id, undefined)).resolves.toBeUndefined();
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it("cancelOcoSiblingsOnTrigger(): no-op when the sibling already resolved (idempotent)", async () => {
+    const groupId = "oco-group-4";
+    const legA = await pendingOrderBook.add(makeOrder({ userId: "user-1", ocoGroupId: groupId }));
+    const legB = await pendingOrderBook.add(makeOrder({ userId: "user-1", ocoGroupId: groupId }));
+
+    // legB already cancelled independently (e.g. client cancelled it directly
+    // a moment before legA's trigger tick was processed).
+    await pendingOrderBook.cancel(legB.id, "user-1");
+    vi.clearAllMocks();
+
+    pendingOrderBook.markTriggered(legA.id);
+    await expect(pendingOrderBook.cancelOcoSiblingsOnTrigger(legA.id, groupId)).resolves.toBeUndefined();
+
+    // No spurious second cancellation emitted for legB.
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it("cancel(): does not cancel orders from a DIFFERENT ocoGroupId", async () => {
+    const legA = await pendingOrderBook.add(makeOrder({ userId: "user-1", ocoGroupId: "group-X" }));
+    const unrelated = await pendingOrderBook.add(makeOrder({ userId: "user-1", ocoGroupId: "group-Y" }));
+
+    await pendingOrderBook.cancel(legA.id, "user-1");
+
+    expect(pendingOrderBook.getAll().some((o) => o.id === unrelated.id)).toBe(true);
   });
 });
 

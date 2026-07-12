@@ -29,6 +29,11 @@ export type PendingOrder = {
   status:        "PENDING" | "TRIGGERED" | "CANCELLED" | "EXPIRED";
   expiresAt?:    Date;
   createdAt:     Date;
+  // FASE 3.6: OCO (One-Cancels-Other) — shared by exactly two sibling orders.
+  // Whichever leg resolves first (triggers OR is manually cancelled) cancels
+  // the other. Not a PendingOrderType of its own: an OCO leg is still a
+  // normal LIMIT/STOP/STOP_LIMIT/TRAILING_STOP order, just linked to a peer.
+  ocoGroupId?:   string;
 };
 
 /**
@@ -135,20 +140,54 @@ class PendingOrderBook {
     const order = this.orders.get(pendingId);
     if (!order || order.userId !== userId || order.status !== "PENDING") return false;
 
+    await this._cancelOne(order, "CLIENT_CANCEL");
+
+    // FASE 3.6: cancelling one OCO leg cancels its sibling too — an OCO pair
+    // resolves together, whichever leg the client acts on first.
+    if (order.ocoGroupId) {
+      await this._cancelGroupSiblings(order.ocoGroupId, order.id, "OCO_SIBLING_CANCELLED");
+    }
+
+    return true;
+  }
+
+  /**
+   * FASE 3.6: called by order.trigger.watcher.ts right after a leg triggers
+   * (fills OR arms, for STOP_LIMIT) — cancels any sibling(s) sharing the same
+   * ocoGroupId. Cancellation happens at trigger-detection time, not at
+   * confirmed fill: once the market has genuinely crossed one leg's level,
+   * that leg is committed, and the OCO contract is that the other leg is
+   * invalidated regardless of whether the triggered leg's execution later
+   * succeeds. No-op if the order has no group (the overwhelmingly common
+   * case — most pending orders are not part of an OCO pair).
+   */
+  async cancelOcoSiblingsOnTrigger(pendingId: string, ocoGroupId: string | undefined): Promise<void> {
+    if (!ocoGroupId) return;
+    await this._cancelGroupSiblings(ocoGroupId, pendingId, "OCO_SIBLING_TRIGGERED");
+  }
+
+  private async _cancelGroupSiblings(ocoGroupId: string, excludeId: string, reason: string): Promise<void> {
+    const siblings = [...this.orders.values()].filter(
+      (o) => o.ocoGroupId === ocoGroupId && o.id !== excludeId && o.status === "PENDING",
+    );
+    for (const sibling of siblings) {
+      await this._cancelOne(sibling, reason);
+    }
+  }
+
+  private async _cancelOne(order: PendingOrder, reason: string): Promise<void> {
     order.status = "CANCELLED";
-    this.orders.delete(pendingId);
-    await this._cancelPersisted(pendingId, "CANCELLED");
+    this.orders.delete(order.id);
+    await this._cancelPersisted(order.id, "CANCELLED");
 
     eventBus.emit("order.cancelled", {
       orderId:   order.orderId,
       pendingId: order.id,
       userId:    order.userId,
       symbol:    order.symbol,
-      reason:    "CLIENT_CANCEL",
+      reason,
       timestamp: new Date().toISOString(),
     });
-
-    return true;
   }
 
   markTriggered(pendingId: string): PendingOrder | null {

@@ -15,6 +15,7 @@ import {
   ClientWithdrawRequestSchema,
   LoginRequestSchema,
   NewOrderRequestSchema,
+  PlaceOcoRequestSchema,
   RegisterRequestSchema,
 } from "../shared/contracts.js";
 import type { Route } from "../shared/http.js";
@@ -563,6 +564,39 @@ export const routes: Route[] = [
       }
 
       return state.placeOrder(parsed, principal);
+    },
+  },
+  // FASE 3.6: true OCO (One-Cancels-Other) — two independently pending
+  // resting orders, whichever triggers/cancels first cancels the other.
+  // No in-memory fallback: pendingOrderBook already works without DATABASE_URL
+  // (persistence is a no-op, the in-memory Map still functions), unlike the
+  // legacy `state.placeOrder` path above which never supported resting orders.
+  {
+    method: "POST",
+    path: api("/trading/order/oco"),
+    auth: true,
+    handler: async ({ body, state, authHeader }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "unauthenticated" };
+      const parsed = PlaceOcoRequestSchema.parse(body);
+      return orderController.placeOcoPair(parsed.legA, parsed.legB, {
+        userId:   principal.sub,
+        tenantId: principal.tenantId,
+      });
+    },
+  },
+  {
+    method: "POST",
+    path: "/trading/order/oco",
+    auth: true,
+    handler: async ({ body, state, authHeader }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "unauthenticated" };
+      const parsed = PlaceOcoRequestSchema.parse(body);
+      return orderController.placeOcoPair(parsed.legA, parsed.legB, {
+        userId:   principal.sub,
+        tenantId: principal.tenantId,
+      });
     },
   },
   // ── Position close ───────────────────────────────────────────────────────────

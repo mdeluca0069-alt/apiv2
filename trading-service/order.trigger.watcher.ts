@@ -58,6 +58,11 @@ class OrderTriggerWatcher {
       const pending = pendingOrderBook.markTriggered(order.id);
       if (!pending) continue;
 
+      // FASE 3.6: OCO — this leg just triggered, so cancel its sibling now
+      // (not after confirmed fill: a genuine trigger commits this leg,
+      // regardless of whether the downstream fill/arm later succeeds).
+      await pendingOrderBook.cancelOcoSiblingsOnTrigger(pending.id, pending.ocoGroupId);
+
       // For STOP_LIMIT: place a new LIMIT order at limitPrice after trigger
       if (pending.type === "STOP_LIMIT" && pending.limitPrice !== undefined) {
         await this._dispatchLimitAfterTrigger(pending);

@@ -1,3 +1,4 @@
+import { randomUUID }           from "node:crypto";
 import { riskEngine }           from "../risk-service/risk.engine.js";
 import { executionEngine }      from "../execution-service/execution.engine.js";
 import { executionQueue }       from "../execution-service/execution.queue.js";
@@ -25,7 +26,7 @@ export class OrderController {
    *   MARKET → immediate execution pipeline
    *   LIMIT / STOP / STOP_LIMIT / TRAILING_STOP → resting order book
    */
-  async placeOrder(req: NewOrderRequest, ctx: PlaceOrderContext): Promise<OrderAck> {
+  async placeOrder(req: NewOrderRequest, ctx: PlaceOrderContext, ocoGroupId?: string): Promise<OrderAck> {
     const symbol = req.symbol.toUpperCase();
     const type   = (req.type ?? "MARKET").toUpperCase();
 
@@ -183,7 +184,7 @@ export class OrderController {
 
     // ── 4. Resting order types → park in order book ─────────────────────────
     try {
-      return await this._parkPendingOrder(req, ctx.userId, quote, riskResult, type);
+      return await this._parkPendingOrder(req, ctx.userId, quote, riskResult, type, ocoGroupId);
     } catch (err) {
       // P0-1: Surface duplicate resting-order errors as 409
       if (err instanceof DuplicateOrderError) {
@@ -194,6 +195,79 @@ export class OrderController {
       }
       throw err;
     }
+  }
+
+  /**
+   * FASE 3.6 — place a true OCO (One-Cancels-Other) pair: two independently
+   * pending orders sharing a generated ocoGroupId, where whichever leg
+   * resolves first (triggers OR is manually cancelled) cancels the other.
+   * The actual cancel-on-trigger/cancel-on-cancel wiring lives in
+   * pending.order.book.ts / order.trigger.watcher.ts — this method only
+   * places both legs (reusing placeOrder()'s existing quote/risk/dedup
+   * pipeline unchanged for each) and rolls leg A back if leg B fails, so a
+   * caller never ends up with an orphaned unpaired "OCO" leg.
+   *
+   * Both legs must be resting order types — MARKET/IOC/FOK execute
+   * immediately and can never be one side of a still-pending pair.
+   */
+  async placeOcoPair(
+    legA: NewOrderRequest,
+    legB: NewOrderRequest,
+    ctx:  PlaceOrderContext,
+  ): Promise<
+    | { ok: true;  ocoGroupId: string; legA: OrderAck; legB: OrderAck }
+    | { ok: false; reason: string; legA?: OrderAck; legB?: OrderAck }
+  > {
+    const RESTING_TYPES = new Set(["LIMIT", "STOP", "STOP_LIMIT", "TRAILING_STOP"]);
+    const typeA = (legA.type ?? "LIMIT").toUpperCase();
+    const typeB = (legB.type ?? "LIMIT").toUpperCase();
+    if (!RESTING_TYPES.has(typeA) || !RESTING_TYPES.has(typeB)) {
+      return {
+        ok:     false,
+        reason: "OCO_INVALID_TYPE: both legs must be resting order types " +
+                "(LIMIT/STOP/STOP_LIMIT/TRAILING_STOP) — MARKET/IOC/FOK execute immediately",
+      };
+    }
+
+    const ocoGroupId = randomUUID();
+
+    const ackA = await this.placeOrder(legA, ctx, ocoGroupId);
+    if (ackA.status !== "ACCEPTED") {
+      return {
+        ok:     false,
+        reason: `OCO_LEG_A_REJECTED: ${ackA.rejectionReason ?? "leg A could not be placed"}`,
+        legA:   ackA,
+      };
+    }
+
+    let ackB: OrderAck;
+    try {
+      ackB = await this.placeOrder(legB, ctx, ocoGroupId);
+    } catch (err) {
+      // Leg B blew up before returning an ack at all (e.g. feed circuit open,
+      // trading suspended) — leg A is already live and unpaired; roll it back.
+      await this._cancelLegForRollback(ackA.id, ctx.userId);
+      throw err;
+    }
+
+    if (ackB.status !== "ACCEPTED") {
+      await this._cancelLegForRollback(ackA.id, ctx.userId);
+      return {
+        ok:     false,
+        reason: `OCO_LEG_B_REJECTED: ${ackB.rejectionReason ?? "leg B could not be placed"}`,
+        legA:   ackA,
+        legB:   ackB,
+      };
+    }
+
+    return { ok: true, ocoGroupId, legA: ackA, legB: ackB };
+  }
+
+  /** Cancels a just-placed resting leg by its parent Order id — used to roll
+   *  back leg A of an OCO pair when leg B fails to place. */
+  private async _cancelLegForRollback(orderId: string, userId: string): Promise<void> {
+    const pending = pendingOrderBook.getForUser(userId).find((p) => p.orderId === orderId);
+    if (pending) await pendingOrderBook.cancel(pending.id, userId);
   }
 
   /**
@@ -423,6 +497,7 @@ export class OrderController {
     quote:      { bid: number; ask: number; mid: number },
     riskResult: { pass: true; effectiveLeverage: number; marginRequired: number; notional: number },
     type:       string,
+    ocoGroupId?: string,
   ): Promise<OrderAck> {
     const symbol = req.symbol.toUpperCase();
     const price  = req.price ?? quote.mid;
@@ -475,6 +550,7 @@ export class OrderController {
         notional:       riskResult.notional,
         clientOrderId:  req.clientOrderId,
         expiresAt:      req.expiresAt ? new Date(req.expiresAt) : undefined,
+        ocoGroupId,
       });
     } catch (addErr) {
       // P0-2: If persistence fails after retries, reject the order so the
