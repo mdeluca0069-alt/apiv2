@@ -234,6 +234,17 @@ export class InternalLiquidityProvider implements ILiquidityProvider {
   }
 
   /**
+   * FASE 3.7: public accessor for the exact notional-tier slippage a real
+   * fill would incur — used by execution-service/slippage.controller.ts's
+   * preview endpoint so its "market impact" estimate matches what a real
+   * order against this symbol/notional will actually be charged, instead
+   * of an independently-tuned formula that could (and did) diverge from it.
+   */
+  estimateSlippage(symbol: string, notional: number): number {
+    return this._deterministicSlippage(symbol, notional);
+  }
+
+  /**
    * Deterministic slippage tiers by asset class and notional size.
    * Same inputs always produce the same slippage — no random component.
    * Reflects realistic B-book internal execution quality for retail order sizes.

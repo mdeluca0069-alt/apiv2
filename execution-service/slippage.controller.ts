@@ -1,5 +1,5 @@
 /**
- * SlippageController — realistic slippage model for internal LP fills.
+ * SlippageController — client-facing slippage PREVIEW for internal LP fills.
  *
  * Slippage in CFD trading has three components:
  *
@@ -9,13 +9,24 @@
  *      Example: EURUSD spread=1.0 pip → 0.5 pip spread slippage.
  *
  *   2. MARKET IMPACT (size-based):
- *      Larger orders consume more liquidity levels in the book.
- *      Modelled as: notional / MARKET_IMPACT_DIVISOR × base_slippage
- *      Example: $100k order has more impact than $10k order.
+ *      FASE 3.7: sourced directly from InternalLiquidityProvider.estimateSlippage()
+ *      — the exact notional-tier number a real fill against this symbol/quantity
+ *      will actually be charged (liquidity.provider.ts's _deterministicSlippage).
+ *      Previously this was an independently-tuned linear formula
+ *      (notional / MARKET_IMPACT_DIVISOR × base_slippage) that could diverge
+ *      by several pips from what the client's order would really pay —
+ *      unifying it here means the preview is no longer a second, disconnected
+ *      model, it reports what the fill path will actually do.
  *
  *   3. VOLATILITY PREMIUM (regime-based):
  *      During high-volatility periods (large changePct), spreads widen
  *      and fills are worse. Modelled as a multiplier on base slippage.
+ *      Preview-only: the real fill path has no volatility input today (the
+ *      quote objects passed to calculateFill() at every real call site carry
+ *      no changePct), so this component is an informational estimate of
+ *      "expect worse slippage in volatile conditions," not a promise of the
+ *      exact fill price — unlike the spread and impact components above,
+ *      which now match the real fill path exactly.
  *
  * The model is DETERMINISTIC (no Math.random) — given the same inputs
  * it produces the same slippage. This is required for:
@@ -26,11 +37,11 @@
  * Outputs:
  *   slippagePips     — slippage in pip units (for client display)
  *   slippagePrice    — slippage in price units (added to fill price)
- *   fillPrice        — final adjusted fill price
+ *   fillAdjustment   — price units to add to mid price for fill
  *   qualityScore     — 0-100, where 100 = perfect fill (zero slippage)
  */
 
-import { assetClassOf } from "../liquidity-engine/liquidity.provider.js";
+import { assetClassOf, LiquidityProvider } from "../liquidity-engine/liquidity.provider.js";
 
 // ── Asset-class parameters ─────────────────────────────────────────────────────
 
@@ -90,9 +101,12 @@ export class SlippageController {
     const spreadPips = (input.spread / 2) / params.pipSize;
 
     // ── 2. Market impact component ─────────────────────────────────────────────
-    // Larger notional = more price levels consumed in the book
+    // FASE 3.7: the exact notional-tier slippage a real fill against this
+    // symbol/notional would incur (liquidity.provider.ts's
+    // _deterministicSlippage) — not an independently-tuned formula, so this
+    // preview reports what the fill path will actually charge.
     const notional     = input.quantity * input.midPrice;
-    const impactPips   = (notional / params.marketImpactDivisor) * spreadPips;
+    const impactPips   = LiquidityProvider.estimateSlippage(input.symbol.toUpperCase(), notional) / params.pipSize;
 
     // ── 3. Volatility component ────────────────────────────────────────────────
     // High changePct (e.g. during news events) widens effective spread
