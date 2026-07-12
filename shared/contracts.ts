@@ -20,7 +20,7 @@ export const AssetClassSchema = z.enum([
 ]);
 
 export const OrderSideSchema = z.enum(["BUY", "SELL"]);
-export const OrderTypeSchema = z.enum(["MARKET", "LIMIT", "STOP", "STOP_LIMIT", "TRAILING_STOP"]);
+export const OrderTypeSchema = z.enum(["MARKET", "LIMIT", "STOP", "STOP_LIMIT", "TRAILING_STOP", "IOC", "FOK"]);
 export const OrderStatusSchema = z.enum([
   "RECEIVED",
   "RISK_REVIEW",
@@ -632,7 +632,7 @@ export type ExecutionRequest = {
   userId:          string;
   symbol:          string;
   side:            "BUY" | "SELL";
-  type:            "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT" | "TRAILING_STOP";
+  type:            "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT" | "TRAILING_STOP" | "IOC" | "FOK";
   quantity:        number;
   requestedPrice?: number;
   leverage:        number;

@@ -134,6 +134,23 @@ export class ExecutionEngine {
 
     const execPrice = fillResult.averagePrice;
 
+    // ── FASE 3.5: FOK (Fill-Or-Kill) — reject the whole order if the LP
+    // cannot fill the full requested quantity immediately. Checked here,
+    // right after the fill is computed and before anything financial
+    // happens (no margin lock, no transaction started yet) — same cheapest-
+    // rejection-point principle as the REQUOTE check above. Today the sole
+    // ILiquidityProvider always returns partialFill:false (full-or-reject by
+    // construction), so this branch is currently unreachable in practice —
+    // it exists for correctness once a future LP can genuinely partial-fill.
+    if (req.type === "FOK" && fillResult.partialFill && fillResult.remainingQuantity > 0) {
+      await orderLifecycle.rejectOrder(
+        req.orderId,
+        `FOK_UNFILLABLE: only ${fillResult.filledQuantity}/${req.quantity} available immediately — Fill-Or-Kill requires the full quantity`,
+      );
+      metrics.inc("fok_rejections_total");
+      return { status: "REJECTED", orderId: req.orderId, reason: "FOK_UNFILLABLE" };
+    }
+
     // ── Cancel check A — before margin lock ──────────────────────────────
     // Order is ACCEPTED, no money committed. Clean abort.
     if (cancelled()) {

@@ -37,7 +37,7 @@ export class OrderLifecycle {
     userId:          string;
     symbol:          string;
     side:            "BUY" | "SELL";
-    type:            "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT" | "TRAILING_STOP";
+    type:            "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT" | "TRAILING_STOP" | "IOC" | "FOK";
     quantity:        number;
     requestedPrice?: number;
     leverage:        number;

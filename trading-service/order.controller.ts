@@ -102,7 +102,7 @@ export class OrderController {
         userId:          ctx.userId,
         symbol,
         side:            req.side,
-        type:            type as "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT" | "TRAILING_STOP",
+        type:            type as "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT" | "TRAILING_STOP" | "IOC" | "FOK",
         quantity:        req.quantity,
         requestedPrice:  req.price,
         leverage:        req.leverage ?? 1,
@@ -139,8 +139,15 @@ export class OrderController {
       };
     }
 
-    // ── 3. MARKET order → execute via per-user queue (prevents margin races) ──
-    if (type === "MARKET") {
+    // ── 3. MARKET/IOC/FOK → execute immediately via per-user queue (prevents
+    // margin races). IOC and FOK are never resting order types — both must
+    // either fill (in whole or, for IOC, in part) right now or be cancelled,
+    // so they share MARKET's immediate-execution path rather than the
+    // resting order book below. The distinction between the three is
+    // resolved inside _executeMarket / execution.engine.ts (FOK rejects any
+    // partial fill outright; IOC and MARKET both already accept a partial
+    // fill and leave the remainder un-requeued — the caller's responsibility).
+    if (type === "MARKET" || type === "IOC" || type === "FOK") {
       // P0-3: Reject before queue if position monitor is at capacity
       if (positionPriceMonitor.isAtCapacity()) {
         return this._rejectedAck(symbol, req.side,
@@ -149,7 +156,7 @@ export class OrderController {
       }
 
       const queued = await executionQueue.enqueue(ctx.userId, (ct) =>
-        this._executeMarket(req, ctx.userId, quote, riskResult, ct)
+        this._executeMarket(req, ctx.userId, quote, riskResult, ct, type as "MARKET" | "IOC" | "FOK")
       );
       if (!queued.ok) {
         // P0-1: Surface duplicate-order errors as 409 (they propagate as EXECUTION_ERROR)
@@ -278,6 +285,7 @@ export class OrderController {
     quote:       { bid: number; ask: number; mid: number; symbol: string; spread: number; changePct: number; ts?: string },
     riskResult:  { pass: true; effectiveLeverage: number; marginRequired: number; notional: number },
     cancelToken?: CancelToken,
+    type:        "MARKET" | "IOC" | "FOK" = "MARKET",
   ): Promise<OrderAck> {
     const symbol = req.symbol.toUpperCase();
 
@@ -285,7 +293,7 @@ export class OrderController {
       userId,
       symbol,
       side:            req.side,
-      type:            "MARKET",
+      type,
       quantity:        req.quantity,
       requestedPrice:  req.price,
       leverage:        riskResult.effectiveLeverage,
@@ -308,7 +316,7 @@ export class OrderController {
         userId,
         symbol,
         side:           req.side,
-        type:           "MARKET",
+        type,
         quantity:       req.quantity,
         requestedPrice: req.price,
         leverage:       riskResult.effectiveLeverage,
@@ -327,7 +335,7 @@ export class OrderController {
         clientOrderId:   req.clientOrderId,
         symbol,
         side:            req.side,
-        type:            "MARKET",
+        type,
         quantity:        req.quantity,
         status:          "REJECTED",
         rejectionReason: execResult.reason,
@@ -349,7 +357,7 @@ export class OrderController {
         clientOrderId:    req.clientOrderId,
         symbol,
         side:             req.side,
-        type:             "MARKET",
+        type,
         quantity:         req.quantity,
         requestedPrice:   req.price,
         averageFillPrice: execResult.averageFillPrice,
@@ -398,7 +406,7 @@ export class OrderController {
       clientOrderId:    req.clientOrderId,
       symbol,
       side:             req.side,
-      type:             "MARKET",
+      type,
       quantity:         req.quantity,
       requestedPrice:   req.price,
       averageFillPrice: execResult.averageFillPrice,
