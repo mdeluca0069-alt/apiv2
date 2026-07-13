@@ -71,6 +71,10 @@ export type ExposureSnapshot = ExposureEntry & {
   symbol:        string;
   grossNotional: number;   // longNotional + shortNotional
   netNotional:   number;   // |longNotional - shortNotional|  (signed: positive = long bias)
+  offsetNotional: number;  // FASE 3.8 (Group D): 2 × min(longNotional, shortNotional) —
+                            // the notional that opposing client positions already cancel
+                            // out internally, and so never needs external hedging at all.
+                            // grossNotional === offsetNotional + |netNotional| always holds.
   limitGross:    number;
   limitNet:      number;
   grossPct:      number;   // grossNotional / limitGross × 100
@@ -260,6 +264,7 @@ export class ExposureRegistry {
       const limits      = EXPOSURE_LIMITS[symbol] ?? DEFAULT_LIMIT;
       const gross       = entry.longNotional + entry.shortNotional;
       const net         = entry.longNotional - entry.shortNotional; // signed
+      const offset      = 2 * Math.min(entry.longNotional, entry.shortNotional);
 
       result.push({
         symbol,
@@ -267,6 +272,7 @@ export class ExposureRegistry {
         shortNotional: entry.shortNotional,
         grossNotional: gross,
         netNotional:   net,
+        offsetNotional: offset,
         limitGross:    limits.grossUsd,
         limitNet:      limits.netUsd,
         grossPct:      limits.grossUsd > 0 ? (gross / limits.grossUsd) * 100 : 0,
@@ -285,6 +291,7 @@ export class ExposureRegistry {
     const limits = EXPOSURE_LIMITS[key] ?? DEFAULT_LIMIT;
     const gross  = entry.longNotional + entry.shortNotional;
     const net    = entry.longNotional - entry.shortNotional;
+    const offset = 2 * Math.min(entry.longNotional, entry.shortNotional);
 
     return {
       symbol:        key,
@@ -292,6 +299,7 @@ export class ExposureRegistry {
       shortNotional: entry.shortNotional,
       grossNotional: gross,
       netNotional:   net,
+      offsetNotional: offset,
       limitGross:    limits.grossUsd,
       limitNet:      limits.netUsd,
       grossPct:      limits.grossUsd > 0 ? (gross / limits.grossUsd) * 100 : 0,

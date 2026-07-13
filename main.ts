@@ -118,6 +118,7 @@ import { stopOutEngine }         from "./trading-service/stopout.engine.js";
 import { riskWarningGenerator }  from "./risk-service/risk.warning.generator.js";
 import { liquidationEngine }     from "./risk-service/liquidation.engine.js";
 import { symbolCircuitBreaker }  from "./risk-service/symbol.circuit.breaker.js";
+import { hedgeQueue }            from "./hedge-service/hedge.queue.js";
 import { swapAccrualService }    from "./settlement/swap.accrual.service.js";
 import { positionPriceMonitor }  from "./trading-service/position.price.monitor.js";
 import { redisPubSub }           from "./realtime-infra/redis.pubsub.js";
@@ -204,6 +205,7 @@ jobCoordinator.register({ id: "audit-outbox-consumer", ttlSeconds: 8,       inte
 jobCoordinator.register({ id: "liquidation-watchdog", ttlSeconds: 25,       intervalMs: 30_000,             description: "FASE 2.5: periodic SL/TP recovery sweep — catches positions missed by the tick-level monitor" });
 jobCoordinator.register({ id: "notification-outbox-consumer", ttlSeconds: 12, intervalMs: 15_000,           description: "FASE 2.6: turn order.filled/position.closed outbox rows into reliable Notification rows + email" });
 jobCoordinator.register({ id: "symbol-circuit-breaker-recovery", ttlSeconds: 25, intervalMs: 30_000,         description: "FASE 3.2: auto re-enable symbols the circuit breaker halted, once their cooldown elapses" });
+jobCoordinator.register({ id: "hedge-queue-sweep",     ttlSeconds: 45,      intervalMs: 60_000,             description: "FASE 3.8: evaluate house exposure and record hedge-order scaffold rows (no live provider — REJECTED by design)" });
 jobCoordinator.register({ id: "signal-generator",      ttlSeconds: 50,      intervalMs: signalIntervalMs,   description: "OLOS technical signal evaluation"                      });
 jobCoordinator.register({ id: "economic-calendar",     ttlSeconds: 20_000,  intervalMs: 6 * 60 * 60_000,   description: "Refresh economic calendar from Finnhub (every 6h)"     });
 jobCoordinator.register({ id: "signal-expire",         ttlSeconds: 3_500,   intervalMs: 60 * 60_000,        description: "Expire unexecuted OLOS signals past 24h TTL"           });
@@ -1138,6 +1140,25 @@ setInterval(async () => {
     await jobCoordinator.release("symbol-circuit-breaker-recovery");
   }
 }, 30_000);
+
+// FASE 3.8 (Group D) — hedge queue sweep: every 60 seconds.
+// Evaluates exposureRegistry's house-wide net position per symbol and
+// records a HedgeOrder row for anything crossing hedge.policy.ts's
+// threshold. With no external LP configured (NullExternalHedgeProvider is
+// the only provider), every row resolves to REJECTED immediately — this is
+// the audit trail the scaffold exists to produce, not a functioning hedge.
+setInterval(async () => {
+  if (!prisma) return;
+  if (!(await jobCoordinator.tryLead("hedge-queue-sweep"))) return;
+  try {
+    const r = await hedgeQueue.runSweep();
+    if (r.queued > 0) console.log(`[hedge-queue] recorded ${r.queued} hedge-order row(s) (evaluated ${r.evaluated} instruments)`);
+  } catch (err) {
+    console.error("[hedge-queue] sweep failed:", (err as Error).message);
+  } finally {
+    await jobCoordinator.release("hedge-queue-sweep");
+  }
+}, 60_000);
 
 // Risk warning generator — every 30 seconds (Fix #9).
 // Persists each active user's REAL current risk state (margin level,

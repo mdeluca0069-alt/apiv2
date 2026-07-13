@@ -25,6 +25,8 @@ import { orderController }            from "../trading-service/order.controller.
 import { getQueueMetrics }            from "../execution-service/execution.queue.js";
 import { killSwitch }                 from "../risk-service/kill.switch.js";
 import { globalRiskSupervisor }       from "../risk-service/global.risk.supervisor.js";
+import { exposureRegistry }           from "../risk-service/exposure.limits.js";
+import { externalHedgeProvider }      from "../hedge-service/null.hedge.provider.js";
 import { closePosition }              from "../trading-service/position.close.js";
 import { modifyOrderSlTp }            from "../trading-service/order.modify.js";
 import { cancelOrder }                from "../trading-service/order.cancel.js";
@@ -3132,6 +3134,14 @@ export const routes: Route[] = [
   },
 
   // ── Admin: Hedge engine stats (positions + metrics) ───────────────────────
+  // NOTE (FASE 3.8, Group D): despite the name, this endpoint has never
+  // reflected any real hedging — "hedgeRatio"/"hedgedPositions" below are the
+  // order fill-rate relabeled, not a measure of externally-offset exposure
+  // (there is no external hedge counterparty in this system). Left unchanged
+  // to avoid breaking whatever admin UI already consumes this exact shape.
+  // For the real house-wide net-position/internal-offset report, see
+  // GET /admin/dealer/inventory below; for the (non-operational, no live
+  // provider) hedge-order scaffold, see GET /admin/dealer/hedge-queue.
   {
     method: "GET",
     path: api("/admin/hedge/stats"),
@@ -3164,6 +3174,63 @@ export const routes: Route[] = [
         ordersFilled,
         killSwitchActivations: metrics.get("kill_switch_activations_total"),
         generatedAt: new Date().toISOString(),
+      };
+    },
+  },
+
+  // ── Admin: Dealer inventory / internal-offset report (FASE 3.8, Group D) ──
+  // The real house-wide net-position view — every number here comes straight
+  // from ExposureRegistry.getAll(), which was already computing gross/net
+  // exposure house-wide (no userId anywhere in that model); it just had no
+  // route exposing it. No new aggregation logic, only new visibility.
+  //
+  // Deliberately does NOT sum notional across symbols into one blended
+  // platform-wide dollar figure — notional here is in each instrument's own
+  // quote currency (e.g. EURGBP notional is in GBP, not USD), and this
+  // system has no FX-conversion layer to make that summation correct. The
+  // per-symbol breakdown is the only honest view; `summary` below reports
+  // counts, not a fabricated total.
+  {
+    method: "GET",
+    path: api("/admin/dealer/inventory"),
+    admin: true,
+    handler: () => {
+      const snapshots = exposureRegistry.getAll();
+      const overNetThreshold = snapshots.filter((s) => s.netPct >= 50);
+      return {
+        instruments: snapshots,
+        summary: {
+          symbolsTracked:         snapshots.length,
+          symbolsOverNetThreshold: overNetThreshold.length,
+          netThresholdPct:        50,
+        },
+        generatedAt: new Date().toISOString(),
+      };
+    },
+  },
+
+  // ── Admin: Hedge-order scaffold visibility (FASE 3.8, Group D) ────────────
+  // Lists recent HedgeOrder rows created by hedge-service/hedge.queue.ts's
+  // periodic sweep. `providerConfigured` is always false today — there is no
+  // real external LP wired in, so every row's status is REJECTED by design.
+  // This endpoint is for visibility into what WOULD have been hedged, not a
+  // control surface for anything that actually executes.
+  {
+    method: "GET",
+    path: api("/admin/dealer/hedge-queue"),
+    admin: true,
+    handler: async ({ query }) => {
+      if (!IS_PERSISTENT) return { providerConfigured: false, orders: [] };
+      const db    = prisma as NonNullable<typeof prisma>;
+      const limit = Math.min(parseInt(query.get("limit") ?? "50"), 200);
+      const orders = await db.hedgeOrder.findMany({
+        orderBy: { createdAt: "desc" },
+        take:    limit,
+      });
+      return {
+        providerConfigured: externalHedgeProvider.isConfigured,
+        activeProviderId:   externalHedgeProvider.providerId,
+        orders,
       };
     },
   },

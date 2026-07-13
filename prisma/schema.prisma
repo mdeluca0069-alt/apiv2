@@ -161,6 +161,7 @@ model Instrument {
   createdAt         DateTime   @default(now())
   Order             Order[]
   Position          Position[]
+  HedgeOrder        HedgeOrder[]
 }
 
 model KycCase {
@@ -476,6 +477,31 @@ model Position {
   @@index([userId, closedAt])
   @@index([userId, status])
   @@index([openedByAutopilot, status])
+}
+
+// FASE 3.8 (Group D): scaffold for external-LP hedging. No real provider
+// exists today (see hedge-service/null.hedge.provider.ts) — every row this
+// system creates today resolves to status=REJECTED, providerId=NULL_PROVIDER.
+// The table exists so the hedge-decision policy and audit trail are real and
+// queryable now, ready to plug in an actual external-LP adapter later
+// without a schema change.
+model HedgeOrder {
+  id          String     @id @default(uuid())
+  symbol      String
+  side        String     // BUY | SELL — the side the HOUSE would trade externally to flatten its book
+  notional    Decimal    @db.Decimal(18, 2)
+  quantity    Decimal?   @db.Decimal(18, 8) // best-effort, derived from the live quote at decision time
+  status      String     // SUBMITTED | REJECTED
+  providerId  String     // e.g. "NULL_PROVIDER" until a real adapter is configured
+  reason      String     // why this hedge was suggested / why it was rejected
+  externalRef String?    // the venue's own order id, once a real provider exists
+  requestedAt DateTime   @default(now())
+  resolvedAt  DateTime?
+  createdAt   DateTime   @default(now())
+  Instrument  Instrument @relation(fields: [symbol], references: [symbol])
+
+  @@index([symbol, status])
+  @@index([createdAt])
 }
 
 model RiskWarning {
