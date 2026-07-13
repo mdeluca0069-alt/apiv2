@@ -1,7 +1,34 @@
 import { randomUUID } from "node:crypto";
 import { Decimal }    from "@prisma/client/runtime/library";
-import type { PrismaClient } from "@prisma/client";
-import { WalletRepository } from "./wallet.repository.js";
+import type { PrismaClient, Prisma } from "@prisma/client";
+import { WalletRepository }  from "./wallet.repository.js";
+import { BalanceCalculator } from "./balance.calculator.js";
+import { quoteCache }        from "../market-data/quote.cache.js";
+
+/** Same composability contract as balance.calculator.ts / order.lifecycle.ts. */
+type Db = Prisma.TransactionClient | PrismaClient;
+
+/** FASE 4.1: fetches live quotes for a user's open positions and runs
+ *  BalanceCalculator against them, atomically or not depending on the `db`
+ *  passed in. A position whose symbol has no live quote right now
+ *  contributes zero to unrealizedPnL (BalanceCalculator's own behavior,
+ *  unchanged here) — strictly safer than the balance-locked formula this
+ *  replaces, which ignored open-position P&L entirely, but still not a
+ *  guarantee every open position's real risk is reflected if its feed is
+ *  down at the exact moment of the check. */
+async function computeLiveFreeMargin(db: Db, userId: string): Promise<number> {
+  const openPositions = await db.position.findMany({
+    where:  { userId, closedAt: null },
+    select: { symbol: true },
+  });
+  const symbols = [...new Set(openPositions.map((p) => p.symbol))];
+  const quotes  = symbols
+    .map((s) => quoteCache.get(s))
+    .filter((q): q is NonNullable<ReturnType<typeof quoteCache.get>> => q != null);
+
+  const snapshot = await new BalanceCalculator(db).compute(userId, quotes);
+  return snapshot.freeMargin;
+}
 
 export type DepositInput = {
   userId: string;
@@ -104,7 +131,17 @@ export class LedgerEngine {
       return { status: "REJECTED", message: "No wallet found for user." };
     }
 
-    const freeMargin = Number(account.balance) - Number(account.locked);
+    // FASE 4.1: free margin must be equity-based (balance + unrealized P&L -
+    // marginUsed), not balance-locked -- a client with an open losing
+    // position must not be able to withdraw cash the position's unrealized
+    // loss has already claimed. balance-locked ignored open-position P&L
+    // entirely, so a client could request (and, before the approveWithdrawal
+    // fix below, actually receive) funds that don't exist once the loss is
+    // realized. This is an early, advisory rejection for a better UX
+    // response; the authoritative check is inside approveWithdrawal's
+    // transaction below, since market conditions can change between request
+    // and admin approval.
+    const freeMargin = await computeLiveFreeMargin(this.db, input.userId);
     if (input.amount > freeMargin) {
       await this.db.ledgerEntry.create({
         data: {
@@ -144,6 +181,15 @@ export class LedgerEngine {
       });
       if (!account) throw new Error(`WALLET_NOT_FOUND:${userId}`);
       if (account.balance.lt(amount)) throw new Error("INSUFFICIENT_BALANCE");
+
+      // FASE 4.1: authoritative equity-based free-margin re-check, atomically
+      // under this same transaction -- requestWithdrawal's check above is
+      // only advisory (market conditions, and the client's open positions,
+      // can change between request and admin approval). Debiting must never
+      // proceed if it would pull cash out from under an open position's
+      // unrealized loss, even if raw balance alone is sufficient.
+      const freeMargin = await computeLiveFreeMargin(tx, userId);
+      if (amount > freeMargin) throw new Error("INSUFFICIENT_FREE_MARGIN");
 
       const newBalance = account.balance.minus(amount);
       await tx.walletAccount.update({

@@ -1,4 +1,10 @@
-import type { PrismaClient } from "@prisma/client";
+import type { PrismaClient, Prisma } from "@prisma/client";
+
+/** Same composability contract as order.lifecycle.ts / exposure.limits.ts —
+ *  accepts either the top-level PrismaClient or a $transaction callback's tx,
+ *  so compute() can be called atomically inside a money-moving transaction
+ *  (see ledger.engine.ts's approveWithdrawal, FASE 4.1) as well as standalone. */
+type Db = Prisma.TransactionClient | PrismaClient;
 
 export type BalanceSnapshot = {
   userId: string;
@@ -19,7 +25,7 @@ export type QuoteLike = {
 };
 
 export class BalanceCalculator {
-  constructor(private readonly db: PrismaClient) {}
+  constructor(private readonly db: Db) {}
 
   async compute(userId: string, quotes: QuoteLike[]): Promise<BalanceSnapshot> {
     const [account, positions] = await Promise.all([
