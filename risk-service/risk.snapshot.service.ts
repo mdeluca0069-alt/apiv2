@@ -13,6 +13,8 @@
  */
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { tradingAnalyticsService } from "../analytics/trading.analytics.service.js";
+import { quoteCache } from "../market-data/quote.cache.js";
+import { pnlCalculator } from "../trading-service/pnl.calculator.js";
 
 export type RiskSnapshot = {
   riskScore:          number;
@@ -48,7 +50,7 @@ export class RiskSnapshotService {
       prisma.walletAccount.findUnique({ where: { userId } }),
       prisma.position.findMany({
         where:  { userId, status: "OPEN" },
-        select: { marginUsed: true, quantity: true, entryPrice: true, pnl: true, symbol: true },
+        select: { marginUsed: true, quantity: true, entryPrice: true, side: true, symbol: true },
       }),
       tradingAnalyticsService.getStats(userId).catch(() => null),
     ]);
@@ -57,7 +59,23 @@ export class RiskSnapshotService {
 
     const balance  = Number(wallet.balance);
     const locked   = Number(wallet.locked);
-    const equity   = Number(wallet.equity) || (balance + positions.reduce((s, p) => s + Number(p.pnl ?? 0), 0));
+
+    // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #2): wallet.equity is never written
+    // anywhere in this codebase, so the `||` fallback below always ran --
+    // and it summed the persisted Position.pnl column, which can go stale/
+    // frozen (see margin.controller.ts's getMarginState for the full
+    // mechanism). Live-recompute from current quotes instead, same as the
+    // pre-trade margin gate, so the dashboard risk score a client/compliance
+    // sees is never stale relative to what actually gates their orders.
+    const unrealizedPnl = positions.reduce((sum, p) => {
+      const quote = quoteCache.get(p.symbol);
+      if (!quote) return sum;
+      const { rawPnl } = pnlCalculator.unrealized(
+        p.side as "BUY" | "SELL", Number(p.quantity), Number(p.entryPrice), quote.bid, quote.ask,
+      );
+      return sum + rawPnl;
+    }, 0);
+    const equity = balance + unrealizedPnl;
 
     const marginUsed = positions.reduce((s, p) => s + Number(p.marginUsed), 0);
     const totalNotional = positions.reduce((s, p) => s + Number(p.quantity) * Number(p.entryPrice), 0);

@@ -80,6 +80,7 @@ import { spreadStore }                from "../liquidity-engine/spread.engine.js
 import { virtualOrderbook }           from "../liquidity-engine/virtual.orderbook.js";
 import { assetClassOf }               from "../liquidity-engine/liquidity.provider.js";
 import { quoteCache }                 from "../market-data/quote.cache.js";
+import { pnlCalculator }              from "../trading-service/pnl.calculator.js";
 import { tradingSuspension }          from "../shared/trading.suspension.js";
 import { feedCircuit }               from "../shared/feed.circuit.js";
 import { PaymentService }                       from "../payment-service/payment.service.js";
@@ -692,12 +693,25 @@ export const routes: Route[] = [
           (db as NonNullable<typeof db>).walletAccount.findUnique({ where: { userId: principal.sub } }),
           (db as NonNullable<typeof db>).position.findMany({
             where:  { userId: principal.sub, status: "OPEN" },
-            select: { pnl: true, marginUsed: true },
+            select: { symbol: true, side: true, quantity: true, entryPrice: true, marginUsed: true },
           }),
         ]);
 
-        const unrealizedPnL = positions.reduce((s, p) => s + Number(p.pnl ?? 0), 0);
-        const marginUsed    = positions.reduce((s, p) => s + Number(p.marginUsed ?? 0), 0);
+        // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #2): live floating P&L from
+        // current quotes, not the persisted Position.pnl column -- see
+        // margin.controller.ts's getMarginState for the full staleness
+        // mechanism this was silently exposed to. This is the equity number
+        // the client actually sees, so it must match what the pre-trade
+        // margin gate uses.
+        const unrealizedPnL = positions.reduce((sum, p) => {
+          const quote = quoteCache.get(p.symbol);
+          if (!quote) return sum;
+          const { rawPnl } = pnlCalculator.unrealized(
+            p.side as "BUY" | "SELL", p.quantity.toNumber(), p.entryPrice.toNumber(), quote.bid, quote.ask,
+          );
+          return sum + rawPnl;
+        }, 0);
+        const marginUsed = positions.reduce((s, p) => s + Number(p.marginUsed ?? 0), 0);
 
         if (!wallet) {
           // WalletAccount row missing — recover balance from approved ledger entries

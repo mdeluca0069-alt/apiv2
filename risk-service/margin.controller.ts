@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { Decimal } from "@prisma/client/runtime/library";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../shared/db.js";
+import { quoteCache } from "../market-data/quote.cache.js";
+import { pnlCalculator } from "../trading-service/pnl.calculator.js";
 import type { MarginState } from "../shared/contracts.js";
 
 /** See order.lifecycle.ts — same composability contract. */
@@ -13,16 +15,36 @@ export class MarginController {
       prisma.walletAccount.findUnique({ where: { userId } }),
       prisma.position.findMany({
         where:  { userId, status: "OPEN" },
-        select: { marginUsed: true, pnl: true },
+        select: { symbol: true, side: true, quantity: true, entryPrice: true, marginUsed: true },
       }),
     ]);
 
     if (!wallet) throw new Error(`WALLET_NOT_FOUND:${userId}`);
 
-    const balance       = wallet.balance.toNumber();
-    const marginUsed    = openPositions.reduce((s: number, p) => s + p.marginUsed.toNumber(), 0);
-    const unrealizedPnl = openPositions.reduce((s: number, p) => s + p.pnl.toNumber(), 0);
-    const equity        = balance + unrealizedPnl;
+    const balance    = wallet.balance.toNumber();
+    const marginUsed = openPositions.reduce((s: number, p) => s + p.marginUsed.toNumber(), 0);
+
+    // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #2): live floating P&L from current
+    // quotes, not the persisted Position.pnl column — that column is only
+    // refreshed every 5s by PositionPriceMonitor's in-memory cache, which can
+    // silently and permanently drop a position on a transient error, freezing
+    // its pnl at its creation-time value (0) for the life of the process.
+    // This is the pre-trade risk gate (canAcceptOrder below feeds
+    // risk.engine.ts's preTradeCheck) — it must never approve an order
+    // against phantom free margin. A position with no live quote right now
+    // contributes 0 (skipped), same limitation as ledger.engine.ts's
+    // withdrawal fix (FASE 4.1) — strictly safer than reading a stale
+    // number, not a guarantee every position's real risk is captured.
+    const unrealizedPnl = openPositions.reduce((sum, p) => {
+      const quote = quoteCache.get(p.symbol);
+      if (!quote) return sum;
+      const { rawPnl } = pnlCalculator.unrealized(
+        p.side as "BUY" | "SELL", p.quantity.toNumber(), p.entryPrice.toNumber(), quote.bid, quote.ask,
+      );
+      return sum + rawPnl;
+    }, 0);
+
+    const equity = balance + unrealizedPnl;
     const freeMargin    = equity - marginUsed;
     const marginLevelPct =
       marginUsed > 0 ? (equity / marginUsed) * 100 : Number.POSITIVE_INFINITY;

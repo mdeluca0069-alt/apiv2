@@ -1,4 +1,5 @@
 import type { PrismaClient, Prisma } from "@prisma/client";
+import { pnlCalculator } from "../trading-service/pnl.calculator.js";
 
 /** Same composability contract as order.lifecycle.ts / exposure.limits.ts —
  *  accepts either the top-level PrismaClient or a $transaction callback's tx,
@@ -39,13 +40,18 @@ export class BalanceCalculator {
 
     const quoteMap = new Map(quotes.map((q) => [q.symbol, q]));
 
+    // FASE 4.2: delegates to pnl.calculator.ts's unrealized() -- the
+    // canonical bid/ask-side formula this file's own header already claimed
+    // to be a consumer of, instead of an independent reimplementation that
+    // could silently drift from it.
     let unrealizedPnL = 0;
     for (const pos of positions) {
       const quote = quoteMap.get(pos.symbol);
       if (!quote) continue;
-      const exitPrice = pos.side === "BUY" ? quote.bid : quote.ask;
-      const direction = pos.side === "BUY" ? 1 : -1;
-      unrealizedPnL += (exitPrice - Number(pos.entryPrice)) * Number(pos.quantity) * direction;
+      const { rawPnl } = pnlCalculator.unrealized(
+        pos.side as "BUY" | "SELL", Number(pos.quantity), Number(pos.entryPrice), quote.bid, quote.ask,
+      );
+      unrealizedPnL += rawPnl;
     }
 
     const equity     = balance + unrealizedPnL;
