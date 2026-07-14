@@ -26,6 +26,11 @@ const { mockQuoteCache } = vi.hoisted(() => ({
 }));
 vi.mock("../market-data/quote.cache.js", () => ({ quoteCache: mockQuoteCache }));
 
+const { mockIsEnabled } = vi.hoisted(() => ({ mockIsEnabled: vi.fn() }));
+vi.mock("../liquidity-engine/broker.spread.config.js", () => ({
+  brokerSpreadConfig: { isEnabled: mockIsEnabled },
+}));
+
 const { mockSettle, PositionAlreadyClosedError } = vi.hoisted(() => {
   class PositionAlreadyClosedError extends Error {
     constructor(public readonly positionId: string, public readonly status: string) {
@@ -65,6 +70,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockQuoteCache.get.mockReturnValue(QUOTE);
   mockQuoteCache.isStale.mockReturnValue(false);
+  mockIsEnabled.mockReturnValue(true);
   mockSettle.mockResolvedValue({ cappedPnl: -40 });
 });
 
@@ -74,7 +80,7 @@ describe("LiquidationEngine.scanForMissedSlTp()", () => {
 
     const report = await liquidationEngine.scanForMissedSlTp();
 
-    expect(report).toEqual({ scanned: 0, closed: 0, skippedStale: 0 });
+    expect(report).toEqual({ scanned: 0, closed: 0, skippedStale: 0, skippedHalted: 0 });
     expect(mockSettle).not.toHaveBeenCalled();
   });
 
@@ -96,7 +102,7 @@ describe("LiquidationEngine.scanForMissedSlTp()", () => {
 
     const report = await liquidationEngine.scanForMissedSlTp();
 
-    expect(report).toEqual({ scanned: 1, closed: 1, skippedStale: 0 });
+    expect(report).toEqual({ scanned: 1, closed: 1, skippedStale: 0, skippedHalted: 0 });
     expect(mockSettle).toHaveBeenCalledTimes(1);
     const settleArg = mockSettle.mock.calls[0][0];
     expect(settleArg.reason).toBe("STOP_LOSS");
@@ -111,7 +117,7 @@ describe("LiquidationEngine.scanForMissedSlTp()", () => {
 
     const report = await liquidationEngine.scanForMissedSlTp();
 
-    expect(report).toEqual({ scanned: 1, closed: 1, skippedStale: 0 });
+    expect(report).toEqual({ scanned: 1, closed: 1, skippedStale: 0, skippedHalted: 0 });
     expect(mockSettle.mock.calls[0][0].reason).toBe("TAKE_PROFIT");
   });
 
@@ -123,7 +129,7 @@ describe("LiquidationEngine.scanForMissedSlTp()", () => {
 
     const report = await liquidationEngine.scanForMissedSlTp();
 
-    expect(report).toEqual({ scanned: 1, closed: 0, skippedStale: 0 });
+    expect(report).toEqual({ scanned: 1, closed: 0, skippedStale: 0, skippedHalted: 0 });
     expect(mockSettle).not.toHaveBeenCalled();
   });
 
@@ -133,7 +139,18 @@ describe("LiquidationEngine.scanForMissedSlTp()", () => {
 
     const report = await liquidationEngine.scanForMissedSlTp();
 
-    expect(report).toEqual({ scanned: 1, closed: 0, skippedStale: 1 });
+    expect(report).toEqual({ scanned: 1, closed: 0, skippedStale: 1, skippedHalted: 0 });
+    expect(mockSettle).not.toHaveBeenCalled();
+  });
+
+  it("FASE 4.2 Bug #3: skips a position whose symbol is currently halted, even with a fresh quote and a hit SL", async () => {
+    mockDb.position.findMany.mockResolvedValue([makePosition({ stopLoss: new Decimal(1.0860) })]);
+    // QUOTE.bid = 1.0850 <= stopLoss 1.0860 → would hit, but the symbol is halted
+    mockIsEnabled.mockReturnValue(false);
+
+    const report = await liquidationEngine.scanForMissedSlTp();
+
+    expect(report).toEqual({ scanned: 1, closed: 0, skippedStale: 0, skippedHalted: 1 });
     expect(mockSettle).not.toHaveBeenCalled();
   });
 

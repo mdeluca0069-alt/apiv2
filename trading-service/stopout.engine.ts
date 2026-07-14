@@ -29,6 +29,7 @@ import { eventBus }           from "../events-bus/event.bus.js";
 import { metrics }            from "../gateway/metrics.js";
 import { alertManager }       from "../alerting/alert.manager.js";
 import { jobCoordinator }     from "../realtime-infra/job.coordinator.js";
+import { brokerSpreadConfig } from "../liquidity-engine/broker.spread.config.js";
 
 const STOP_OUT_PCT    = 50;   // ESMA retail mandatory
 const MARGIN_CALL_PCT = 100;  // restrict new orders
@@ -41,6 +42,9 @@ export type StopOutResult = {
   liquidated:   number;   // number of positions closed
   totalPnl:     number;
   triggeredAt:  string;
+  /** FASE 4.2 (Bug #3): positions skipped because their symbol is currently
+   *  halted -- only meaningful for action="STOP_OUT". */
+  skippedHalted?: number;
 };
 
 export type StopOutScanReport = {
@@ -208,8 +212,22 @@ export class StopOutEngine {
 
     let liquidated = 0;
     let totalPnl   = 0;
+    let skippedHalted = 0;
 
     for (const pos of sorted) {
+      // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #3): a halted symbol's live
+      // price is exactly the price the circuit breaker flagged as anomalous
+      // (or an admin flagged as untradeable) — force-closing an existing
+      // position against it is the same mistake the halt exists to prevent
+      // for new orders. Skip it; the recovery sweep once the halt clears
+      // (or the next 30s/tick-level check) will catch it if the user is
+      // still below the stop-out floor then. Other positions for this same
+      // user on non-halted symbols are still liquidated normally.
+      if (!brokerSpreadConfig.isEnabled(pos.symbol)) {
+        skippedHalted++;
+        continue;
+      }
+
       try {
         const result = await settlementEngine.settle({
           positionId: pos.id,
@@ -253,18 +271,21 @@ export class StopOutEngine {
           marginUsed,
           positionsClosed: liquidated,
           totalPnl,
+          skippedHalted,
         } as object,
       },
     });
 
     metrics.inc("stop_out_events_total");
+    if (skippedHalted > 0) metrics.inc("stop_out_skipped_halted_total", skippedHalted);
     eventBus.emit("risk.stop_out", {
       userId, marginLevel, equity, marginUsed,
       positionsClosed: liquidated, totalPnl,
       triggeredAt,
     });
 
-    console.warn(`[stop-out] userId=${userId} marginLevel=${marginLevel.toFixed(1)}% closed=${liquidated} totalPnl=${totalPnl}`);
+    console.warn(`[stop-out] userId=${userId} marginLevel=${marginLevel.toFixed(1)}% closed=${liquidated} totalPnl=${totalPnl}` +
+      (skippedHalted > 0 ? ` skippedHalted=${skippedHalted}` : ""));
 
     // Alert on stop-out — individual stop-outs are WARNING; wave detection in scanAll()
     void alertManager.send({
@@ -275,7 +296,7 @@ export class StopOutEngine {
       metadata: { userId, marginLevel: marginLevel.toFixed(2), positions: liquidated, totalPnl: totalPnl.toFixed(2) },
     });
 
-    return { userId, marginLevel, action: "STOP_OUT", liquidated, totalPnl, triggeredAt };
+    return { userId, marginLevel, action: "STOP_OUT", liquidated, totalPnl, triggeredAt, skippedHalted };
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────

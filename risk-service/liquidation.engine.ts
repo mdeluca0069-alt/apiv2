@@ -32,6 +32,7 @@ import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { quoteCache }         from "../market-data/quote.cache.js";
 import { settlementEngine, type CloseReason, PositionAlreadyClosedError } from "../settlement/settlement.engine.js";
 import { LiquidityProvider } from "../liquidity-engine/liquidity.provider.js";
+import { brokerSpreadConfig } from "../liquidity-engine/broker.spread.config.js";
 import type { LiquidationResult } from "../shared/contracts.js";
 
 type LiveQuote = {
@@ -48,6 +49,7 @@ export type LiquidationScanReport = {
   scanned:     number;  // open positions with a stopLoss/takeProfit set
   closed:      number;  // positions this sweep actually closed
   skippedStale: number; // positions skipped because their symbol's quote is stale/missing
+  skippedHalted: number; // positions skipped because their symbol is currently halted (FASE 4.2 Bug #3)
 };
 
 export class LiquidationEngine {
@@ -60,7 +62,7 @@ export class LiquidationEngine {
    * prices" mistake the rest of this codebase deliberately avoids).
    */
   async scanForMissedSlTp(): Promise<LiquidationScanReport> {
-    const report: LiquidationScanReport = { scanned: 0, closed: 0, skippedStale: 0 };
+    const report: LiquidationScanReport = { scanned: 0, closed: 0, skippedStale: 0, skippedHalted: 0 };
     if (!IS_PERSISTENT || !prisma?.position) return report; // sandbox / no-DB mode
 
     const db = prisma as NonNullable<typeof prisma>;
@@ -94,6 +96,17 @@ export class LiquidationEngine {
       const quote = quoteCache.get(pos.symbol);
       if (!quote || quoteCache.isStale(pos.symbol)) {
         report.skippedStale++;
+        continue;
+      }
+
+      // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #3): a halted symbol's live
+      // price is exactly the price the circuit breaker flagged as
+      // anomalous (or an admin flagged as untradeable) -- closing an
+      // existing position against it is the same mistake the halt exists
+      // to prevent for new orders. Skip and let the halt's own recovery
+      // sweep / next tick after it clears catch this position.
+      if (!brokerSpreadConfig.isEnabled(pos.symbol)) {
+        report.skippedHalted++;
         continue;
       }
 

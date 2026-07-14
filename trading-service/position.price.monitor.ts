@@ -42,6 +42,7 @@ import { pnlCalculator }        from "./pnl.calculator.js";
 import { settlementEngine, PositionAlreadyClosedError } from "../settlement/settlement.engine.js";
 import { stopOutEngine }        from "./stopout.engine.js";
 import { metrics }              from "../gateway/metrics.js";
+import { brokerSpreadConfig }   from "../liquidity-engine/broker.spread.config.js";
 import type { MarketQuoteEvent } from "../events-bus/event.bus.js";
 
 /**
@@ -187,7 +188,14 @@ export class PositionPriceMonitor {
       const slHit = pos.stopLoss !== null && this._isSlHit(pos.side, pos.stopLoss, bid, ask);
       const tpHit = !slHit && pos.takeProfit !== null && this._isTpHit(pos.side, pos.takeProfit, bid, ask);
 
-      if ((slHit || tpHit) && !this.settlingIds.has(pos.id)) {
+      // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #3): a halted symbol's live
+      // price is exactly the price the circuit breaker flagged as anomalous
+      // (or an admin flagged as untradeable) — closing an existing position
+      // against it is the same mistake the halt exists to prevent for new
+      // orders. Falls through to the normal cache update below instead of
+      // closing, so the position's displayed P&L keeps tracking the market
+      // even while its liquidation is deferred until the halt clears.
+      if ((slHit || tpHit) && !this.settlingIds.has(pos.id) && brokerSpreadConfig.isEnabled(symbol)) {
         this.settlingIds.add(pos.id);
         const reason = slHit ? "STOP_LOSS" : "TAKE_PROFIT";
         const exitPrice = pos.side === "BUY" ? bid : ask;
