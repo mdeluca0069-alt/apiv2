@@ -102,6 +102,8 @@ const BALANCE_TYPES = new Set([
   "COMMISSION",                 // brokerage commission debit
   "SWAP",                       // overnight financing (may be ±)
   "ADJUSTMENT",                 // manual admin correction
+  "NBP_WRITEOFF",               // FASE 4.3: broker absorbs a residual negative
+                                 // balance after settlement (see settlement.engine.ts)
 ]);
 
 const EPSILON = 0.01; // 1 cent tolerance for floating-point rounding

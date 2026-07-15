@@ -102,9 +102,19 @@ export class PnLCalculator {
    *
    * If netCredit > 0 → wallet balance increases.
    * If netCredit < 0 → wallet balance decreases (loss case).
+   *
+   * FASE 4.3 (RISK_ENGINE_FREEZE.md Bug #6): `cappedPnl` already caps raw
+   * P&L at -marginUsed (applyNBP), but commission/swap were subtracted
+   * afterward, uncapped -- a position could still debit the wallet for more
+   * than its own deposited margin once fees are included, defeating the
+   * point of NBP. `marginUsed` (optional, defaults to no cap so direct
+   * callers/tests of the raw formula are unaffected) applies the same
+   * ESMA guarantee to the actual wallet-moving number, not just the
+   * P&L component of it.
    */
-  netCredit(cappedPnl: number, commission: number, swap: number): number {
-    return cappedPnl - commission - swap;
+  netCredit(cappedPnl: number, commission: number, swap: number, marginUsed = Infinity): number {
+    const raw = cappedPnl - commission - swap;
+    return Math.max(raw, -Math.abs(marginUsed));
   }
 
   // ── Convenience ───────────────────────────────────────────────────────────
@@ -131,7 +141,7 @@ export class PnLCalculator {
     const rawPnl    = this.realized(params.side, params.quantity, params.entryPrice, params.exitPrice);
     const cappedPnl = this.applyNBP(rawPnl, params.marginUsed);
     const pct       = this.pnlPercent(params.side, params.entryPrice, params.exitPrice);
-    const net       = this.netCredit(cappedPnl, params.commission, params.swap);
+    const net       = this.netCredit(cappedPnl, params.commission, params.swap, params.marginUsed);
 
     return {
       rawPnl,

@@ -4,10 +4,18 @@
  * Every position close — manual, stop-loss, take-profit, stop-out, admin —
  * MUST go through this engine.  It is the only place that:
  *   - calculates realised P&L (PnLCalculator)
- *   - applies negative balance protection (ESMA requirement)
+ *   - applies negative balance protection (ESMA requirement) -- both the
+ *     per-position cap (PnLCalculator.applyNBP/netCredit, which since FASE 4.3
+ *     also protects against commission pushing a capped loss past the
+ *     position's own margin) and a final aggregate write-off: if the wallet
+ *     balance is still negative after this settlement (several positions can
+ *     each individually respect their own margin cap while the account's
+ *     pre-existing balance was smaller than the sum of their margins), the
+ *     residual is absorbed by the broker via an audited NBP_WRITEOFF ledger
+ *     entry in the same transaction, never a silent clamp.
  *   - charges commission (CommissionCalculator)
  *   - charges overnight swap (SwapCalculator)
- *   - atomically updates position, wallet, and three ledger entries
+ *   - atomically updates position, wallet, and three-to-four ledger entries
  *   - writes an immutable audit log entry
  *   - enqueues an outbox event for reliable WebSocket delivery
  *
@@ -105,6 +113,9 @@ export type SettleResult = {
   netCredit:   number;
   newBalance:  Decimal;
   pnlPercent:  number;
+  /** FASE 4.3 (Bug #6): >0 when a residual negative balance after this
+   *  settlement was written off (broker-absorbed, ESMA NBP). 0 otherwise. */
+  writeOffAmount: number;
 };
 
 // ── Engine ───────────────────────────────────────────────────────────────────
@@ -148,9 +159,15 @@ export class SettlementEngine {
       swap:       0,
     });
 
-    const netCredit = Number(
-      (pnl.cappedPnl - commResult.commission).toFixed(8)
-    );
+    // FASE 4.3 (RISK_ENGINE_FREEZE.md Bug #6): use pnl.netCredit -- the
+    // result settleClose() already computed above via pnlCalculator's
+    // canonical, NBP-capped-including-commission formula -- instead of
+    // recomputing it inline here. This used to be a second, independent
+    // `cappedPnl - commission` formula that carried the exact same
+    // commission-leak bug pnl.calculator.ts's netCredit() was just fixed
+    // for: fixing only the calculator would have done nothing for this,
+    // the actual production settlement path.
+    const netCredit = Number(pnl.netCredit.toFixed(8));
 
     const ts = new Date().toISOString();
 
@@ -158,6 +175,7 @@ export class SettlementEngine {
     let newBalance!: Decimal;
     let safeRelease = 0;
     let discrepancy = 0;
+    let writeOffAmount = 0;
     let outboxId!: string;
 
     await withSettlementRetry(() =>
@@ -225,6 +243,33 @@ export class SettlementEngine {
       });
       newBalance = updatedWallet.balance;
 
+      // ── 2d-i. Negative balance write-off (FASE 4.3, RISK_ENGINE_FREEZE.md
+      // Bug #6) ─────────────────────────────────────────────────────────
+      // Per-position NBP (applyNBP/netCredit above) caps THIS settlement's
+      // own loss at its own deposited margin -- but a client can still end
+      // up with a negative wallet balance in aggregate: each of several
+      // positions can individually respect its own margin cap while the
+      // account's pre-existing balance was smaller than the sum of all
+      // their margins (leverage means margin used need not equal current
+      // balance). ESMA negative balance protection requires the broker to
+      // absorb any such residual shortfall, not pursue the client for it --
+      // previously nothing detected or wrote this off anywhere in the
+      // codebase; a negative balance just sat there. Written off atomically
+      // in the same transaction as the settlement that caused it, with its
+      // own audited ledger entry (never a silent clamp).
+      if (newBalance.lessThan(0)) {
+        writeOffAmount = Math.abs(newBalance.toNumber());
+        await tx.walletAccount.update({
+          where: { userId: input.userId },
+          data:  { balance: new Decimal(0) },
+        });
+        newBalance = new Decimal(0);
+        console.warn(
+          `[settlement] NBP_WRITEOFF positionId=${input.positionId} userId=${input.userId} ` +
+          `amount=${writeOffAmount.toFixed(2)} — residual negative balance absorbed by broker`
+        );
+      }
+
       // ── 2c-e. Ledger legs 1-3 — batch INSERT (single round trip) ──────
       // Combining PNL_SETTLEMENT, COMMISSION, and MARGIN_RELEASE into one
       // createMany call reduces this transaction from ~10 sequential round
@@ -270,6 +315,19 @@ export class SettlementEngine {
             debitAccount:  `CLIENT_MARGIN:${input.userId}`,
             creditAccount: `CLIENT_FREE:${input.userId}`,
           },
+          ...(writeOffAmount > 0 ? [{
+            id:             randomUUID(),
+            userId:         input.userId,
+            currency:       "USD",
+            amount:         new Decimal(writeOffAmount),
+            type:           "NBP_WRITEOFF" as const,
+            reference:      input.positionId,
+            status:         "COMPLETED",
+            note:           `Negative balance protection write-off — balance after this settlement would have been -${writeOffAmount.toFixed(2)}, broker absorbs the shortfall (ESMA NBP)`,
+            runningBalance: newBalance,
+            debitAccount:   "BROKER_NBP_WRITEOFF",
+            creditAccount:  `CLIENT:${input.userId}`,
+          }] : []),
         ],
       });
 
@@ -316,6 +374,7 @@ export class SettlementEngine {
             marginUsedRequested: input.marginUsed,
             marginUsedReleased:  safeRelease,
             marginDiscrepancy:   discrepancy > 0.001 ? discrepancy : 0,
+            nbpWriteOff:         writeOffAmount > 0 ? writeOffAmount : 0,
           } as object,
         },
       });
@@ -348,6 +407,17 @@ export class SettlementEngine {
     }
     if (pnl.rawPnl < pnl.cappedPnl) {
       metrics.inc("negative_balance_clips_total");
+    }
+    if (writeOffAmount > 0) {
+      metrics.inc("nbp_writeoff_total");
+      metrics.observe("nbp_writeoff_amount_usd", writeOffAmount);
+      void alertManager.send({
+        type:     "NBP_WRITEOFF",
+        severity: "WARNING",
+        title:    "Negative Balance Write-Off",
+        message:  `User ${input.userId}'s balance went negative after settling position ${input.positionId} — broker absorbed ${writeOffAmount.toFixed(2)} USD (ESMA negative balance protection).`,
+        metadata: { userId: input.userId, positionId: input.positionId, writeOffAmount: writeOffAmount.toFixed(2) },
+      });
     }
 
     // ── 5. Emit domain events (non-blocking) ───────────────────────────────
@@ -392,6 +462,7 @@ export class SettlementEngine {
       netCredit,
       newBalance,
       pnlPercent:  pnl.pnlPercent,
+      writeOffAmount,
     };
   }
 
