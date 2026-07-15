@@ -8,6 +8,7 @@ import { metrics }          from "../gateway/metrics.js";
 import { reconciliationEngine } from "../settlement/reconciliation.engine.js";
 import { quoteCache }       from "../market-data/quote.cache.js";
 import { checkRequote }     from "./requote.policy.js";
+import { leverageGuard }    from "../risk-service/leverage.guard.js";
 import type { ExecutionRequest, ExecutionResult } from "../shared/contracts.js";
 import type { CancelToken }  from "./execution.queue.js";
 
@@ -175,14 +176,31 @@ export class ExecutionEngine {
     // a failure: releasing the unused portion of margin after a genuine partial
     // fill, which is a correct follow-up action on committed state, not a
     // rollback compensation).
+    // FASE 4.3 (RISK_ENGINE_FREEZE.md Bug #7): req.marginRequired/req.notional
+    // were computed by risk.engine.ts's preTradeCheck() at ORDER-REQUEST
+    // time, from the mid price -- but the real fill (above) executes at
+    // top-of-book (ask for BUY, bid for SELL) plus deterministic slippage,
+    // via fillEngine.fill(). The position's actual notional/margin must
+    // reflect what was actually filled, not a stale pre-trade estimate --
+    // recomputed here from execPrice, now that it's known, using the same
+    // pure formulas risk.engine.ts itself uses. This also means the margin
+    // LOCK below (and the exposure check further down, which already reads
+    // effectiveNotional) are now checked against the real requirement: if
+    // the real price makes the position more expensive than pre-approved
+    // and the client's free margin can't cover it, checkAndLockMargin's
+    // existing atomic check correctly rejects -- no separate rejection path
+    // needed, it was just being fed the wrong number before.
+    const realNotional       = leverageGuard.computeNotional(req.quantity, execPrice);
+    const realMarginRequired = leverageGuard.computeMarginRequired(realNotional, req.leverage);
+
     const isPartial      = fillResult.partialFill && fillResult.remainingQuantity > 0;
     const effectiveFill  = fillResult.filledQuantity;
     const effectiveMargin = isPartial
-      ? (fillResult.filledQuantity / req.quantity) * req.marginRequired
-      : req.marginRequired;
+      ? (fillResult.filledQuantity / req.quantity) * realMarginRequired
+      : realMarginRequired;
     const effectiveNotional = isPartial
-      ? (effectiveFill / req.quantity) * req.notional
-      : req.notional;
+      ? (effectiveFill / req.quantity) * realNotional
+      : realNotional;
 
     type TxOutcome =
       | { ok: true; positionId: string; newFilledQty: number; originalQty: number;
@@ -196,7 +214,7 @@ export class ExecutionEngine {
         // FOR UPDATE on the wallet row (inside margin.controller.ts) serializes
         // concurrent margin-lock attempts per user under this same transaction.
         const marginLock = await marginController.checkAndLockMargin(
-          req.userId, req.orderId, req.marginRequired, tx,
+          req.userId, req.orderId, realMarginRequired, tx,
         );
         if (!marginLock.ok) {
           return { ok: false as const, reason: marginLock.reason };
@@ -335,7 +353,7 @@ export class ExecutionEngine {
     // committed, this is a legitimate follow-up release of already-settled
     // state, not a rollback compensation for a failure.
     if (isPartial) {
-      const unusedMargin = req.marginRequired - effectiveMargin;
+      const unusedMargin = realMarginRequired - effectiveMargin;
       if (unusedMargin > 0.01) {
         await releaseMarginWithRetry(req.userId, req.orderId, unusedMargin);
       }
@@ -378,7 +396,7 @@ export class ExecutionEngine {
         side:             req.side,
         quantity:         effectiveFill,
         averageFillPrice: execPrice,
-        marginRequired:   req.marginRequired,
+        marginRequired:   realMarginRequired,
         notional:         effectiveNotional,
         leverage:         req.leverage,
         timestamp:        ts,
@@ -387,7 +405,7 @@ export class ExecutionEngine {
       eventBus.emit("wallet.event", {
         userId:    req.userId,
         type:      "MARGIN_LOCK",
-        amount:    req.marginRequired,
+        amount:    realMarginRequired,
         reference: req.orderId,
         timestamp: ts,
       });
