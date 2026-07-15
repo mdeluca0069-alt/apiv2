@@ -27,8 +27,8 @@ const { mockDb } = vi.hoisted(() => ({
 }));
 vi.mock("../shared/db.js", () => ({ prisma: mockDb, IS_PERSISTENT: true }));
 
-const { mockQuoteGet } = vi.hoisted(() => ({ mockQuoteGet: vi.fn() }));
-vi.mock("../market-data/quote.cache.js", () => ({ quoteCache: { get: mockQuoteGet } }));
+const { mockQuoteGet, mockIsStale } = vi.hoisted(() => ({ mockQuoteGet: vi.fn(), mockIsStale: vi.fn() }));
+vi.mock("../market-data/quote.cache.js", () => ({ quoteCache: { get: mockQuoteGet, isStale: mockIsStale } }));
 
 vi.mock("../liquidity-engine/broker.spread.config.js", () => ({
   brokerSpreadConfig: { isEnabled: vi.fn().mockReturnValue(true) },
@@ -78,6 +78,7 @@ function makeSettleMock(startingBalance: number, marginByPositionId: Record<stri
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockIsStale.mockReturnValue(false);
 });
 
 describe("StopOutEngine.checkUser() — minimal necessary liquidation", () => {

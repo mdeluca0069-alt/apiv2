@@ -23,8 +23,8 @@ const { mockDb } = vi.hoisted(() => ({
 }));
 vi.mock("../shared/db.js", () => ({ prisma: mockDb, IS_PERSISTENT: true }));
 
-const { mockQuoteGet } = vi.hoisted(() => ({ mockQuoteGet: vi.fn() }));
-vi.mock("../market-data/quote.cache.js", () => ({ quoteCache: { get: mockQuoteGet } }));
+const { mockQuoteGet, mockIsStale } = vi.hoisted(() => ({ mockQuoteGet: vi.fn(), mockIsStale: vi.fn() }));
+vi.mock("../market-data/quote.cache.js", () => ({ quoteCache: { get: mockQuoteGet, isStale: mockIsStale } }));
 
 const { mockIsEnabled } = vi.hoisted(() => ({ mockIsEnabled: vi.fn() }));
 vi.mock("../liquidity-engine/broker.spread.config.js", () => ({
@@ -67,6 +67,7 @@ function makePosition(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   mockIsEnabled.mockReturnValue(true);
+  mockIsStale.mockReturnValue(false);
   mockSettle.mockResolvedValue({ cappedPnl: -1_000, newBalance: decimalLike(0) });
 });
 

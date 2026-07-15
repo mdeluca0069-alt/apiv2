@@ -52,6 +52,9 @@ export type StopOutResult = {
   /** FASE 4.2 (Bug #3): positions skipped because their symbol is currently
    *  halted -- only meaningful for action="STOP_OUT". */
   skippedHalted?: number;
+  /** FASE 4.2 (Bug #5): positions skipped because their symbol's quote is
+   *  stale or missing -- only meaningful for action="STOP_OUT". */
+  skippedStale?: number;
 };
 
 export type StopOutScanReport = {
@@ -160,18 +163,27 @@ export class StopOutEngine {
     const locked    = wallet.locked.toNumber();
 
     // Compute live unrealised P&L for each position
+    // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #5): a stale quote is exactly as
+    // untrustworthy as a missing one for this purpose (the underlying feed
+    // is silently dead) -- treat it the same way, falling back to
+    // pnl=0/markPrice=entryPrice like the pre-existing no-quote case,
+    // rather than computing a real money-moving decision from a price that
+    // may be minutes or hours old. `staleOrMissing` is carried through so
+    // the liquidation loop below never actually closes a position at that
+    // untrustworthy price either.
     let totalUnrealized = 0;
     const positionsWithPnl = positions.map((pos) => {
       const quote = quoteCache.get(pos.symbol);
+      const staleOrMissing = !quote || quoteCache.isStale(pos.symbol);
       let pnl = 0;
       let markPrice = pos.entryPrice.toNumber();
-      if (quote) {
+      if (quote && !staleOrMissing) {
         markPrice = pos.side === "BUY" ? quote.bid : quote.ask;
         const direction = pos.side === "BUY" ? 1 : -1;
         pnl = (markPrice - pos.entryPrice.toNumber()) * pos.quantity.toNumber() * direction;
       }
       totalUnrealized += pnl;
-      return { ...pos, pnl, markPrice };
+      return { ...pos, pnl, markPrice, staleOrMissing };
     });
 
     const equity      = balance + totalUnrealized;
@@ -229,6 +241,7 @@ export class StopOutEngine {
     let liquidated     = 0;
     let totalPnl       = 0;
     let skippedHalted  = 0;
+    let skippedStale   = 0;
     let runningBalance    = balance;
     let runningUnrealized = totalUnrealized;
     let runningMarginUsed = marginUsed;
@@ -237,6 +250,18 @@ export class StopOutEngine {
       const runningEquity = runningBalance + runningUnrealized;
       const runningLevel  = runningMarginUsed > 0 ? (runningEquity / runningMarginUsed) * 100 : Infinity;
       if (runningLevel >= STOP_OUT_PCT) break; // recovered — minimal necessary closure done
+
+      // FASE 4.2 Bug #5: a stale or missing quote is untrustworthy for a
+      // real money-moving decision -- pos.markPrice already fell back to
+      // entryPrice above (zero computed P&L), which is fine for the
+      // margin-level estimate but must never be used as an actual exit
+      // price. Skip; the position is re-evaluated fresh on the next 30s
+      // scan / tick, same as the requote/staleness protections already
+      // applied to normal MARKET orders elsewhere in this codebase.
+      if (pos.staleOrMissing) {
+        skippedStale++;
+        continue;
+      }
 
       // FASE 4.2 Bug #3: a halted symbol's live price is exactly the price
       // the circuit breaker flagged as anomalous (or an admin flagged as
@@ -312,12 +337,14 @@ export class StopOutEngine {
           positionsClosed: liquidated,
           totalPnl,
           skippedHalted,
+          skippedStale,
         } as object,
       },
     });
 
     metrics.inc("stop_out_events_total");
     if (skippedHalted > 0) metrics.inc("stop_out_skipped_halted_total", skippedHalted);
+    if (skippedStale > 0)  metrics.inc("stop_out_skipped_stale_total", skippedStale);
     eventBus.emit("risk.stop_out", {
       userId, marginLevel, equity, marginUsed,
       positionsClosed: liquidated, totalPnl,
@@ -325,7 +352,8 @@ export class StopOutEngine {
     });
 
     console.warn(`[stop-out] userId=${userId} marginLevel=${marginLevel.toFixed(1)}% closed=${liquidated} totalPnl=${totalPnl}` +
-      (skippedHalted > 0 ? ` skippedHalted=${skippedHalted}` : ""));
+      (skippedHalted > 0 ? ` skippedHalted=${skippedHalted}` : "") +
+      (skippedStale > 0  ? ` skippedStale=${skippedStale}`   : ""));
 
     // Alert on stop-out — individual stop-outs are WARNING; wave detection in scanAll()
     void alertManager.send({
@@ -336,7 +364,7 @@ export class StopOutEngine {
       metadata: { userId, marginLevel: marginLevel.toFixed(2), positions: liquidated, totalPnl: totalPnl.toFixed(2) },
     });
 
-    return { userId, marginLevel, action: "STOP_OUT", liquidated, totalPnl, triggeredAt, skippedHalted };
+    return { userId, marginLevel, action: "STOP_OUT", liquidated, totalPnl, triggeredAt, skippedHalted, skippedStale };
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
