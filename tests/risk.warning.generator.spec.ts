@@ -17,7 +17,7 @@ const {
   mockGetMarginState, mockPositionFindMany, mockWalletFindUnique,
   mockInstrumentFindMany, mockCreateOrUpdateWarning,
   mockKillSwitchIsActive, mockKillSwitchGetState, mockIsSuspended,
-  mockPositionFindManyDistinct,
+  mockPositionFindManyDistinct, mockGetSnapshot,
 } = vi.hoisted(() => ({
   mockGetMarginState: vi.fn(),
   mockPositionFindMany: vi.fn(),
@@ -28,7 +28,19 @@ const {
   mockKillSwitchGetState: vi.fn().mockReturnValue({ active: false, reason: "" }),
   mockIsSuspended: vi.fn().mockReturnValue(false),
   mockPositionFindManyDistinct: vi.fn().mockResolvedValue([]),
+  mockGetSnapshot: vi.fn(),
 }));
+
+/** FASE 4.3 (Bug #8): riskScore now comes from riskSnapshotService's
+ *  canonical composite formula, not a second independent one computed
+ *  inline here -- these tests control it directly instead of re-deriving
+ *  risk.snapshot.service.ts's own weighted formula. */
+function mockSnapshot(riskScore: number) {
+  return {
+    riskScore, marginLevelPct: 0, leverage: 0, marginUtilization: 0,
+    concentrationRisk: 0, varEstimate: 0, maxDrawdown: 0, stopOutDistance: 0,
+  };
+}
 
 vi.mock("../shared/db.js", () => ({
   IS_PERSISTENT: true,
@@ -53,6 +65,9 @@ vi.mock("../shared/trading.suspension.js", () => ({
 vi.mock("../risk-service/risk.warning.service.js", () => ({
   riskWarningService: { createOrUpdateWarning: mockCreateOrUpdateWarning },
 }));
+vi.mock("../risk-service/risk.snapshot.service.js", () => ({
+  riskSnapshotService: { getSnapshot: mockGetSnapshot },
+}));
 
 const { RiskWarningGenerator } = await import("../risk-service/risk.warning.generator.js");
 
@@ -61,6 +76,7 @@ beforeEach(() => {
   mockKillSwitchIsActive.mockReturnValue(false);
   mockIsSuspended.mockReturnValue(false);
   mockInstrumentFindMany.mockResolvedValue([]);
+  mockGetSnapshot.mockResolvedValue(mockSnapshot(0)); // default for tests that don't care about the exact score
 });
 
 describe("RiskWarningGenerator.generateForUser", () => {
@@ -71,6 +87,7 @@ describe("RiskWarningGenerator.generateForUser", () => {
     });
     mockPositionFindMany.mockResolvedValue([]);
     mockWalletFindUnique.mockResolvedValue({ balance: dec(10_000) });
+    mockGetSnapshot.mockResolvedValue(mockSnapshot(0));
 
     const gen = new RiskWarningGenerator();
     await gen.generateForUser("user-1");
@@ -91,6 +108,7 @@ describe("RiskWarningGenerator.generateForUser", () => {
     });
     mockPositionFindMany.mockResolvedValue([]);
     mockWalletFindUnique.mockResolvedValue({ balance: dec(100) });
+    mockGetSnapshot.mockResolvedValue(mockSnapshot(100));
 
     const gen = new RiskWarningGenerator();
     await gen.generateForUser("user-1");
@@ -99,6 +117,23 @@ describe("RiskWarningGenerator.generateForUser", () => {
     expect(payload.severity).toBe("CRITICAL");
     expect(payload.regulatoryLevel).toBe("high_risk");
     expect(payload.riskScore).toBe(100);
+  });
+
+  it("passes through riskSnapshotService's canonical riskScore verbatim, whatever value it returns", async () => {
+    mockGetMarginState.mockResolvedValue({
+      userId: "user-1", balance: 3_000, equity: 3_000, marginUsed: 900,
+      freeMargin: 2_100, marginLevelPct: 333, unrealizedPnl: 0,
+    });
+    mockPositionFindMany.mockResolvedValue([]);
+    mockWalletFindUnique.mockResolvedValue({ balance: dec(3_000) });
+    mockGetSnapshot.mockResolvedValue(mockSnapshot(42)); // an arbitrary composite score
+
+    const gen = new RiskWarningGenerator();
+    await gen.generateForUser("user-1");
+
+    expect(mockGetSnapshot).toHaveBeenCalledWith("user-1");
+    const payload = mockCreateOrUpdateWarning.mock.calls[0]![0];
+    expect(payload.riskScore).toBe(42);
   });
 
   it("aggregates real open positions into portfolioAggregate and exposureHeatmap by real asset class", async () => {
@@ -154,5 +189,6 @@ describe("RiskWarningGenerator.generateForUser", () => {
     await gen.generateForUser("user-x");
 
     expect(mockCreateOrUpdateWarning).not.toHaveBeenCalled();
+    expect(mockGetSnapshot).not.toHaveBeenCalled();
   });
 });

@@ -25,6 +25,7 @@ import { marginController } from "./margin.controller.js";
 import { killSwitch } from "./kill.switch.js";
 import { tradingSuspension } from "../shared/trading.suspension.js";
 import { riskWarningService } from "./risk.warning.service.js";
+import { riskSnapshotService } from "./risk.snapshot.service.js";
 import { ESMA_LEVERAGE_CAPS } from "../shared/contracts.js";
 
 const STOP_OUT_LEVEL_PCT    = 50;
@@ -99,13 +100,22 @@ export class RiskWarningGenerator {
     const negativeBalanceActive = (wallet?.balance.toNumber() ?? 0) < 0;
     const liveTradeDisabled     = killSwitch.isActive() || tradingSuspension.isSuspended(userId);
 
-    // ── Risk score / severity / regulatory level — real, derived from real margin level ──
-    // 0 at/above the caution threshold, rising to 100 at/below stop-out — a
-    // direct, monotonic function of the same marginLevelPct every other
-    // margin-call/stop-out check in this codebase already uses.
-    const riskScore = Math.round(
-      Math.max(0, Math.min(100, ((CAUTION_LEVEL_PCT - marginLevel) / (CAUTION_LEVEL_PCT - STOP_OUT_LEVEL_PCT)) * 100)),
-    );
+    // ── Risk score / severity / regulatory level ──────────────────────────
+    // FASE 4.3 (RISK_ENGINE_FREEZE.md Bug #8): this used to compute its own
+    // second, independent riskScore formula (a pure linear function of
+    // marginLevelPct alone) -- risk.snapshot.service.ts's getSnapshot()
+    // already computes the real composite score (margin level, drawdown,
+    // concentration, margin utilisation), and the two could disagree for
+    // the same user at the same time depending on which endpoint was
+    // queried. riskSnapshotService is the canonical source now; this
+    // generator reuses its riskScore instead of a second formula, matching
+    // this file's own stated design philosophy (see header) of deriving
+    // fields from already-correct services rather than reinventing them.
+    // severity/regulatoryLevel below stay their own direct, monotonic
+    // function of marginLevelPct -- that's a genuinely distinct concept
+    // (ESMA's three named thresholds), not a second riskScore.
+    const snapshot  = await riskSnapshotService.getSnapshot(userId);
+    const riskScore = snapshot.riskScore;
     const regulatoryLevel: "none" | "caution" | "high_risk" =
       marginLevel <= MARGIN_CALL_LEVEL_PCT ? "high_risk" :
       marginLevel <= CAUTION_LEVEL_PCT     ? "caution"   : "none";
