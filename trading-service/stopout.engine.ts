@@ -1,23 +1,30 @@
 /**
  * StopOutEngine — ESMA-compliant margin call and stop-out liquidation.
  *
- * ESMA rules (MiFID II / CFD regulation):
+ * ESMA rules (MiFID II / CFD regulation, Product Intervention Decision
+ * 2018/796):
  *   - Retail clients: mandatory stop-out at 50% margin level.
  *   - Margin level = (equity / marginUsed) × 100.
- *   - When level drops below 50%, ALL open positions must be liquidated,
- *     starting with the position with the largest unrealised loss.
+ *   - When level drops below 50%, close one or more positions -- starting
+ *     with the largest unrealised loss -- on terms most favourable to the
+ *     client, stopping as soon as margin level has recovered back to 50%.
+ *     FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #4): this used to unconditionally
+ *     close every open position regardless of whether fewer would have
+ *     sufficed -- ESMA's rule is minimal necessary closure, not "close
+ *     everything."
  *
  * Architecture:
  *   - Runs on a scheduled loop (every 30 seconds in main.ts).
  *   - For each user with open positions: compute live equity + margin level.
- *   - If level < STOP_OUT_PCT: liquidate all positions via SettlementEngine.
+ *   - If level < STOP_OUT_PCT: liquidate positions, largest loss first,
+ *     until margin level recovers above STOP_OUT_PCT.
  *   - Each liquidation is a real DB transaction (atomic, auditable).
  *   - Writes AuditLog, increments metrics counters, emits WebSocket event.
  *
  * Warning levels:
  *   150% → WARNING (notify client)
  *   120% → MARGIN_CALL (restrict new positions)
- *    50% → STOP_OUT (liquidate all)
+ *    50% → STOP_OUT (liquidate the minimal necessary positions)
  */
 
 import { randomUUID }         from "node:crypto";
@@ -205,31 +212,49 @@ export class StopOutEngine {
       return { userId, marginLevel, action: "MARGIN_CALL", liquidated: 0, totalPnl: 0, triggeredAt };
     }
 
-    // ── STOP-OUT: liquidate all positions ─────────────────────────────────────
+    // ── STOP-OUT: liquidate the minimal necessary positions ───────────────────
+    //
+    // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #4): ESMA's actual rule (Product
+    // Intervention Decision 2018/796) is to close "one or more [positions]...
+    // on terms most favourable to the client" once margin level drops below
+    // 50% -- not unconditionally close everything. Closing more than needed
+    // needlessly crystallises profitable positions the client didn't choose
+    // to exit and charges avoidable commission. So: close the largest-loss
+    // position first (as before), but re-check margin level after each close
+    // and stop as soon as it has recovered back to the 50% floor.
 
     // Sort by largest unrealised loss first (most adverse position closed first)
     const sorted = [...positionsWithPnl].sort((a, b) => a.pnl - b.pnl);
 
-    let liquidated = 0;
-    let totalPnl   = 0;
-    let skippedHalted = 0;
+    let liquidated     = 0;
+    let totalPnl       = 0;
+    let skippedHalted  = 0;
+    let runningBalance    = balance;
+    let runningUnrealized = totalUnrealized;
+    let runningMarginUsed = marginUsed;
 
     for (const pos of sorted) {
-      // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #3): a halted symbol's live
-      // price is exactly the price the circuit breaker flagged as anomalous
-      // (or an admin flagged as untradeable) — force-closing an existing
-      // position against it is the same mistake the halt exists to prevent
-      // for new orders. Skip it; the recovery sweep once the halt clears
-      // (or the next 30s/tick-level check) will catch it if the user is
-      // still below the stop-out floor then. Other positions for this same
-      // user on non-halted symbols are still liquidated normally.
+      const runningEquity = runningBalance + runningUnrealized;
+      const runningLevel  = runningMarginUsed > 0 ? (runningEquity / runningMarginUsed) * 100 : Infinity;
+      if (runningLevel >= STOP_OUT_PCT) break; // recovered — minimal necessary closure done
+
+      // FASE 4.2 Bug #3: a halted symbol's live price is exactly the price
+      // the circuit breaker flagged as anomalous (or an admin flagged as
+      // untradeable) — force-closing an existing position against it is the
+      // same mistake the halt exists to prevent for new orders. Skip it;
+      // the recovery sweep once the halt clears (or the next 30s/tick-level
+      // check) will catch it if the user is still below the floor then.
       if (!brokerSpreadConfig.isEnabled(pos.symbol)) {
         skippedHalted++;
         continue;
       }
 
+      // Only the settlement call itself is try/caught -- bookkeeping below
+      // runs unconditionally once settle() has genuinely succeeded, so a
+      // problem there can never be mislabeled as a settlement failure.
+      let result: Awaited<ReturnType<typeof settlementEngine.settle>>;
       try {
-        const result = await settlementEngine.settle({
+        result = await settlementEngine.settle({
           positionId: pos.id,
           userId,
           symbol:     pos.symbol,
@@ -243,17 +268,32 @@ export class StopOutEngine {
           reason:     "STOP_OUT",
           detail:     `Stop-out triggered at margin level ${marginLevel.toFixed(1)}% (ESMA floor: ${STOP_OUT_PCT}%)`,
         });
-
-        totalPnl += result.cappedPnl;
-        liquidated++;
       } catch (err) {
         if (err instanceof PositionAlreadyClosedError) {
-          // Closed concurrently by SL/TP tick or another stop-out sweep — not an error.
-          liquidated++; // count it; the other path handled the settlement
+          // Closed concurrently by SL/TP tick or another stop-out sweep — not
+          // an error. We don't know the exact balance delta the other path
+          // applied, so runningBalance is left as-is here (conservative: may
+          // cause one extra position to be evaluated this sweep, never fewer
+          // than actually needed) -- but the position's margin/P&L no longer
+          // apply either way, since it is now closed.
+          liquidated++;
+          runningUnrealized -= pos.pnl;
+          runningMarginUsed -= pos.marginUsed.toNumber();
         } else {
           console.error(`[stop-out] Failed to settle position ${pos.id}:`, (err as Error).message);
         }
+        continue;
       }
+
+      totalPnl += result.cappedPnl;
+      liquidated++;
+      // Track the effect of this closure without re-querying the DB: the
+      // authoritative new balance comes straight from the settlement
+      // result; this position's floating P&L and margin no longer count
+      // toward the running equity/margin-level once it's closed.
+      runningBalance     = result.newBalance.toNumber();
+      runningUnrealized -= pos.pnl;
+      runningMarginUsed -= pos.marginUsed.toNumber();
     }
 
     // Audit + snapshot

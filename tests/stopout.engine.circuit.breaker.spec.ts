@@ -67,7 +67,7 @@ function makePosition(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   mockIsEnabled.mockReturnValue(true);
-  mockSettle.mockResolvedValue({ cappedPnl: -1_000 });
+  mockSettle.mockResolvedValue({ cappedPnl: -1_000, newBalance: decimalLike(0) });
 });
 
 describe("StopOutEngine.checkUser() — circuit breaker position protection", () => {
