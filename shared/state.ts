@@ -4,6 +4,8 @@ import { hashPassword as argon2Hash } from "../auth-service/password.hasher.js";
 import { LiquidityProvider, type LiquidityBook } from "../liquidity-engine/liquidity.provider.js";
 import { quoteCache } from "../market-data/quote.cache.js";
 import { eventBus } from "../events-bus/event.bus.js";
+import { metrics } from "../gateway/metrics.js";
+import { WalletRepository } from "../wallet-service/wallet.repository.js";
 import {
   type AiSignal,
   type AssetClass,
@@ -1379,7 +1381,7 @@ export class BrokerState {
     return next;
   }
 
-  adminAllocateCapital(actor: Principal, input: { userId: string; amount: number; note: string }): BrokerClientAccount {
+  async adminAllocateCapital(actor: Principal, input: { userId: string; amount: number; note: string }): Promise<BrokerClientAccount> {
     const account = this.ensureClientAccount(input.userId);
     const entry: LedgerEntryRecord = {
       id: randomUUID(),
@@ -1390,15 +1392,38 @@ export class BrokerState {
       reference: "BROKER_CONTROL_CENTER",
       note: input.note,
     };
+
+    if (this.prisma) {
+      // LEDGER_FREEZE.md §0.1: the real balance mutation goes through
+      // WalletRepository's atomic credit (Serializable tx, real double-entry)
+      // instead of a blind overwrite of WalletAccount.balance derived from
+      // this class's own in-memory ledger — that overwrite already caused
+      // real wallet/ledger divergence in production (see the workaround
+      // comments in gateway/routes.ts and settlement/reconciliation.engine.ts
+      // that exist specifically because of this legacy path). Runs before any
+      // in-memory/audit state is touched, so a DB failure here (e.g. no
+      // wallet yet) never leaves a phantom allocation recorded locally.
+      const repo = new WalletRepository(this.prisma);
+      await repo.getOrCreate(input.userId);
+      await repo.credit(input.userId, input.amount, "ADMIN_CAPITAL_ALLOCATION", `ADMIN:${entry.id}`, input.note);
+      eventBus.emit("wallet.event", {
+        userId: input.userId, type: "CREDIT", amount: input.amount,
+        reference: `ADMIN:${entry.id}`, timestamp: entry.createdAt,
+      });
+      metrics.inc("igfx_deposits_total");
+      metrics.observe("igfx_deposit_amount_usd", input.amount);
+    } else {
+      void this.persistLedgerEntry(input.userId, entry);
+    }
+
     const next = this.recalculateClientAccount({ ...account, ledger: [entry, ...account.ledger] });
     this.clientAccounts.set(input.userId, next);
-    void this.persistLedgerEntry(input.userId, entry);
-    void this.persistWalletBalance(input.userId, next.capital.allocated);
+    if (!this.prisma) void this.persistWalletBalance(input.userId, next.capital.allocated);
     this.recordAudit(actor.sub, "admin.capital_allocated", "client_account", { userId: input.userId, entry });
     return next;
   }
 
-  adminWithdrawCapital(actor: Principal, input: { userId: string; amount: number; note: string }): BrokerClientAccount {
+  async adminWithdrawCapital(actor: Principal, input: { userId: string; amount: number; note: string }): Promise<BrokerClientAccount> {
     const account = this.ensureClientAccount(input.userId);
     const entry: LedgerEntryRecord = {
       id: randomUUID(),
@@ -1409,10 +1434,27 @@ export class BrokerState {
       reference: "BROKER_CONTROL_CENTER",
       note: input.note,
     };
+
+    if (this.prisma) {
+      // Same reasoning as adminAllocateCapital above — atomic debit through
+      // WalletRepository (which also, as a direct consequence of using the
+      // correct primitive, now genuinely rejects withdrawing more than the
+      // real balance instead of silently overwriting it with an unchecked
+      // figure) instead of a blind, non-transactional overwrite.
+      const repo = new WalletRepository(this.prisma);
+      await repo.debit(input.userId, input.amount, "WITHDRAW_REQUEST", `ADMIN:${entry.id}`, input.note);
+      eventBus.emit("wallet.event", {
+        userId: input.userId, type: "DEBIT", amount: input.amount,
+        reference: `ADMIN:${entry.id}`, timestamp: entry.createdAt,
+      });
+      metrics.inc("igfx_withdrawals_total");
+    } else {
+      void this.persistLedgerEntry(input.userId, entry);
+    }
+
     const next = this.recalculateClientAccount({ ...account, ledger: [entry, ...account.ledger] });
     this.clientAccounts.set(input.userId, next);
-    void this.persistLedgerEntry(input.userId, entry);
-    void this.persistWalletBalance(input.userId, next.capital.allocated);
+    if (!this.prisma) void this.persistWalletBalance(input.userId, next.capital.allocated);
     this.recordAudit(actor.sub, "admin.capital_withdrawn", "client_account", { userId: input.userId, entry });
     return next;
   }
