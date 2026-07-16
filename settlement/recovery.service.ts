@@ -214,6 +214,13 @@ export class RecoveryService {
     });
 
     for (const order of stuckOrders) {
+      // LEDGER_FREEZE.md §0.3: this used to be inferred as `order.status ===
+      // "ACCEPTED"` when writing the audit record below -- true whenever a
+      // release was ATTEMPTED, even if the transaction below threw and
+      // never actually ran. Track the real outcome instead, so the audit
+      // trail can never assert a margin release that didn't happen.
+      let marginReleased = false;
+
       // For ACCEPTED orders: margin may have been locked. Check if a position
       // exists — if not, release margin (it's orphaned).
       if (order.status === "ACCEPTED") {
@@ -263,11 +270,14 @@ export class RecoveryService {
                     creditAccount: `CLIENT_FREE:${order.userId}`,
                   },
                 });
+                marginReleased = true; // only reached if both writes above actually committed
               }, { maxWait: 10000, timeout: 15000 });
-              console.warn(
-                `[recovery] released margin for stuck ACCEPTED order ${order.id} ` +
-                `userId=${order.userId} amount=${margReq.toFixed(2)}`
-              );
+              if (marginReleased) {
+                console.warn(
+                  `[recovery] released margin for stuck ACCEPTED order ${order.id} ` +
+                  `userId=${order.userId} amount=${margReq.toFixed(2)}`
+                );
+              }
             } catch (err) {
               console.error(
                 `[recovery] failed to release margin for stuck order ${order.id}:`,
@@ -296,7 +306,7 @@ export class RecoveryService {
           payload: {
             stuckStatus: order.status,
             age:         Date.now() - order.createdAt.getTime(),
-            marginReleased: order.status === "ACCEPTED",
+            marginReleased,
           } as object,
         },
       });
