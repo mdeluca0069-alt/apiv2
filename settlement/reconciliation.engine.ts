@@ -33,6 +33,8 @@ import { prisma }              from "../shared/db.js";
 import { metrics }             from "../gateway/metrics.js";
 import { alertManager }        from "../alerting/alert.manager.js";
 import { DistributedJobLock }  from "../shared/distributed.job.lock.js";
+import { eventBus }            from "../events-bus/event.bus.js";
+import { notificationRouter }  from "../notification-service/notification.router.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -336,12 +338,36 @@ export class ReconciliationEngine {
           creditAccount: `CLIENT_FREE:${userId}`,
         },
       });
+      // LEDGER_FREEZE.md §0.2: this is the system's own autonomous self-
+      // correction of a client's balance -- it needs an audit trail at least
+      // as complete as an ordinary user-initiated action, not less. Same
+      // action/actor shape as recovery.service.ts's equivalent startup-time
+      // repair (the one branch already doing this right).
+      await tx.auditLog.create({
+        data: {
+          id:      randomUUID(),
+          actor:   "SYSTEM_RECONCILIATION",
+          action:  "margin.orphan_released",
+          entity:  userId,
+          payload: { orphanAmount: orphan, locked: currentLocked, positionTotal, repairedAt } as object,
+        },
+      });
       released = orphan;
     }, { maxWait: 10000, timeout: 15000 });
 
     if (released > 0.01) {
       metrics.inc("reconciliation_orphan_margin_repaired_total");
       console.warn(`[reconciliation] repaired orphan margin userId=${userId} released=${released.toFixed(2)}`);
+      eventBus.emit("wallet.event", {
+        userId, type: "MARGIN_RELEASE", amount: released,
+        reference: `RECON:${repairedAt}`, timestamp: repairedAt,
+      });
+      void notificationRouter.sendAll(
+        userId, "margin", "NORMAL",
+        "Margine bloccato rilasciato automaticamente",
+        `Una verifica di riconciliazione ha rilasciato ${released.toFixed(2)} USD di margine bloccato non più associato a posizioni aperte.`,
+        { orphanAmount: released, repairedAt },
+      );
     }
     return released;
   }
