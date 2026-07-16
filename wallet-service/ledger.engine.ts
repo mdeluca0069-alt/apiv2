@@ -81,7 +81,7 @@ export class LedgerEngine {
     return { status: "PENDING_ADMIN", entryId: id, reference };
   }
 
-  async approveDeposit(userId: string, amount: number, depositReference: string): Promise<void> {
+  async approveDeposit(userId: string, amount: number, depositReference: string, adminId: string): Promise<void> {
     await this.repo.getOrCreate(userId);
 
     // Both the credit and the status update must succeed or fail together.
@@ -121,6 +121,19 @@ export class LedgerEngine {
       await tx.ledgerEntry.updateMany({
         where: { userId, reference: depositReference, type: "DEPOSIT_REQUEST" },
         data:  { status: "APPROVED" },
+      });
+
+      // LEDGER_FREEZE.md §0.5: same gap as approveWithdrawal (§0.4) -- an
+      // admin crediting a manual deposit (e.g. a bank wire) left zero audit
+      // trail of which admin moved the money in, unlike rejectDeposit().
+      await tx.auditLog.create({
+        data: {
+          id:      randomUUID(),
+          actor:   adminId,
+          action:  "deposit.approved",
+          entity:  userId,
+          payload: { amount, reference: depositReference, newBalance: newBalance.toNumber() } as object,
+        },
       });
     }, { isolationLevel: "Serializable", maxWait: 10000, timeout: 15000 });
   }
