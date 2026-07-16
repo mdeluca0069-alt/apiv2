@@ -30,6 +30,22 @@ class ExposureHaltedError extends Error {
   constructor(detail: string) { super(detail); this.name = "ExposureHaltedError"; }
 }
 
+/** LEDGER_FREEZE.md §0.6: order.controller.ts's pre-trade rejection path
+ *  already emits this event (feeding Metrics/Notification/the durable event
+ *  archive); this engine's own REJECTED branches never did, so two
+ *  rejections producing an identical client-visible OrderAck had radically
+ *  different downstream completeness depending only on which layer
+ *  rejected. Same event shape, same call site pattern. */
+function emitOrderRejected(req: ExecutionRequest, reason: string): void {
+  eventBus.emit("order.rejected", {
+    orderId:   req.orderId,
+    userId:    req.userId,
+    symbol:    req.symbol,
+    reason,
+    timestamp: new Date().toISOString(),
+  });
+}
+
 // Retries releaseMargin up to 5 times with exponential backoff (50→800ms).
 // Prevents orphan wallet.locked when the connection pool is momentarily exhausted
 // during the window between checkAndLockMargin() committing and createPosition() completing.
@@ -114,11 +130,10 @@ export class ExecutionEngine {
     if (freshQuote) {
       const rq = checkRequote(req.symbol, req.side, quote, freshQuote);
       if (rq.requoted) {
-        await orderLifecycle.rejectOrder(
-          req.orderId,
-          `REQUOTE: price moved ${rq.movePct.toFixed(3)}% while your order was queued (tolerance ${rq.threshold}%) — please resubmit`,
-        );
+        const reason = `REQUOTE: price moved ${rq.movePct.toFixed(3)}% while your order was queued (tolerance ${rq.threshold}%) — please resubmit`;
+        await orderLifecycle.rejectOrder(req.orderId, reason);
         metrics.inc("requotes_total");
+        emitOrderRejected(req, reason);
         return { status: "REJECTED", orderId: req.orderId, reason: "REQUOTE" };
       }
     }
@@ -129,7 +144,9 @@ export class ExecutionEngine {
     try {
       fillResult = fillEngine.fill(req, quote);
     } catch (err) {
-      await orderLifecycle.rejectOrder(req.orderId, "Internal LP fill error — no liquidity");
+      const reason = "Internal LP fill error — no liquidity";
+      await orderLifecycle.rejectOrder(req.orderId, reason);
+      emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "LP_UNAVAILABLE" };
     }
 
@@ -144,18 +161,19 @@ export class ExecutionEngine {
     // construction), so this branch is currently unreachable in practice —
     // it exists for correctness once a future LP can genuinely partial-fill.
     if (req.type === "FOK" && fillResult.partialFill && fillResult.remainingQuantity > 0) {
-      await orderLifecycle.rejectOrder(
-        req.orderId,
-        `FOK_UNFILLABLE: only ${fillResult.filledQuantity}/${req.quantity} available immediately — Fill-Or-Kill requires the full quantity`,
-      );
+      const reason = `FOK_UNFILLABLE: only ${fillResult.filledQuantity}/${req.quantity} available immediately — Fill-Or-Kill requires the full quantity`;
+      await orderLifecycle.rejectOrder(req.orderId, reason);
       metrics.inc("fok_rejections_total");
+      emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "FOK_UNFILLABLE" };
     }
 
     // ── Cancel check A — before margin lock ──────────────────────────────
     // Order is ACCEPTED, no money committed. Clean abort.
     if (cancelled()) {
-      await orderLifecycle.rejectOrder(req.orderId, "EXECUTION_TIMEOUT: cancelled before margin lock");
+      const reason = "EXECUTION_TIMEOUT: cancelled before margin lock";
+      await orderLifecycle.rejectOrder(req.orderId, reason);
+      emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "EXECUTION_TIMEOUT" };
     }
 
@@ -328,18 +346,23 @@ export class ExecutionEngine {
     } catch (err) {
       if (err instanceof ExecutionCancelledError) {
         await orderLifecycle.rejectOrder(req.orderId, err.message);
+        emitOrderRejected(req, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: "EXECUTION_TIMEOUT" };
       }
       if (err instanceof ExposureHaltedError) {
         await orderLifecycle.rejectOrder(req.orderId, err.message);
+        emitOrderRejected(req, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: "INSTRUMENT_HALTED" };
       }
-      await orderLifecycle.rejectOrder(req.orderId, `Execution failed: ${(err as Error).message}`);
+      const reason = `Execution failed: ${(err as Error).message}`;
+      await orderLifecycle.rejectOrder(req.orderId, reason);
+      emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "LP_UNAVAILABLE" };
     }
 
     if (!outcome.ok) {
       await orderLifecycle.rejectOrder(req.orderId, outcome.reason);
+      emitOrderRejected(req, outcome.reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "MARGIN_INSUFFICIENT" };
     }
 
