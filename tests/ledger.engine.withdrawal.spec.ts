@@ -144,6 +144,12 @@ describe("LedgerEngine.approveWithdrawal() — authoritative equity re-check", (
 
     expect(db.walletAccount.update).toHaveBeenCalledTimes(1);
     expect(db.ledgerEntry.create).toHaveBeenCalledTimes(1);
+    // The balance must go DOWN by the withdrawn amount, never up -- this is
+    // exactly the direction the sign-inversion bug (see below) got backwards.
+    const updateArg  = db.walletAccount.update.mock.calls[0][0] as { data: { balance: { toNumber(): number } } };
+    expect(updateArg.data.balance.toNumber()).toBe(5_000); // 10,000 - 5,000
+    const ledgerArg  = db.ledgerEntry.create.mock.calls[0][0] as { data: { amount: { toNumber(): number } } };
+    expect(ledgerArg.data.amount.toNumber()).toBe(-5_000); // negative: money leaving the client's account
   });
 
   it("still throws INSUFFICIENT_BALANCE when raw balance itself is short, independent of the free-margin check", async () => {
@@ -182,5 +188,56 @@ describe("LedgerEngine.approveWithdrawal() — audit trail (Bug #4, LEDGER_FREEZ
     expect(entry.entity).toBe("user-1");
     expect(entry.payload.amount).toBe(5_000);
     expect(entry.payload.reference).toBe("ref-1");
+  });
+});
+
+describe("Withdrawal request → approve round trip — sign-inversion regression (discovered live, not in the original audit)", () => {
+  // requestWithdrawal() stores the PENDING_ADMIN LedgerEntry's amount as
+  // NEGATIVE (-input.amount). The admin-approve route reads that same row
+  // back and used to pass Number(entry.amount) -- i.e. the negative value --
+  // straight into approveWithdrawal(), which treats its `amount` parameter
+  // as a positive magnitude (balance.minus(amount), new Decimal(-amount)).
+  // The double negative made every approved withdrawal CREDIT the client
+  // instead of debiting them, and made the INSUFFICIENT_BALANCE /
+  // INSUFFICIENT_FREE_MARGIN checks unconditionally pass (a negative amount
+  // is never greater than a positive balance/freeMargin). Reproduced live
+  // via a real request+approve round trip against a running server before
+  // this fix. The route now does Math.abs(Number(entry.amount)) -- this
+  // test proves why: it re-derives the exact negative value
+  // requestWithdrawal() persists and confirms only the Math.abs()'d
+  // (positive) form produces a correct debit.
+  it("the amount requestWithdrawal() persists for admin review is negative", async () => {
+    const db = makeDb({ balance: 5_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.requestWithdrawal({ userId: "user-1", amount: 500, destination: "bank-1", method: "wire" });
+
+    expect(db.ledgerEntry.create).toHaveBeenCalledTimes(1);
+    const stored = db.ledgerEntry.create.mock.calls[0][0] as { data: { amount: number } };
+    expect(stored.data.amount).toBe(-500);
+  });
+
+  it("approveWithdrawal() given that same negative value unconverted would credit the client instead of debiting them (the bug, reproduced)", async () => {
+    const db = makeDb({ balance: 5_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+    const storedAmount = -500; // exactly what requestWithdrawal() persists
+
+    await engine.approveWithdrawal("user-1", storedAmount, "ref-1", "admin-1");
+
+    const updateArg = db.walletAccount.update.mock.calls[0][0] as { data: { balance: { toNumber(): number } } };
+    // 5,000 - (-500) = 5,500 -- balance goes UP for a "withdrawal". This is
+    // the exact defect; the route must never call approveWithdrawal() this way.
+    expect(updateArg.data.balance.toNumber()).toBe(5_500);
+  });
+
+  it("approveWithdrawal() given Math.abs() of that value (what the fixed route now passes) correctly debits the client", async () => {
+    const db = makeDb({ balance: 5_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+    const storedAmount = -500;
+
+    await engine.approveWithdrawal("user-1", Math.abs(storedAmount), "ref-1", "admin-1");
+
+    const updateArg = db.walletAccount.update.mock.calls[0][0] as { data: { balance: { toNumber(): number } } };
+    expect(updateArg.data.balance.toNumber()).toBe(4_500); // 5,000 - 500, correct direction
   });
 });

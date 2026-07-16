@@ -2761,7 +2761,15 @@ export const routes: Route[] = [
       }
 
       const engine = new LedgerEngine(db as NonNullable<typeof db>);
-      await engine.approveWithdrawal(entry.userId, Number(entry.amount), entry.reference, principal.sub);
+      // requestWithdrawal() stores this PENDING_ADMIN entry's amount as
+      // NEGATIVE (a signed ledger delta); approveWithdrawal() expects a
+      // positive magnitude (it negates internally when building its own
+      // COMPLETED entry) -- passing the signed value through unconverted
+      // made every approval add the withdrawal amount to the client's
+      // balance instead of subtracting it, and silently defeated both the
+      // INSUFFICIENT_BALANCE and INSUFFICIENT_FREE_MARGIN checks (a negative
+      // "amount" is never greater than a positive balance/freeMargin).
+      await engine.approveWithdrawal(entry.userId, Math.abs(Number(entry.amount)), entry.reference, principal.sub);
       return { ok: true };
     },
   },
