@@ -2761,7 +2761,7 @@ export const routes: Route[] = [
       }
 
       const engine = new LedgerEngine(db as NonNullable<typeof db>);
-      await engine.approveWithdrawal(entry.userId, Number(entry.amount), entry.reference);
+      await engine.approveWithdrawal(entry.userId, Number(entry.amount), entry.reference, principal.sub);
       return { ok: true };
     },
   },

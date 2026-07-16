@@ -166,7 +166,7 @@ export class LedgerEngine {
     return { status: "PENDING_ADMIN", message: "Withdrawal request submitted for review." };
   }
 
-  async approveWithdrawal(userId: string, amount: number, withdrawalReference: string): Promise<void> {
+  async approveWithdrawal(userId: string, amount: number, withdrawalReference: string, adminId: string): Promise<void> {
     // Both the debit and the status update must succeed or fail together.
     // Idempotency guard: if already approved, bail out without double-debiting.
     await this.db.$transaction(async (tx) => {
@@ -216,6 +216,20 @@ export class LedgerEngine {
       await tx.ledgerEntry.updateMany({
         where: { userId, reference: withdrawalReference, type: "WITHDRAW_REQUEST", status: "PENDING_ADMIN" },
         data:  { status: "APPROVED" },
+      });
+
+      // LEDGER_FREEZE.md §0.4: this is the one operation in the whole
+      // withdrawal flow that actually sends real client money out of the
+      // platform -- it had zero audit trail of which admin approved it,
+      // unlike rejectWithdrawal() below. Same action/actor shape.
+      await tx.auditLog.create({
+        data: {
+          id:      randomUUID(),
+          actor:   adminId,
+          action:  "withdrawal.approved",
+          entity:  userId,
+          payload: { amount, reference: withdrawalReference, newBalance: newBalance.toNumber() } as object,
+        },
       });
     }, { isolationLevel: "Serializable", maxWait: 10000, timeout: 15000 });
   }

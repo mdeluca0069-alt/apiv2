@@ -58,6 +58,9 @@ function makeDb(overrides: {
       findFirst:  vi.fn().mockResolvedValue(overrides.existingApproval ?? null),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
+    auditLog: {
+      create: vi.fn().mockResolvedValue({}),
+    },
   };
 
   return {
@@ -123,9 +126,10 @@ describe("LedgerEngine.approveWithdrawal() — authoritative equity re-check", (
     });
     const engine = new LedgerEngine(db as never);
 
-    await expect(engine.approveWithdrawal("user-1", 6_000, "ref-1")).rejects.toThrow("INSUFFICIENT_FREE_MARGIN");
+    await expect(engine.approveWithdrawal("user-1", 6_000, "ref-1", "admin-1")).rejects.toThrow("INSUFFICIENT_FREE_MARGIN");
     expect(db.walletAccount.update).not.toHaveBeenCalled();
     expect(db.ledgerEntry.create).not.toHaveBeenCalled();
+    expect(db.auditLog.create).not.toHaveBeenCalled();
   });
 
   it("approves and debits when equity-based free margin covers the amount", async () => {
@@ -136,7 +140,7 @@ describe("LedgerEngine.approveWithdrawal() — authoritative equity re-check", (
     });
     const engine = new LedgerEngine(db as never);
 
-    await engine.approveWithdrawal("user-1", 5_000, "ref-1");
+    await engine.approveWithdrawal("user-1", 5_000, "ref-1", "admin-1");
 
     expect(db.walletAccount.update).toHaveBeenCalledTimes(1);
     expect(db.ledgerEntry.create).toHaveBeenCalledTimes(1);
@@ -146,7 +150,8 @@ describe("LedgerEngine.approveWithdrawal() — authoritative equity re-check", (
     const db = makeDb({ balance: 100, locked: 0, openPositions: [] });
     const engine = new LedgerEngine(db as never);
 
-    await expect(engine.approveWithdrawal("user-1", 500, "ref-1")).rejects.toThrow("INSUFFICIENT_BALANCE");
+    await expect(engine.approveWithdrawal("user-1", 500, "ref-1", "admin-1")).rejects.toThrow("INSUFFICIENT_BALANCE");
+    expect(db.auditLog.create).not.toHaveBeenCalled();
   });
 
   it("is idempotent: a second approval for an already-COMPLETED reference is a no-op, no re-debit", async () => {
@@ -156,8 +161,26 @@ describe("LedgerEngine.approveWithdrawal() — authoritative equity re-check", (
     });
     const engine = new LedgerEngine(db as never);
 
-    await engine.approveWithdrawal("user-1", 5_000, "ref-1");
+    await engine.approveWithdrawal("user-1", 5_000, "ref-1", "admin-1");
 
     expect(db.walletAccount.update).not.toHaveBeenCalled();
+    expect(db.auditLog.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("LedgerEngine.approveWithdrawal() — audit trail (Bug #4, LEDGER_FREEZE.md §0.4)", () => {
+  it("writes an AuditLog row, inside the same transaction, recording which admin approved the outbound transfer", async () => {
+    const db = makeDb({ balance: 10_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveWithdrawal("user-1", 5_000, "ref-1", "admin-42");
+
+    expect(db.auditLog.create).toHaveBeenCalledTimes(1);
+    const entry = db.auditLog.create.mock.calls[0][0].data;
+    expect(entry.actor).toBe("admin-42");
+    expect(entry.action).toBe("withdrawal.approved");
+    expect(entry.entity).toBe("user-1");
+    expect(entry.payload.amount).toBe(5_000);
+    expect(entry.payload.reference).toBe("ref-1");
   });
 });
