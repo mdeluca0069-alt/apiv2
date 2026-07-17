@@ -4,6 +4,8 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../shared/db.js";
 import { quoteCache } from "../market-data/quote.cache.js";
 import { pnlCalculator } from "../trading-service/pnl.calculator.js";
+import { eventBus } from "../events-bus/event.bus.js";
+import { metrics } from "../gateway/metrics.js";
 import type { MarginState } from "../shared/contracts.js";
 
 /** See order.lifecycle.ts — same composability contract. */
@@ -156,6 +158,8 @@ export class MarginController {
    *   2. Clamp the release to the actual current locked amount (safe against orphan-release).
    */
   async releaseMargin(userId: string, positionId: string, amount: number): Promise<void> {
+    let released = 0;
+
     await prisma.$transaction(async (tx) => {
       const rows = await tx.$queryRaw<Array<{ locked: string }>>`
         SELECT locked FROM "WalletAccount" WHERE "userId" = ${userId} FOR UPDATE
@@ -184,7 +188,32 @@ export class MarginController {
           creditAccount: `CLIENT_FREE:${userId}`,
         },
       });
+
+      // LEDGER_FREEZE.md §0.7: this release (currently only reached from a
+      // genuine partial fill's unused-margin follow-up, see execution.engine.ts)
+      // had no Audit trail and no success Metrics at all -- only a failure
+      // counter existed, and only if every retry AND the fire-and-forget
+      // repair both failed.
+      await tx.auditLog.create({
+        data: {
+          id:      randomUUID(),
+          actor:   "SYSTEM_EXECUTION",
+          action:  "margin.released",
+          entity:  positionId,
+          payload: { userId, requested: amount, released: safeRelease } as object,
+        },
+      });
+
+      released = safeRelease;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 3000, timeout: 8000 });
+
+    if (released > 0) {
+      metrics.inc("partial_fill_margin_released_total");
+      eventBus.emit("wallet.event", {
+        userId, type: "MARGIN_RELEASE", amount: released,
+        reference: positionId, timestamp: new Date().toISOString(),
+      });
+    }
   }
 
   async updatePositionPnl(
