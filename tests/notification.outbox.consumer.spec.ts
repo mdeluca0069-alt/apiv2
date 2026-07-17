@@ -168,6 +168,28 @@ describe("NotificationOutboxConsumer.processPending()", () => {
     expect(mockTx.notification.upsert.mock.calls[0][0].create.body).toBe("Realized P&L: -18.25 USD");
   });
 
+  it("position.closed: mentions the write-off when negative balance protection absorbed part of the loss (FASE 5.2 Bug #8, LEDGER_FREEZE.md §0.8)", async () => {
+    mockDb.outboxEvent.findMany.mockResolvedValue([
+      { ...CLOSE_EVENT_LOSS, payload: { ...CLOSE_EVENT_LOSS.payload, nbpWriteOff: 25.5 } },
+    ]);
+
+    await notificationOutboxConsumer.processPending();
+
+    const body = mockTx.notification.upsert.mock.calls[0][0].create.body as string;
+    expect(body).toContain("-18.25 USD");
+    expect(body).toContain("25.50 USD");
+    expect(body.toLowerCase()).toContain("negative balance protection");
+  });
+
+  it("position.closed: no write-off mention when nbpWriteOff is 0 or absent", async () => {
+    mockDb.outboxEvent.findMany.mockResolvedValue([CLOSE_EVENT_WIN]);
+
+    await notificationOutboxConsumer.processPending();
+
+    const body = mockTx.notification.upsert.mock.calls[0][0].create.body as string;
+    expect(body).toBe("Realized P&L: +42.50 USD");
+  });
+
   it("an event missing userId is marked processed and skipped, never reaches the transaction", async () => {
     mockDb.outboxEvent.findMany.mockResolvedValue([
       { id: "outbox-no-user", eventType: "order.filled", userId: null, payload: {} },

@@ -66,6 +66,11 @@ type PositionClosedPayload = {
   entryPrice: number; quantity: number; leverage: number; openedAt: string;
   rawPnl: number; pnlPercent: number; commission: number; swap: number;
   marginUsedRequested: number; marginUsedReleased: number; marginDiscrepancy: number;
+  /** LEDGER_FREEZE.md §0.8: settlement.engine.ts always sends this (0 when no
+   *  write-off happened) — must be copied through to the durable audit trail,
+   *  never dropped, since the source OutboxEvent row is pruned a few hours
+   *  after processing and this is the only other place the fact survives. */
+  nbpWriteOff: number;
 };
 
 export type AuditConsumerResult = { processed: number; failed: number; skipped: number };
@@ -239,7 +244,7 @@ export class AuditOutboxConsumer {
               detail:    `${p.reason} close @ ${p.exitPrice}`,
               actor:     "SYSTEM",
             }]),
-            riskMetrics: JSON.stringify({ reason: p.reason, netCredit: p.netCredit }),
+            riskMetrics: JSON.stringify({ reason: p.reason, netCredit: p.netCredit, nbpWriteOff: p.nbpWriteOff }),
           },
         });
       }
@@ -264,6 +269,7 @@ export class AuditOutboxConsumer {
             marginUsedRequested: p.marginUsedRequested,
             marginUsedReleased:  p.marginUsedReleased,
             marginDiscrepancy:   p.marginDiscrepancy,
+            nbpWriteOff:         p.nbpWriteOff,
             reason:              p.reason,
             detail:              p.detail,
           } as object,

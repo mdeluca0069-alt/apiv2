@@ -87,6 +87,7 @@ const CLOSE_EVENT = {
     openedAt: new Date(CLOSE_CREATED_AT.getTime() - 60_000).toISOString(),
     rawPnl: 42.5, pnlPercent: 3.9, commission: 1.5, swap: 0,
     marginUsedRequested: 100, marginUsedReleased: 100, marginDiscrepancy: 0,
+    nbpWriteOff: 0,
   },
 };
 
@@ -182,6 +183,22 @@ describe("AuditOutboxConsumer.processPending()", () => {
 
     expect(mockTx.tradeAudit.upsert).not.toHaveBeenCalled();
     expect(mockTx.auditLog.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("position.closed: copies nbpWriteOff into both AuditLog.payload and TradeAudit.riskMetrics (FASE 5.2 Bug #8, LEDGER_FREEZE.md §0.8)", async () => {
+    mockTx.tradeAudit.updateMany.mockResolvedValue({ count: 0 });
+    mockDb.outboxEvent.findMany.mockResolvedValue([
+      { ...CLOSE_EVENT, payload: { ...CLOSE_EVENT.payload, netCredit: -50, nbpWriteOff: 12.34 } },
+    ]);
+
+    await auditOutboxConsumer.processPending();
+
+    const auditPayload = mockTx.auditLog.create.mock.calls[0][0].data.payload as { nbpWriteOff: number };
+    expect(auditPayload.nbpWriteOff).toBe(12.34);
+
+    const created = mockTx.tradeAudit.upsert.mock.calls[0][0].create;
+    const riskMetrics = JSON.parse(created.riskMetrics);
+    expect(riskMetrics.nbpWriteOff).toBe(12.34);
   });
 
   it("a failed event increments auditRetries instead of being marked processed, and does not block the rest of the batch", async () => {

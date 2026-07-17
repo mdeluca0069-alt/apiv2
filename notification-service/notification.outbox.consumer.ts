@@ -47,6 +47,8 @@ type OrderFilledPayload = {
 
 type PositionClosedPayload = {
   symbol: string; pnl: number;
+  /** LEDGER_FREEZE.md §0.8: 0 when no write-off happened. */
+  nbpWriteOff?: number;
 };
 
 type Channel = "IN_APP" | "EMAIL";
@@ -89,10 +91,14 @@ export class NotificationOutboxConsumer {
         } else if (event.eventType === "position.closed") {
           const p = event.payload as PositionClosedPayload;
           const pnl = Number(p.pnl ?? 0);
+          const writeOff = Number(p.nbpWriteOff ?? 0);
+          const body = writeOff > 0
+            ? `Realized P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USD (${writeOff.toFixed(2)} USD of loss beyond your balance was absorbed under negative balance protection)`
+            : `Realized P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USD`;
           await this._deliver(
             db, event.id, event.userId, "fill", "NORMAL",
             `Position closed — ${p.symbol}`,
-            `Realized P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USD`,
+            body,
             ["IN_APP"],
           );
         } else {
