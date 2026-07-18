@@ -1097,6 +1097,12 @@ setInterval(() => {
       if (r.stopOuts > 0 || r.marginCalls > 0) {
         console.warn(`[stop-out] stopOuts=${r.stopOuts} marginCalls=${r.marginCalls} warnings=${r.warnings} scanned=${r.scannedUsers}`);
       }
+      // LEDGER_FREEZE.md §0.11: per-user errors from this sweep used to be
+      // collected into r.errors and never read by anyone -- a failure here
+      // vanished with zero trace.
+      if (r.errors.length > 0) {
+        console.error(`[stop-out] ${r.errors.length} user(s) errored during scan:`, r.errors);
+      }
     }).catch((err) => console.error("[stop-out] scan failed:", (err as Error).message));
   }
 }, 30_000);

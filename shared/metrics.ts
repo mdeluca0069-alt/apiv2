@@ -344,7 +344,9 @@ metrics.register("igfx_margin_utilization_pct",           "histogram", "User mar
 // Backward compat
 metrics.register("kill_switch_activations_total",         "counter",   "Kill switch activations");
 metrics.register("margin_calls_total",                    "counter",   "Margin calls");
-metrics.register("stop_out_events_total",                 "counter",   "Stop-out liquidations");
+metrics.register("stop_out_events_total",                 "counter",   "Stop-out liquidations (one increment per position closed)");
+metrics.register("stop_out_episodes_total",                "counter",   "Stop-out sweeps triggered (one increment per user scan that closed >=1 position, regardless of how many)");
+metrics.register("stop_out_audit_write_failures_total",    "counter",   "Stop-out compliance audit summary write failures");
 metrics.register("stop_loss_triggers_total",              "counter",   "Stop-loss closes");
 metrics.register("take_profit_triggers_total",            "counter",   "Take-profit closes");
 

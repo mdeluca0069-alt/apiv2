@@ -324,25 +324,51 @@ export class StopOutEngine {
     // Audit + snapshot
     await this._saveMarginSnapshot(userId, equity, balance, marginUsed, marginLevel, "STOP_OUT");
 
-    await db.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   "risk-engine",
-        action:  "stop_out.triggered",
-        entity:  `user:${userId}`,
-        payload: {
-          marginLevel:  marginLevel.toFixed(2),
-          equity,
-          marginUsed,
-          positionsClosed: liquidated,
-          totalPnl,
-          skippedHalted,
-          skippedStale,
-        } as object,
-      },
-    });
+    // LEDGER_FREEZE.md §0.11: this summary write was previously unguarded --
+    // an exception here was swallowed by scanAll()'s per-user try/catch into
+    // an `errors` array its own only caller (main.ts) never reads, so a
+    // failure here vanished with zero trace even though the money movement
+    // above had already genuinely happened. The liquidation itself must
+    // never be undone by an audit-write failure (the money is already
+    // moved), but the failure itself must be visible somewhere.
+    try {
+      await db.auditLog.create({
+        data: {
+          id:      randomUUID(),
+          actor:   "risk-engine",
+          action:  "stop_out.triggered",
+          entity:  `user:${userId}`,
+          payload: {
+            marginLevel:  marginLevel.toFixed(2),
+            equity,
+            marginUsed,
+            positionsClosed: liquidated,
+            totalPnl,
+            skippedHalted,
+            skippedStale,
+          } as object,
+        },
+      });
+    } catch (err) {
+      console.error(`[stop-out] CRITICAL: failed to write stop_out.triggered audit summary for userId=${userId}:`, (err as Error).message);
+      metrics.inc("stop_out_audit_write_failures_total");
+      void alertManager.send({
+        type:     "STOP_OUT",
+        severity: "CRITICAL",
+        title:    "Stop-Out Audit Write Failed",
+        message:  `Stop-out for user ${userId} closed ${liquidated} position(s) (net P&L ${totalPnl.toFixed(2)} USD) but the compliance audit summary failed to write: ${(err as Error).message}`,
+        metadata: { userId, marginLevel: marginLevel.toFixed(2), positions: liquidated, totalPnl: totalPnl.toFixed(2) },
+      });
+    }
 
-    metrics.inc("stop_out_events_total");
+    // LEDGER_FREEZE.md §0.11: this counter used to be "stop_out_events_total"
+    // -- the SAME name settlement.engine.ts increments once per POSITION
+    // closed with reason STOP_OUT/LIQUIDATION. A single stop-out sweep that
+    // closes 3 positions incremented that shared counter 4 times under one
+    // name with two different units. This is a distinct concept (one sweep
+    // episode, regardless of how many positions it closed) and now has its
+    // own name.
+    metrics.inc("stop_out_episodes_total");
     if (skippedHalted > 0) metrics.inc("stop_out_skipped_halted_total", skippedHalted);
     if (skippedStale > 0)  metrics.inc("stop_out_skipped_stale_total", skippedStale);
     eventBus.emit("risk.stop_out", {
@@ -350,6 +376,16 @@ export class StopOutEngine {
       positionsClosed: liquidated, totalPnl,
       triggeredAt,
     });
+
+    // LEDGER_FREEZE.md §0.11: _notify() only ever handled WARNING/MARGIN_CALL
+    // -- a client who was actually stopped out got nothing beyond the
+    // generic per-position "Position closed" notice, never a dedicated
+    // "you were stopped out" message. Only fires if something was actually
+    // closed (a sweep that only skipped halted/stale positions has nothing
+    // to tell the client yet).
+    if (liquidated > 0) {
+      await this._notify(userId, "STOP_OUT", marginLevel, { liquidated, totalPnl });
+    }
 
     console.warn(`[stop-out] userId=${userId} marginLevel=${marginLevel.toFixed(1)}% closed=${liquidated} totalPnl=${totalPnl}` +
       (skippedHalted > 0 ? ` skippedHalted=${skippedHalted}` : "") +
@@ -369,7 +405,10 @@ export class StopOutEngine {
 
   // ─── Private helpers ──────────────────────────────────────────────────────
 
-  private async _notify(userId: string, level: "WARNING" | "MARGIN_CALL", marginLevel: number) {
+  private async _notify(
+    userId: string, level: "WARNING" | "MARGIN_CALL" | "STOP_OUT", marginLevel: number,
+    stopOutDetail?: { liquidated: number; totalPnl: number },
+  ) {
     if (!prisma?.notification) return;
     const db = prisma as NonNullable<typeof prisma>;
 
@@ -381,6 +420,11 @@ export class StopOutEngine {
       MARGIN_CALL: {
         title: "Margin Call",
         body:  `Margin level is ${marginLevel.toFixed(0)}%. New positions are restricted. Add funds immediately to avoid stop-out.`,
+      },
+      STOP_OUT: {
+        title: "Stop-Out Triggered",
+        body:  `Your margin level dropped to ${marginLevel.toFixed(0)}% and ${stopOutDetail?.liquidated ?? 0} position(s) ` +
+               `were automatically closed to protect your account (net P&L ${(stopOutDetail?.totalPnl ?? 0).toFixed(2)} USD).`,
       },
     };
 
@@ -394,10 +438,10 @@ export class StopOutEngine {
           userId,
           channel:  "IN_APP",
           category: "margin",
-          priority: level === "MARGIN_CALL" ? "CRITICAL" : "HIGH",
+          priority: level === "WARNING" ? "HIGH" : "CRITICAL",
           title:    msg.title,
           body:     msg.body,
-          payload:  { marginLevel } as object,
+          payload:  level === "STOP_OUT" ? { marginLevel, ...stopOutDetail } as object : { marginLevel } as object,
         },
       });
     } catch {
