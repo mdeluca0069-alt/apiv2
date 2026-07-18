@@ -18,6 +18,18 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+const { mockMetricsInc, mockMetricsObserve } = vi.hoisted(() => ({
+  mockMetricsInc: vi.fn(), mockMetricsObserve: vi.fn(),
+}));
+vi.mock("../gateway/metrics.js", () => ({
+  metrics: { inc: mockMetricsInc, observe: mockMetricsObserve, set: vi.fn(), get: vi.fn() },
+}));
+
+// Spy on the real eventBus singleton -- see broker-state.admin.capital.spec.ts
+// for why a full module mock is avoided here.
+const { eventBus } = await import("../events-bus/event.bus.js");
+const emitSpy = vi.spyOn(eventBus, "emit");
+
 const { LedgerEngine } = await import("../wallet-service/ledger.engine.js");
 
 function decimalLike(n: number) {
@@ -127,5 +139,40 @@ describe("LedgerEngine.approveDeposit() — audit trail (Bug #5, LEDGER_FREEZE.m
     expect(entry.entity).toBe("user-1");
     expect(entry.payload.amount).toBe(500);
     expect(entry.payload.reference).toBe("ref-1");
+  });
+});
+
+describe("LedgerEngine — Notification/Metrics (Bug #10, LEDGER_FREEZE.md §0.10)", () => {
+  it("requestDeposit() increments deposit_requests_total", async () => {
+    const db = makeDb({ balance: 0 });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.requestDeposit({ userId: "user-1", amount: 500, method: "wire" });
+
+    expect(mockMetricsInc).toHaveBeenCalledWith("deposit_requests_total");
+  });
+
+  it("approveDeposit() emits a wallet.event CREDIT and increments deposit metrics on a genuine approval", async () => {
+    const db = makeDb({ balance: 1_000 });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveDeposit("user-1", 500, "ref-1", "admin-1");
+
+    expect(emitSpy).toHaveBeenCalledWith("wallet.event", expect.objectContaining({
+      userId: "user-1", type: "CREDIT", amount: 500,
+    }));
+    expect(mockMetricsInc).toHaveBeenCalledWith("igfx_deposits_total");
+    expect(mockMetricsInc).toHaveBeenCalledWith("deposit_approvals_total");
+    expect(mockMetricsObserve).toHaveBeenCalledWith("igfx_deposit_amount_usd", 500);
+  });
+
+  it("approveDeposit() emits/increments nothing on an idempotent no-op replay", async () => {
+    const db = makeDb({ balance: 1_000, existingApproval: { id: "already-done" } });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveDeposit("user-1", 500, "ref-1", "admin-1");
+
+    expect(emitSpy).not.toHaveBeenCalled();
+    expect(mockMetricsInc).not.toHaveBeenCalledWith("igfx_deposits_total");
   });
 });

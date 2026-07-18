@@ -1,6 +1,8 @@
 import { randomUUID }   from "node:crypto";
 import type { PrismaClient } from "@prisma/client";
 import { Decimal }          from "@prisma/client/runtime/library";
+import { eventBus }         from "../events-bus/event.bus.js";
+import { metrics }          from "../gateway/metrics.js";
 
 // ─── Status constants ────────────────────────────────────────────────────────
 
@@ -71,6 +73,8 @@ export class DepositStateMachine {
     webhookData?: unknown;
   }): Promise<{ alreadyCredited: boolean }> {
     let alreadyCredited = false;
+    let creditedUserId: string | undefined;
+    let creditedAmount = 0;
 
     await this.db.$transaction(async (tx) => {
       const dep = await tx.depositTransaction.findUniqueOrThrow({
@@ -148,11 +152,27 @@ export class DepositStateMachine {
           creditedAt:  new Date(),
         },
       });
+
+      creditedUserId = dep.userId;
+      creditedAmount = creditAmount.toNumber();
     }, {
       isolationLevel: "Serializable",
       maxWait:         10_000,
       timeout:         20_000,
     });
+
+    // LEDGER_FREEZE.md §0.10: this credit path never fed Notification/Metrics
+    // at all -- the wallet.event listener that would notify the client
+    // (notification-service/notification.router.ts) already exists and works
+    // for every other subsystem, it was simply never fed from here.
+    if (creditedUserId) {
+      eventBus.emit("wallet.event", {
+        userId: creditedUserId, type: "CREDIT", amount: creditedAmount,
+        reference: `PSP:${params.pspRef}`, timestamp: new Date().toISOString(),
+      });
+      metrics.inc("igfx_deposits_total");
+      metrics.observe("igfx_deposit_amount_usd", creditedAmount);
+    }
 
     return { alreadyCredited };
   }

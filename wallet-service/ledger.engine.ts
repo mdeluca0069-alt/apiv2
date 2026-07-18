@@ -4,6 +4,8 @@ import type { PrismaClient, Prisma } from "@prisma/client";
 import { WalletRepository }  from "./wallet.repository.js";
 import { BalanceCalculator } from "./balance.calculator.js";
 import { quoteCache }        from "../market-data/quote.cache.js";
+import { eventBus }          from "../events-bus/event.bus.js";
+import { metrics }           from "../gateway/metrics.js";
 
 /** Same composability contract as balance.calculator.ts / order.lifecycle.ts. */
 type Db = Prisma.TransactionClient | PrismaClient;
@@ -78,11 +80,13 @@ export class LedgerEngine {
       },
     });
 
+    metrics.inc("deposit_requests_total");
     return { status: "PENDING_ADMIN", entryId: id, reference };
   }
 
   async approveDeposit(userId: string, amount: number, depositReference: string, adminId: string): Promise<void> {
     await this.repo.getOrCreate(userId);
+    let approved = false;
 
     // Both the credit and the status update must succeed or fail together.
     // A crash between them would leave the deposit as PENDING_ADMIN, allowing
@@ -135,7 +139,21 @@ export class LedgerEngine {
           payload: { amount, reference: depositReference, newBalance: newBalance.toNumber() } as object,
         },
       });
+
+      approved = true;
     }, { isolationLevel: "Serializable", maxWait: 10000, timeout: 15000 });
+
+    // LEDGER_FREEZE.md §0.10: same gap as the PSP credit path -- this manual
+    // admin approval never fed Notification/Metrics either.
+    if (approved) {
+      eventBus.emit("wallet.event", {
+        userId, type: "CREDIT", amount,
+        reference: `APPROVED:${depositReference}`, timestamp: new Date().toISOString(),
+      });
+      metrics.inc("igfx_deposits_total");
+      metrics.inc("deposit_approvals_total");
+      metrics.observe("igfx_deposit_amount_usd", amount);
+    }
   }
 
   async requestWithdrawal(input: WithdrawalInput): Promise<{ status: string; message: string }> {
@@ -176,10 +194,13 @@ export class LedgerEngine {
       },
     });
 
+    metrics.inc("withdrawal_requests_total");
     return { status: "PENDING_ADMIN", message: "Withdrawal request submitted for review." };
   }
 
   async approveWithdrawal(userId: string, amount: number, withdrawalReference: string, adminId: string): Promise<void> {
+    let approved = false;
+
     // Both the debit and the status update must succeed or fail together.
     // Idempotency guard: if already approved, bail out without double-debiting.
     await this.db.$transaction(async (tx) => {
@@ -244,7 +265,20 @@ export class LedgerEngine {
           payload: { amount, reference: withdrawalReference, newBalance: newBalance.toNumber() } as object,
         },
       });
+
+      approved = true;
     }, { isolationLevel: "Serializable", maxWait: 10000, timeout: 15000 });
+
+    // LEDGER_FREEZE.md §0.10: same gap as the deposit side -- this had no
+    // Notification/Metrics either.
+    if (approved) {
+      eventBus.emit("wallet.event", {
+        userId, type: "DEBIT", amount,
+        reference: `APPROVED:${withdrawalReference}`, timestamp: new Date().toISOString(),
+      });
+      metrics.inc("igfx_withdrawals_total");
+      metrics.inc("withdrawal_approvals_total");
+    }
   }
 
   async rejectDeposit(userId: string, entryId: string, adminId: string): Promise<void> {

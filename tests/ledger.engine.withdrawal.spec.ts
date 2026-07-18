@@ -22,6 +22,18 @@ vi.mock("../market-data/quote.cache.js", () => ({
   quoteCache: { get: mockQuoteGet },
 }));
 
+const { mockMetricsInc, mockMetricsObserve } = vi.hoisted(() => ({
+  mockMetricsInc: vi.fn(), mockMetricsObserve: vi.fn(),
+}));
+vi.mock("../gateway/metrics.js", () => ({
+  metrics: { inc: mockMetricsInc, observe: mockMetricsObserve, set: vi.fn(), get: vi.fn() },
+}));
+
+// Spy on the real eventBus singleton -- see broker-state.admin.capital.spec.ts
+// for why a full module mock is avoided here.
+const { eventBus } = await import("../events-bus/event.bus.js");
+const emitSpy = vi.spyOn(eventBus, "emit");
+
 const { LedgerEngine } = await import("../wallet-service/ledger.engine.js");
 
 function decimalLike(n: number) {
@@ -239,5 +251,55 @@ describe("Withdrawal request → approve round trip — sign-inversion regressio
 
     const updateArg = db.walletAccount.update.mock.calls[0][0] as { data: { balance: { toNumber(): number } } };
     expect(updateArg.data.balance.toNumber()).toBe(4_500); // 5,000 - 500, correct direction
+  });
+});
+
+describe("LedgerEngine — Notification/Metrics (Bug #10, LEDGER_FREEZE.md §0.10)", () => {
+  it("requestWithdrawal() increments withdrawal_requests_total on a successful request", async () => {
+    const db = makeDb({ balance: 5_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.requestWithdrawal({ userId: "user-1", amount: 500, destination: "bank-1", method: "wire" });
+
+    expect(mockMetricsInc).toHaveBeenCalledWith("withdrawal_requests_total");
+  });
+
+  it("requestWithdrawal() does NOT increment withdrawal_requests_total when advisory-rejected for insufficient free margin", async () => {
+    mockQuoteGet.mockReturnValue({ symbol: "EURUSD", bid: 1.0000, ask: 1.0002, mid: 1.0001 });
+    const db = makeDb({
+      balance: 10_000, locked: 3_000,
+      openPositions: [{ symbol: "EURUSD", side: "BUY", quantity: 100_000, entryPrice: 1.0600 }],
+    });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.requestWithdrawal({ userId: "user-1", amount: 6_000, destination: "bank-1", method: "wire" });
+
+    expect(mockMetricsInc).not.toHaveBeenCalledWith("withdrawal_requests_total");
+  });
+
+  it("approveWithdrawal() emits a wallet.event DEBIT and increments withdrawal metrics on a genuine approval", async () => {
+    const db = makeDb({ balance: 5_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveWithdrawal("user-1", 500, "ref-1", "admin-1");
+
+    expect(emitSpy).toHaveBeenCalledWith("wallet.event", expect.objectContaining({
+      userId: "user-1", type: "DEBIT", amount: 500,
+    }));
+    expect(mockMetricsInc).toHaveBeenCalledWith("igfx_withdrawals_total");
+    expect(mockMetricsInc).toHaveBeenCalledWith("withdrawal_approvals_total");
+  });
+
+  it("approveWithdrawal() emits/increments nothing on an idempotent no-op replay", async () => {
+    const db = makeDb({
+      balance: 5_000, locked: 0, openPositions: [],
+      existingApproval: { id: "already-done" },
+    });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveWithdrawal("user-1", 500, "ref-1", "admin-1");
+
+    expect(emitSpy).not.toHaveBeenCalled();
+    expect(mockMetricsInc).not.toHaveBeenCalledWith("igfx_withdrawals_total");
   });
 });
