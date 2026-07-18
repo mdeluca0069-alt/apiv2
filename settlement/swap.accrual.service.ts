@@ -28,6 +28,7 @@ import { quoteCache }          from "../market-data/quote.cache.js";
 import { swapCalculator }      from "../trading-service/swap.calculator.js";
 import { assetClassOf }        from "../liquidity-engine/liquidity.provider.js";
 import { eventBus }            from "../events-bus/event.bus.js";
+import { metrics }             from "../gateway/metrics.js";
 import { DistributedJobLock }  from "../shared/distributed.job.lock.js";
 
 export type AccrualSummary = {
@@ -101,6 +102,7 @@ export class SwapAccrualService {
           if (charged !== 0) processed++;
         } catch (err) {
           errors++;
+          metrics.inc("swap_accrual_errors_total");
           console.error(`[swap-accrual] position ${pos.id}:`, (err as Error).message);
         }
       }
@@ -220,10 +222,29 @@ export class SwapAccrualService {
         data:  { balance: { increment: new Decimal(chargeAmount) } },
       });
 
+      // LEDGER_FREEZE.md §0.9: this recurring nightly charge had no Audit
+      // trail and no Metrics at all -- not even a registered counter existed
+      // for a successful accrual (swap_accrual_errors_total was registered
+      // but, like this one, never actually incremented anywhere).
+      await tx.auditLog.create({
+        data: {
+          id:      randomUUID(),
+          actor:   "SYSTEM_SWAP_ACCRUAL",
+          action:  "swap.accrued",
+          entity:  pos.id,
+          payload: { userId: pos.userId, symbol: pos.symbol, amount: chargeAmount, nights, rateAnnual, reference } as object,
+        },
+      });
+
       return chargeAmount;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, maxWait: 10000, timeout: 15000 });
 
     if (result !== 0) {
+      metrics.inc("swap_accrual_total");
+      // Event Bus: this emit is already durably captured by the event
+      // archive (realtime-infra/event.archive.ts's ARCHIVED_EVENTS includes
+      // "swap.accrued") -- not merely in-memory, contrary to what this
+      // fix's own audit finding assumed without checking that file.
       eventBus.emit("swap.accrued", {
         userId:      pos.userId,
         positionId:  pos.id,

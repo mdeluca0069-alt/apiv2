@@ -396,7 +396,8 @@ metrics.register("reconciliation_mismatches_total",       "counter",   "Reconcil
 metrics.register("reconciliation_dirty_users",            "gauge",     "Dirty reconciliation users");
 metrics.register("reconciliation_orphan_margin_repaired_total","counter","Orphan margin repairs");
 metrics.register("partial_fill_margin_released_total",     "counter",   "Unused margin released after a partial fill");
-metrics.register("swap_accrual_errors_total",             "counter",   "Swap accrual errors");
+metrics.register("swap_accrual_total",                    "counter",   "Successful per-position swap accruals");
+metrics.register("swap_accrual_errors_total",              "counter",   "Swap accrual errors");
 metrics.register("negative_balance_clips_total",          "counter",   "Negative balance clips");
 metrics.register("enhanced_recon_swap_mismatches",        "counter",   "Enhanced recon swap mismatches");
 metrics.register("enhanced_recon_deposit_mismatches",     "counter",   "Enhanced recon deposit mismatches");
