@@ -38,6 +38,41 @@ export type LedgerPage = {
   offset:       number;
 };
 
+// LEDGER_FREEZE.md §3 (open question, resolved 2026-07-19): swap accrual's
+// richer per-position detail (nights, annualised rate, position/symbol
+// breakdown) was only reachable via the generic ledger query filtered to
+// type=SWAP, which only exposes the flat LedgerEntry shape -- not a
+// dedicated History surface for the SwapAccrual table itself.
+export type SwapHistoryParams = {
+  userId:      string;
+  limit?:      number;
+  offset?:     number;
+  positionId?: string;
+  symbol?:     string;
+  from?:       Date;
+  to?:         Date;
+};
+
+export type SwapHistoryEntry = {
+  id:             string;
+  positionId:     string;
+  symbol:         string;
+  side:           string;
+  swapAmount:     number;
+  swapRateAnnual: number;
+  nights:         number;
+  accrualDate:    string;
+  createdAt:      string;
+};
+
+export type SwapHistoryPage = {
+  entries:      SwapHistoryEntry[];
+  totalCount:   number;
+  totalSwapUsd: number;
+  pageSize:     number;
+  offset:       number;
+};
+
 export type StatementPeriod = "daily" | "weekly" | "monthly" | "custom";
 
 export type AccountStatement = {
@@ -149,6 +184,67 @@ export class LedgerService {
     }));
 
     return { entries, totalCount, totalCredits, totalDebits, pageSize: limit, offset };
+  }
+
+  /** Dedicated History surface for swap/rollover accrual — the SwapAccrual
+   *  table's own per-position detail, not derivable from the flat
+   *  LedgerEntry shape the generic getLedger() above exposes. */
+  async getSwapHistory(params: SwapHistoryParams): Promise<SwapHistoryPage> {
+    const { userId, limit = 50, offset = 0, positionId, symbol, from, to } = params;
+
+    if (!IS_PERSISTENT) {
+      return { entries: [], totalCount: 0, totalSwapUsd: 0, pageSize: limit, offset };
+    }
+
+    const where = {
+      userId,
+      ...(positionId ? { positionId } : {}),
+      ...(symbol     ? { symbol }     : {}),
+      ...(from || to
+        ? {
+            accrualDate: {
+              ...(from ? { gte: from } : {}),
+              ...(to   ? { lte: to }   : {}),
+            },
+          }
+        : {}),
+    };
+
+    const [totalCount, rows, sumResult] = await Promise.all([
+      prisma.swapAccrual.count({ where }),
+      prisma.swapAccrual.findMany({
+        where,
+        orderBy: { accrualDate: "desc" },
+        take:    Math.min(limit, 500),
+        skip:    offset,
+        select: {
+          id: true, positionId: true, symbol: true, side: true,
+          swapAmount: true, swapRateAnnual: true, nights: true,
+          accrualDate: true, createdAt: true,
+        },
+      }),
+      prisma.swapAccrual.aggregate({ where, _sum: { swapAmount: true } }),
+    ]);
+
+    const entries: SwapHistoryEntry[] = rows.map((r) => ({
+      id:             r.id,
+      positionId:     r.positionId,
+      symbol:         r.symbol,
+      side:           r.side,
+      swapAmount:     Number(r.swapAmount),
+      swapRateAnnual: Number(r.swapRateAnnual),
+      nights:         r.nights,
+      accrualDate:    r.accrualDate.toISOString().slice(0, 10),
+      createdAt:      r.createdAt.toISOString(),
+    }));
+
+    return {
+      entries,
+      totalCount,
+      totalSwapUsd: Number(sumResult._sum.swapAmount ?? 0),
+      pageSize: limit,
+      offset,
+    };
   }
 
   async getStatement(userId: string, period: StatementPeriod, from?: Date, to?: Date): Promise<AccountStatement> {

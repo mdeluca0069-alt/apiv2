@@ -33,7 +33,7 @@ import { cancelOrder }                from "../trading-service/order.cancel.js";
 import { getCandles }                 from "../market-data/candle.aggregator.js";
 import type { Timeframe }             from "../market-data/candle.aggregator.js";
 import { ledgerService }              from "../wallet-service/ledger.service.js";
-import type { LedgerQueryParams }     from "../wallet-service/ledger.service.js";
+import type { LedgerQueryParams, SwapHistoryParams } from "../wallet-service/ledger.service.js";
 import { LedgerEngine }               from "../wallet-service/ledger.engine.js";
 import { autopilotService }           from "../autopilot-service/autopilot.service.js";
 import { AutopilotConfigInputSchema } from "../autopilot-service/autopilot.service.js";
@@ -1133,6 +1133,35 @@ export const routes: Route[] = [
       if (to)   params.to   = new Date(to);
 
       return ledgerService.getLedger(params);
+    },
+  },
+
+  // ── Swap/rollover history (LEDGER_FREEZE.md §3 — dedicated History surface,
+  // previously only reachable via the generic ledger query) ────────────────────
+  {
+    method: "GET",
+    path: api("/wallet/swap-history"),
+    auth: true,
+    handler: async ({ authHeader, state, query }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
+
+      const params: SwapHistoryParams = {
+        userId: principal.sub,
+        limit:  Math.min(parseInt(query.get("limit")  ?? "50"), 500),
+        offset: parseInt(query.get("offset") ?? "0"),
+      };
+
+      const positionId = query.get("positionId");
+      if (positionId) params.positionId = positionId;
+      const symbol = query.get("symbol");
+      if (symbol) params.symbol = symbol;
+      const from = query.get("from");
+      const to   = query.get("to");
+      if (from) params.from = new Date(from);
+      if (to)   params.to   = new Date(to);
+
+      return ledgerService.getSwapHistory(params);
     },
   },
 
