@@ -151,8 +151,21 @@ export class InternalLiquidityProvider implements ILiquidityProvider {
       ask: side === "BUY"  ? limitPrice : quote.ask,
     };
     const fill = this.calculateFill(syntheticQuote, side, quantity);
+
+    // RISK_ENGINE_FREEZE.md §1.6: calculateFill() always adds the same
+    // deterministic slippage it applies to MARKET orders, on top of
+    // limitPrice -- for large enough notional (slip > 0 tiers), that pushed
+    // a BUY LIMIT fill above its own limit and a SELL LIMIT fill below it,
+    // breaking this interface's own documented contract ("returns a fill at
+    // limitPrice or better, or throws if no fill possible" --
+    // i.liquidity.provider.ts). Clamp back onto the client's limit: never
+    // worse, price improvement only when slippage happens to help.
+    const clampedPrice = side === "BUY"
+      ? Math.min(fill.averagePrice, limitPrice)
+      : Math.max(fill.averagePrice, limitPrice);
+
     return {
-      averagePrice:      fill.averagePrice,
+      averagePrice:      roundPrice(symbol, clampedPrice),
       filledQuantity:    fill.filledQuantity,
       remainingQuantity: fill.remainingQuantity,
       slippage:          fill.slippage,
