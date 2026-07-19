@@ -21,6 +21,11 @@ const { mockDb } = vi.hoisted(() => {
 });
 vi.mock("../shared/db.js", () => ({ prisma: mockDb, IS_PERSISTENT: true }));
 
+const { mockMetricsInc } = vi.hoisted(() => ({ mockMetricsInc: vi.fn() }));
+vi.mock("../gateway/metrics.js", () => ({
+  metrics: { inc: mockMetricsInc, observe: vi.fn(), set: vi.fn(), get: vi.fn() },
+}));
+
 const { mockQuoteCache } = vi.hoisted(() => ({
   mockQuoteCache: { get: vi.fn(), isStale: vi.fn() },
 }));
@@ -192,5 +197,46 @@ describe("LiquidationEngine.closePosition() — admin force-close reason (§0.12
 
     await expect(liquidationEngine.closePosition("pos-missing", QUOTE)).rejects.toThrow("not found or not open");
     expect(mockSettle).not.toHaveBeenCalled();
+  });
+});
+
+describe("LiquidationEngine.scanForMissedSlTp() — metrics (§0.13, LEDGER_FREEZE.md)", () => {
+  it("records scanned/closed counts for a sweep that closes a hit position", async () => {
+    mockDb.position.findMany.mockResolvedValue([makePosition({ stopLoss: new Decimal(1.0860) })]);
+
+    await liquidationEngine.scanForMissedSlTp();
+
+    expect(mockMetricsInc).toHaveBeenCalledWith("liquidation_watchdog_scanned_total", 1);
+    expect(mockMetricsInc).toHaveBeenCalledWith("liquidation_watchdog_closed_total", 1);
+    expect(mockMetricsInc).not.toHaveBeenCalledWith("liquidation_watchdog_skipped_stale_total", expect.anything());
+    expect(mockMetricsInc).not.toHaveBeenCalledWith("liquidation_watchdog_skipped_halted_total", expect.anything());
+  });
+
+  it("records skipped-stale count without recording a close", async () => {
+    mockDb.position.findMany.mockResolvedValue([makePosition()]);
+    mockQuoteCache.isStale.mockReturnValue(true);
+
+    await liquidationEngine.scanForMissedSlTp();
+
+    expect(mockMetricsInc).toHaveBeenCalledWith("liquidation_watchdog_scanned_total", 1);
+    expect(mockMetricsInc).toHaveBeenCalledWith("liquidation_watchdog_skipped_stale_total", 1);
+    expect(mockMetricsInc).not.toHaveBeenCalledWith("liquidation_watchdog_closed_total", expect.anything());
+  });
+
+  it("records skipped-halted count", async () => {
+    mockDb.position.findMany.mockResolvedValue([makePosition({ stopLoss: new Decimal(1.0860) })]);
+    mockIsEnabled.mockReturnValue(false);
+
+    await liquidationEngine.scanForMissedSlTp();
+
+    expect(mockMetricsInc).toHaveBeenCalledWith("liquidation_watchdog_skipped_halted_total", 1);
+  });
+
+  it("does not record anything when there is nothing to scan", async () => {
+    mockDb.position.findMany.mockResolvedValue([]);
+
+    await liquidationEngine.scanForMissedSlTp();
+
+    expect(mockMetricsInc).not.toHaveBeenCalled();
   });
 });

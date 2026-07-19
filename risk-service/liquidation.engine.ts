@@ -33,6 +33,7 @@ import { quoteCache }         from "../market-data/quote.cache.js";
 import { settlementEngine, type CloseReason, PositionAlreadyClosedError } from "../settlement/settlement.engine.js";
 import { LiquidityProvider } from "../liquidity-engine/liquidity.provider.js";
 import { brokerSpreadConfig } from "../liquidity-engine/broker.spread.config.js";
+import { metrics } from "../gateway/metrics.js";
 import type { LiquidationResult } from "../shared/contracts.js";
 
 type LiveQuote = {
@@ -131,6 +132,17 @@ export class LiquidationEngine {
         }
       }
     }
+
+    // LEDGER_FREEZE.md §0.13: this whole file had zero metrics calls. The
+    // operational signal this watchdog exists to surface -- "the 30s sweep
+    // had to catch what the tick-level monitor missed" -- was invisible to
+    // Prometheus; a rising rate here is exactly the sign
+    // position.price.monitor.ts's own coverage is degrading (per this
+    // file's own header comment).
+    metrics.inc("liquidation_watchdog_scanned_total", report.scanned);
+    if (report.closed > 0)        metrics.inc("liquidation_watchdog_closed_total", report.closed);
+    if (report.skippedStale > 0)  metrics.inc("liquidation_watchdog_skipped_stale_total", report.skippedStale);
+    if (report.skippedHalted > 0) metrics.inc("liquidation_watchdog_skipped_halted_total", report.skippedHalted);
 
     return report;
   }
