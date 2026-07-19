@@ -24,7 +24,9 @@
  * All alerts are also written to AuditLog for compliance.
  */
 
+import { randomUUID } from "node:crypto";
 import { metrics } from "../gateway/metrics.js";
+import { prisma, IS_PERSISTENT } from "../shared/db.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -176,11 +178,39 @@ class AlertManager {
 
     metrics.inc("alerts_sent_total");
 
-    // Send in parallel; neither channel failing blocks the other
+    // Send in parallel; neither channel failing blocks the other, and a
+    // failure in any one (including the audit write) never blocks or drops
+    // the others.
     await Promise.allSettled([
       sendTelegram(alert),
       sendEmail(alert),
+      this._writeAuditLog(alert),
     ]);
+  }
+
+  // LEDGER_FREEZE.md §0.14: this file's own header comment has claimed
+  // "All alerts are also written to AuditLog for compliance" since it was
+  // written, but the implementation never did -- every money/risk-related
+  // alert in this class (reconciliation mismatches, settlement failures,
+  // margin discrepancies, stop-out waves, swap errors, etc.) went out over
+  // Telegram/email with zero durable compliance record. This makes the
+  // header comment true instead of removing the claim, since alerting is
+  // exactly the kind of event FASE 5's rule is about.
+  private async _writeAuditLog(alert: AlertPayload): Promise<void> {
+    if (!IS_PERSISTENT || !prisma) return;
+    try {
+      await prisma.auditLog.create({
+        data: {
+          id:      randomUUID(),
+          actor:   "ALERT_MANAGER",
+          action:  `alert.${alert.type.toLowerCase()}`,
+          entity:  alert.type,
+          payload: { severity: alert.severity, title: alert.title, message: alert.message, ...alert.metadata } as object,
+        },
+      });
+    } catch (err) {
+      console.error("[alert] failed to write AuditLog:", (err as Error).message);
+    }
   }
 
   // ── Pre-built alert templates ──────────────────────────────────────────────
