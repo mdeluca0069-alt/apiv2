@@ -271,6 +271,9 @@ await Promise.all([
   globalRiskSupervisor.startSync().catch((err) =>
     console.error("[risk-supervisor] cross-worker sync failed to start:", (err as Error).message),
   ),
+  brokerSpreadConfig.startSync().catch((err) =>
+    console.error("[broker-spread] cross-worker sync failed to start:", (err as Error).message),
+  ),
 ]);
 
 // Seed synthetic placeholder candles synchronously so charts have data immediately.

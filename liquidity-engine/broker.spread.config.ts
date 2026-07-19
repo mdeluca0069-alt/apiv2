@@ -16,6 +16,7 @@
  */
 
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { publishControlChannel, subscribeControlChannel } from "../shared/control.channel.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -253,8 +254,31 @@ export const SYMBOLS_BY_CLASS: Record<AssetClass, string[]> = {
 
 // ─── BrokerSpreadConfig ───────────────────────────────────────────────────────
 
+const CONTROL_CHANNEL = "broker-spread";
+
 export class BrokerSpreadConfig {
   private readonly cache = new Map<string, SpreadEntry>();
+
+  /**
+   * RISK_ENGINE_FREEZE.md §5.2: this halt state (including the per-symbol
+   * circuit breaker's automated setEnabled() calls) had no cross-worker sync
+   * -- a PM2/Docker-replica worker other than the one that tripped a halt
+   * kept accepting new orders on that symbol, and an existing position could
+   * still be force-closed against it (the exact FASE 4.2 Bug #3 scenario)
+   * from a worker that never saw the halt. Same fix shape as kill.switch.ts's
+   * Fix #6: subscribe to cross-worker changes so an update() on ANY worker
+   * (an admin's HTTP request or the circuit breaker) is reflected on every
+   * other worker's in-process cache within milliseconds. Call once at
+   * startup, after load(). No-op (single-worker-safe) with no Redis configured.
+   */
+  async startSync(): Promise<void> {
+    await subscribeControlChannel(CONTROL_CHANNEL, (payload) => {
+      const entry = payload as SpreadEntry;
+      if (!entry?.symbol) return;
+      this.cache.set(entry.symbol.toUpperCase(), entry);
+      console.warn(`[broker-spread] ${entry.symbol}: state synced from another worker: enabled=${entry.enabled} spread=${entry.spread} by=${entry.updatedBy}`);
+    });
+  }
 
   async load(): Promise<void> {
     if (!IS_PERSISTENT) {
@@ -361,6 +385,8 @@ export class BrokerSpreadConfig {
     console.log(
       `[broker-spread] ${key}: spread=${entry.spread} enabled=${entry.enabled} by=${adminId}`
     );
+
+    void publishControlChannel(CONTROL_CHANNEL, entry);
 
     return entry;
   }
