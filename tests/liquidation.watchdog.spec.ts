@@ -15,7 +15,7 @@ import { Decimal } from "@prisma/client/runtime/library";
 
 const { mockDb } = vi.hoisted(() => {
   const mockDb = {
-    position: { findMany: vi.fn() },
+    position: { findMany: vi.fn(), findUnique: vi.fn() },
   };
   return { mockDb };
 });
@@ -166,5 +166,31 @@ describe("LiquidationEngine.scanForMissedSlTp()", () => {
     // Does not throw, and the second (unrelated, not-hit) position is still scanned.
     expect(report.scanned).toBe(2);
     expect(mockSettle).toHaveBeenCalledTimes(1); // second position's SL/TP wasn't hit, never called
+  });
+});
+
+describe("LiquidationEngine.closePosition() — admin force-close reason (§0.12, LEDGER_FREEZE.md)", () => {
+  it("passes reason 'ADMIN' to settle(), not 'STOP_OUT' -- distinguishable from a genuine regulatory stop-out in the audit trail", async () => {
+    mockDb.position.findUnique.mockResolvedValue({
+      id: "pos-1", userId: "user-1", symbol: "EURUSD", side: "BUY",
+      quantity: new Decimal(10_000), entryPrice: new Decimal(1.0900),
+      marginUsed: new Decimal(100), leverage: 10, openedAt: new Date(),
+      status: "OPEN",
+    });
+
+    await liquidationEngine.closePosition("pos-1", QUOTE);
+
+    expect(mockSettle).toHaveBeenCalledTimes(1);
+    const settleArg = mockSettle.mock.calls[0][0];
+    expect(settleArg.reason).toBe("ADMIN");
+    expect(settleArg.reason).not.toBe("STOP_OUT");
+    expect(settleArg.detail).toBe("Admin force-close");
+  });
+
+  it("throws when the position doesn't exist or isn't OPEN", async () => {
+    mockDb.position.findUnique.mockResolvedValue(null);
+
+    await expect(liquidationEngine.closePosition("pos-missing", QUOTE)).rejects.toThrow("not found or not open");
+    expect(mockSettle).not.toHaveBeenCalled();
   });
 });

@@ -159,7 +159,16 @@ export class LiquidationEngine {
       throw new Error(`Position ${positionId} not found or not open`);
     }
 
-    return this._close(pos, quote, "STOP_OUT", "Admin force-close");
+    // LEDGER_FREEZE.md §0.12: this had no callers anywhere in the codebase
+    // (confirmed dead code) but previously passed reason "STOP_OUT" -- if it
+    // were ever wired up, audit.outbox.consumer.ts's `action:
+    // position.${reason.toLowerCase()}` would produce an AuditLog row
+    // indistinguishable from a genuine ESMA-mandated regulatory stop-out,
+    // with the only difference being a free-text detail string. "ADMIN" is
+    // an existing CloseReason variant (settlement.engine.ts) that was never
+    // actually used anywhere -- exactly the value this case should have
+    // used from the start.
+    return this._close(pos, quote, "ADMIN", "Admin force-close");
   }
 
   // ── Private ────────────────────────────────────────────────────────────────
