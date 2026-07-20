@@ -632,7 +632,8 @@ export type RejectionReason =
   | "INSTRUMENT_NOT_FOUND"
   | "WALLET_NOT_FOUND"
   | "CLIENT_EXPOSURE_LIMIT_EXCEEDED"
-  | "CORRELATION_RISK_LIMIT_EXCEEDED";
+  | "CORRELATION_RISK_LIMIT_EXCEEDED"
+  | "CONCENTRATION_LIMIT_EXCEEDED";
 
 export type PreTradeRiskResult =
   | { pass: true;  marginRequired: number; notional: number; effectiveLeverage: number }

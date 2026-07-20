@@ -10,6 +10,7 @@ import { killSwitch }        from "./kill.switch.js";
 import { exposureRegistry }  from "./exposure.limits.js";
 import { clientExposureLimits } from "./client.exposure.limits.js";
 import { correlationGuard }     from "./correlation.guard.js";
+import { concentrationGuard }   from "./concentration.guard.js";
 
 export type PreTradeInput = {
   userId:          string;
@@ -176,6 +177,14 @@ export class RiskEngine {
     const correlationCheck = await correlationGuard.check(input.userId, input.symbol.toUpperCase(), input.side);
     if (!correlationCheck.ok) {
       return this._reject(correlationCheck.reason, correlationCheck.detail);
+    }
+
+    // ── 7d. Concentration (HHI) enforcement ────────────────────────────────
+    // RISK_ENGINE_FREEZE.md §3.5: the HHI concentration score was already
+    // computed correctly for the client dashboard but never gated any order.
+    const concentrationCheck = await concentrationGuard.check(input.userId, input.symbol.toUpperCase(), notional);
+    if (!concentrationCheck.ok) {
+      return this._reject(concentrationCheck.reason, concentrationCheck.detail);
     }
 
     // ── 8. Global instrument exposure check ──────────────────────────────
