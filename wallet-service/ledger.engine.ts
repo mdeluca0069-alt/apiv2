@@ -46,15 +46,6 @@ export type WithdrawalInput = {
   method: string;
 };
 
-export type PnLSettlementInput = {
-  userId: string;
-  pnl: number;
-  marginToRelease: number;  // actual margin locked for this position — must be > 0
-  positionId: string;
-  symbol: string;
-  side: "BUY" | "SELL";
-};
-
 export class LedgerEngine {
   private readonly repo: WalletRepository;
 
@@ -321,59 +312,5 @@ export class LedgerEngine {
         },
       });
     }, { maxWait: 10000, timeout: 15000 });
-  }
-
-  async settlePnL(input: PnLSettlementInput): Promise<void> {
-    await this.repo.getOrCreate(input.userId);
-
-    if (input.pnl > 0) {
-      await this.repo.credit(
-        input.userId,
-        input.pnl,
-        "PNL_CREDIT",
-        `PNL:${input.positionId}`,
-        `P&L credit from ${input.side} ${input.symbol} position ${input.positionId}`
-      );
-    } else if (input.pnl < 0) {
-      // Run debit inside its own serializable transaction — the transaction
-      // will re-read the balance internally, avoiding the TOCTOU window.
-      // Negative balance protection: cap loss at available balance.
-      const loss = Math.abs(input.pnl);
-      try {
-        await this.repo.debit(
-          input.userId,
-          loss,
-          "PNL_DEBIT",
-          `PNL:${input.positionId}`,
-          `P&L debit from ${input.side} ${input.symbol} position ${input.positionId}`
-        );
-      } catch (err) {
-        if (err instanceof Error && err.message === "INSUFFICIENT_FUNDS") {
-          // Negative balance protection: debit whatever is available
-          const account = await this.repo.get(input.userId);
-          const available = account ? Number(account.balance) : 0;
-          if (available > 0) {
-            await this.repo.debit(
-              input.userId,
-              available,
-              "PNL_DEBIT",
-              `PNL:${input.positionId}`,
-              `P&L debit (negative balance protection, capped at ${available}) — position ${input.positionId}`
-            );
-          }
-        } else {
-          throw err;
-        }
-      }
-    }
-
-    // Always release margin — pass the actual margin amount, not zero.
-    if (input.marginToRelease > 0) {
-      await this.repo.releaseMargin(
-        input.userId,
-        input.marginToRelease,
-        input.positionId
-      );
-    }
   }
 }

@@ -72,7 +72,6 @@ type LiquidityControl = {
 };
 
 type BrokerRiskPolicy = {
-  stopOutLevelPct: number;
   maxDrawdownPct: number;
   maxRiskPerTradePct: number;
   negativeBalanceProtection: boolean;
@@ -425,7 +424,6 @@ export class BrokerState {
   private readonly liquidityControls = new Map<string, LiquidityControl>();
   private readonly audit: AuditRecord[] = [];
   private riskPolicy: BrokerRiskPolicy = {
-    stopOutLevelPct: 50,
     maxDrawdownPct: 18,
     maxRiskPerTradePct: 2,
     negativeBalanceProtection: true,
@@ -1654,7 +1652,6 @@ export class BrokerState {
   adminUpdateRiskPolicy(
     actor: Principal,
     input: {
-      stopOutLevelPct?: number;
       maxDrawdownPct?: number;
       maxRiskPerTradePct?: number;
       negativeBalanceProtection?: boolean;
@@ -1954,7 +1951,11 @@ export class BrokerState {
       exposure,
       drawdownPct: Math.max(0, -wallet.unrealizedPnl / wallet.available) * 100,
       negativeBalanceProtection: this.riskPolicy.negativeBalanceProtection,
-      stopOutLevelPct: this.riskPolicy.stopOutLevelPct,
+      // RISK_ENGINE_FREEZE.md §7.3: the real stop-out threshold is a hardcoded
+      // ESMA-mandated floor (STOP_OUT_PCT = 50 in trading-service/stopout.engine.ts),
+      // not admin-configurable -- this field used to let an admin set a value here
+      // that was silently never read by the actual liquidation engine.
+      stopOutLevelPct: 50,
       leveragePolicy: this.riskPolicy.leveragePolicy,
       alerts,
     };

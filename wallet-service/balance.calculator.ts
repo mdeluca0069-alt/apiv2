@@ -69,15 +69,4 @@ export class BalanceCalculator {
       marginLevel: isFinite(marginLevel) ? marginLevel : 9999,
     };
   }
-
-  async getBalanceOnly(userId: string): Promise<{ balance: number; locked: number; freeMargin: number }> {
-    const account = await this.db.walletAccount.findUnique({
-      where: { userId },
-      select: { balance: true, locked: true },
-    });
-
-    const balance = account ? Number(account.balance) : 0;
-    const locked  = account ? Number(account.locked)  : 0;
-    return { balance, locked, freeMargin: Math.max(0, balance - locked) };
-  }
 }

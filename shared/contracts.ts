@@ -242,8 +242,12 @@ export const AdminKillSwitchSchema = z.object({
   reason: z.string().min(3).default("Admin broker control center"),
 });
 
+// RISK_ENGINE_FREEZE.md §7.3: stopOutLevelPct is intentionally NOT admin-settable
+// here -- the real stop-out threshold is a hardcoded ESMA-mandated floor
+// (STOP_OUT_PCT = 50 in trading-service/stopout.engine.ts), and this schema
+// previously let an admin set a value that was silently never read by the
+// actual liquidation engine.
 export const AdminRiskPolicySchema = z.object({
-  stopOutLevelPct: z.number().min(10).max(100).optional(),
   maxDrawdownPct: z.number().min(1).max(80).optional(),
   maxRiskPerTradePct: z.number().min(0.1).max(10).optional(),
   negativeBalanceProtection: z.boolean().optional(),
