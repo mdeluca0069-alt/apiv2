@@ -8,6 +8,7 @@ import { leverageGuard }     from "./leverage.guard.js";
 import { marginController }  from "./margin.controller.js";
 import { killSwitch }        from "./kill.switch.js";
 import { exposureRegistry }  from "./exposure.limits.js";
+import { clientExposureLimits } from "./client.exposure.limits.js";
 
 export type PreTradeInput = {
   userId:          string;
@@ -152,6 +153,17 @@ export class RiskEngine {
         "POSITION_SIZE_EXCEEDS_LIMIT",
         `Order requires ${positionPct.toFixed(1)}% of account equity`,
       );
+    }
+
+    // ── 7b. Per-client aggregate exposure cap ─────────────────────────────
+    // RISK_ENGINE_FREEZE.md §3.1: no cap previously existed on a single
+    // client's total open notional or concurrent position count. A client
+    // with enough equity/margin could concentrate into an unbounded number
+    // of large positions even though each individual order passed every
+    // other check. Tier-keyed limits (client.exposure.limits.ts).
+    const clientExposureCheck = await clientExposureLimits.check(input.userId, user.tier, notional);
+    if (!clientExposureCheck.ok) {
+      return this._reject(clientExposureCheck.reason, clientExposureCheck.detail);
     }
 
     // ── 8. Global instrument exposure check ──────────────────────────────
