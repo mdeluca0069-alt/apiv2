@@ -11,6 +11,7 @@ import { exposureRegistry }  from "./exposure.limits.js";
 import { clientExposureLimits } from "./client.exposure.limits.js";
 import { correlationGuard }     from "./correlation.guard.js";
 import { concentrationGuard }   from "./concentration.guard.js";
+import { volatilityLeverageGuard } from "./volatility.leverage.guard.js";
 
 export type PreTradeInput = {
   userId:          string;
@@ -114,7 +115,11 @@ export class RiskEngine {
 
     // ── 3. Leverage cap (ESMA) ────────────────────────────────────────────
     const lvResult        = leverageGuard.check(instrument.assetClass, input.leverage);
-    const effectiveLeverage = lvResult.effectiveLeverage;
+
+    // ── 3b. Volatility-based leverage derating ────────────────────────────
+    // RISK_ENGINE_FREEZE.md §5.5: volatility previously only widened spread
+    // (a cost); it never reduced the leverage granted to a new position.
+    const effectiveLeverage = volatilityLeverageGuard.apply(input.symbol.toUpperCase(), lvResult.effectiveLeverage);
 
     // ── 4. Minimum trade size ─────────────────────────────────────────────
     const minSize = instrument.minTradeSize.toNumber();
