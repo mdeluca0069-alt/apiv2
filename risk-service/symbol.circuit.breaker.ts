@@ -50,6 +50,22 @@ const HALT_THRESHOLD_PCT: Record<string, number> = {
 };
 const DEFAULT_HALT_THRESHOLD_PCT = 1.5;
 
+// RISK_ENGINE_FREEZE.md §5.4: percent move across a reopen (after the feed
+// was stale) that trips the breaker. Deliberately much higher than
+// HALT_THRESHOLD_PCT -- a multi-hour/overnight/weekend gap accumulates real,
+// legitimate price movement (a 2% index gap on overnight news is normal,
+// not a flash crash), so this only catches jumps abnormal even by reopen
+// standards, not ordinary gap risk.
+const GAP_HALT_THRESHOLD_PCT: Record<string, number> = {
+  FX_MAJOR:  1.5,
+  FX_MINOR:  2.0,
+  INDEX:     3.0,
+  COMMODITY: 3.0,
+  CRYPTO:    5.0,
+  EQUITY:    5.0,
+};
+const DEFAULT_GAP_HALT_THRESHOLD_PCT = 3.0;
+
 type TickRecord = { price: number; ts: number };
 
 export type HaltState = {
@@ -107,6 +123,42 @@ export class SymbolCircuitBreaker {
     // recovery sweep could re-enable a symbol an admin deliberately disabled.
   }
 
+  /**
+   * RISK_ENGINE_FREEZE.md §5.4 — gap detection at market reopen.
+   *
+   * recordTick()'s 10s rolling window structurally requires 2 ticks inside
+   * that window to measure any move, so a gap >= 10s (a feed outage, an
+   * overnight break, a weekend) always resets the window down to a single
+   * tick and never trips flash-move detection, no matter how large the real
+   * gap was. This is the missing counterpart: called exactly once per
+   * reopen transition (state.isStale true -> false) by
+   * InternalLiquidityCore.ingestExternalPrice(), comparing the last real
+   * price this symbol had before it went stale directly against the first
+   * real price after -- independent of the tick window entirely.
+   *
+   * Uses GAP_HALT_THRESHOLD_PCT (much higher than HALT_THRESHOLD_PCT) and
+   * reuses the exact same halt/cooldown/alert/metric mechanism as
+   * recordTick() via _trip() -- a reopen halt is indistinguishable to an
+   * admin or the recovery sweep from a flash-move halt.
+   */
+  recordReopen(symbol: string, previousPrice: number, newPrice: number, assetClass: string): void {
+    if (!isFinite(previousPrice) || previousPrice <= 0 || !isFinite(newPrice) || newPrice <= 0) return;
+
+    const movePct   = Math.abs((newPrice - previousPrice) / previousPrice) * 100;
+    const threshold = GAP_HALT_THRESHOLD_PCT[assetClass] ?? DEFAULT_GAP_HALT_THRESHOLD_PCT;
+
+    if (movePct <= threshold) return;
+
+    if (this.haltedByBreaker.has(symbol)) {
+      this.haltedByBreaker.set(symbol, { haltedAt: Date.now(), movePct });
+      return;
+    }
+
+    if (brokerSpreadConfig.isEnabled(symbol)) {
+      void this._trip(symbol, movePct, threshold, 0);
+    }
+  }
+
   /** True if this engine (not an admin) is currently holding this symbol halted. */
   isHaltedByBreaker(symbol: string): boolean {
     return this.haltedByBreaker.has(symbol.toUpperCase());
@@ -161,18 +213,25 @@ export class SymbolCircuitBreaker {
     return { recovered };
   }
 
-  /** Takes ownership of a fresh halt — caller (recordTick) has already
-   *  confirmed this symbol isn't already tracked as ours. */
-  private async _trip(symbol: string, movePct: number, threshold: number): Promise<void> {
+  /**
+   * Takes ownership of a fresh halt — caller (recordTick/recordReopen) has
+   * already confirmed this symbol isn't already tracked as ours.
+   * windowSeconds describes what was actually measured: the 10s rolling
+   * window for recordTick(), or 0 for recordReopen() (a direct last-price
+   * vs first-price comparison across a gap, not a window at all) — so the
+   * halt log/alert never misreports a reopen gap as a 10-second move.
+   */
+  private async _trip(symbol: string, movePct: number, threshold: number, windowSeconds: number = WINDOW_MS / 1000): Promise<void> {
     try {
       await brokerSpreadConfig.setEnabled(symbol, false, "system:circuit-breaker");
       this.haltedByBreaker.set(symbol, { haltedAt: Date.now(), movePct });
+      const windowDesc = windowSeconds > 0 ? `in ${windowSeconds}s ` : "across a reopen gap ";
       console.warn(
-        `[symbol-circuit-breaker] ${symbol} HALTED — moved ${movePct.toFixed(3)}% in ${WINDOW_MS / 1000}s ` +
+        `[symbol-circuit-breaker] ${symbol} HALTED — moved ${movePct.toFixed(3)}% ${windowDesc}` +
         `(threshold ${threshold}%), cooldown ${COOLDOWN_MS / 60_000}min`
       );
       metrics.inc("symbol_circuit_breaker_trips_total");
-      void alertManager.symbolCircuitBreakerTripped(symbol, movePct, WINDOW_MS / 1000);
+      void alertManager.symbolCircuitBreakerTripped(symbol, movePct, windowSeconds);
     } catch (err) {
       console.error(`[symbol-circuit-breaker] failed to halt ${symbol}:`, (err as Error).message);
     }

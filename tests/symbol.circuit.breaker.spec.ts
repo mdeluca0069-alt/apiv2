@@ -133,6 +133,65 @@ describe("SymbolCircuitBreaker.recordTick()", () => {
   });
 });
 
+describe("SymbolCircuitBreaker.recordReopen()", () => {
+  it("does not halt when the reopen gap stays under the asset class's gap threshold", async () => {
+    symbolCircuitBreaker.recordReopen("GAP_EURUSD_A", 1.1000, 1.1100, "FX_MAJOR"); // ~0.91%, under 1.5%
+    await flushMicrotasks();
+
+    expect(mockSetEnabled).not.toHaveBeenCalled();
+    expect(symbolCircuitBreaker.isHaltedByBreaker("GAP_EURUSD_A")).toBe(false);
+  });
+
+  it("halts the symbol when the reopen gap exceeds the asset class's gap threshold", async () => {
+    symbolCircuitBreaker.recordReopen("GAP_EURUSD_B", 1.1000, 1.1200, "FX_MAJOR"); // ~1.82%, over 1.5%
+    await flushMicrotasks();
+
+    expect(mockSetEnabled).toHaveBeenCalledWith("GAP_EURUSD_B", false, "system:circuit-breaker");
+    // windowSeconds=0 signals this halt came from a direct gap comparison,
+    // not the 10s rolling window — distinct from recordTick()'s alert shape.
+    expect(mockTripped).toHaveBeenCalledWith("GAP_EURUSD_B", expect.any(Number), 0);
+    expect(symbolCircuitBreaker.isHaltedByBreaker("GAP_EURUSD_B")).toBe(true);
+  });
+
+  it("fires immediately from a single comparison — no second tick or rolling window needed", async () => {
+    // This is exactly the case recordTick() structurally cannot catch: a
+    // single post-gap tick, with nothing else in any window to compare it to.
+    symbolCircuitBreaker.recordReopen("GAP_XAUUSD_A", 2400, 2500, "COMMODITY"); // ~4.17%, over 3% commodity threshold
+    await flushMicrotasks();
+
+    expect(mockSetEnabled).toHaveBeenCalledWith("GAP_XAUUSD_A", false, "system:circuit-breaker");
+  });
+
+  it("uses a materially higher threshold than recordTick()'s 10s-window threshold for the same asset class", async () => {
+    // A 1% FX_MAJOR move trips recordTick() (threshold 0.5%) but must NOT
+    // trip recordReopen() (threshold 1.5%) -- reopen gaps are expected to be
+    // larger than 10s-window moves and shouldn't be gated at the same bar.
+    symbolCircuitBreaker.recordReopen("GAP_EURUSD_C", 1.1000, 1.1100, "FX_MAJOR"); // ~0.91%
+    await flushMicrotasks();
+    expect(mockSetEnabled).not.toHaveBeenCalled();
+  });
+
+  it("never takes ownership of a symbol already disabled by someone else (e.g. an admin)", async () => {
+    mockIsEnabled.mockReturnValue(false);
+
+    symbolCircuitBreaker.recordReopen("GAP_EURUSD_D", 1.1000, 1.1200, "FX_MAJOR");
+    await flushMicrotasks();
+
+    expect(mockSetEnabled).not.toHaveBeenCalled();
+    expect(symbolCircuitBreaker.isHaltedByBreaker("GAP_EURUSD_D")).toBe(false);
+  });
+
+  it("uses the default gap threshold for an unrecognized asset class", async () => {
+    symbolCircuitBreaker.recordReopen("GAP_WEIRD_A", 100, 102, "UNKNOWN_CLASS"); // 2%, under the 3% default
+    await flushMicrotasks();
+    expect(mockSetEnabled).not.toHaveBeenCalled();
+
+    symbolCircuitBreaker.recordReopen("GAP_WEIRD_A", 100, 104, "UNKNOWN_CLASS"); // 4%, over the 3% default
+    await flushMicrotasks();
+    expect(mockSetEnabled).toHaveBeenCalledWith("GAP_WEIRD_A", false, "system:circuit-breaker");
+  });
+});
+
 describe("SymbolCircuitBreaker.runRecoverySweep()", () => {
   it("does not recover before the cooldown has elapsed", async () => {
     symbolCircuitBreaker.recordTick("TICK_EURUSD_F", 1.1000, "FX_MAJOR");

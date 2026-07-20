@@ -273,6 +273,14 @@ export class InternalLiquidityCore {
     const prec = precisionFor(key, ac);
     const now  = Date.now();
 
+    // Captured before any mutation below, for the reopen-gap check after the
+    // isStale-clearing block. hadExternal distinguishes "recovered after a
+    // real gap" from "the very first tick this symbol has ever received"
+    // (whose state.mid is still the synthetic seed price, not a real one).
+    const wasStale     = state.isStale;
+    const hadExternal  = state.hasExternal;
+    const previousMid  = state.mid;
+
     // FASE 3.2: per-symbol circuit breaker — halts new order acceptance for
     // THIS symbol if the price moved abnormally fast within a short window.
     // Independent of dynamic spread widening below (that reacts to the
@@ -359,6 +367,17 @@ export class InternalLiquidityCore {
       state.isStale    = false;
       state.staleSince = null;
       console.log(`[liquidity-core] ${key} feed recovered — accepting orders`);
+    }
+
+    // RISK_ENGINE_FREEZE.md §5.4: recordTick()'s 10s rolling window
+    // structurally requires 2 ticks within that window to measure a move,
+    // so it never fires across a gap >= 10s -- every overnight/weekend gap
+    // or feed outage silently bypassed flash-move detection. This is the
+    // true reopen-transition check: comparing the last real price this
+    // symbol had before it went stale against the first real price after,
+    // regardless of how long the gap was.
+    if (wasStale && hadExternal && previousMid > 0) {
+      symbolCircuitBreaker.recordReopen(key, previousMid, externalMid, ac);
     }
 
     // Day rollover
