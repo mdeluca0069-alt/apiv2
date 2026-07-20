@@ -9,6 +9,7 @@ import { marginController }  from "./margin.controller.js";
 import { killSwitch }        from "./kill.switch.js";
 import { exposureRegistry }  from "./exposure.limits.js";
 import { clientExposureLimits } from "./client.exposure.limits.js";
+import { correlationGuard }     from "./correlation.guard.js";
 
 export type PreTradeInput = {
   userId:          string;
@@ -164,6 +165,17 @@ export class RiskEngine {
     const clientExposureCheck = await clientExposureLimits.check(input.userId, user.tier, notional);
     if (!clientExposureCheck.ok) {
       return this._reject(clientExposureCheck.reason, clientExposureCheck.detail);
+    }
+
+    // ── 7c. Correlation-aware risk check (manual/API orders) ──────────────
+    // RISK_ENGINE_FREEZE.md §3.3: the real Pearson correlation engine was
+    // only ever consulted by the autopilot pipeline (soft size halving) --
+    // manual/API orders, the majority of trading volume, had zero
+    // correlation awareness. A manual order's quantity is a client contract,
+    // so this blocks outright rather than silently resizing.
+    const correlationCheck = await correlationGuard.check(input.userId, input.symbol.toUpperCase(), input.side);
+    if (!correlationCheck.ok) {
+      return this._reject(correlationCheck.reason, correlationCheck.detail);
     }
 
     // ── 8. Global instrument exposure check ──────────────────────────────

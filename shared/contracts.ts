@@ -631,7 +631,8 @@ export type RejectionReason =
   | "DUPLICATE_CLIENT_ORDER_ID"
   | "INSTRUMENT_NOT_FOUND"
   | "WALLET_NOT_FOUND"
-  | "CLIENT_EXPOSURE_LIMIT_EXCEEDED";
+  | "CLIENT_EXPOSURE_LIMIT_EXCEEDED"
+  | "CORRELATION_RISK_LIMIT_EXCEEDED";
 
 export type PreTradeRiskResult =
   | { pass: true;  marginRequired: number; notional: number; effectiveLeverage: number }
