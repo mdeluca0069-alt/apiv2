@@ -43,6 +43,16 @@ vi.mock("../shared/db.js", () => ({
   },
 }));
 
+// MARKET_DATA_FREEZE.md §0.3: exposure.analytics.ts/var.engine.ts/
+// portfolio.intelligence.ts now value open positions live via
+// market-data/position.valuation.ts (quoteCache), never the old
+// Position.markPrice DB column. Mocked here with the same values this
+// file's fixtures originally put in markPrice, so every downstream
+// assertion (notional-derived currency exposure, etc.) keeps testing the
+// same numbers with no change in intent.
+const { mockQuoteCacheGet } = vi.hoisted(() => ({ mockQuoteCacheGet: vi.fn().mockReturnValue(undefined) }));
+vi.mock("../market-data/quote.cache.js", () => ({ quoteCache: { get: mockQuoteCacheGet } }));
+
 import { portfolioIntelligence } from "../risk-service/portfolio.intelligence.js";
 import { currenciesForSymbol } from "../economic-calendar/economic.event.service.js";
 
@@ -53,6 +63,7 @@ beforeEach(() => {
   mockPositionFindMany.mockReset().mockResolvedValue([]);
   mockTradeAuditFindMany.mockReset().mockResolvedValue([]);
   mockSnapshotFindMany.mockReset().mockResolvedValue([]);
+  mockQuoteCacheGet.mockReset().mockReturnValue(undefined);
 });
 
 // Two open positions shared by most tests: one with a stop, one without; one
@@ -62,16 +73,22 @@ function seedOpenPositions() {
   mockPositionFindMany.mockResolvedValue([
     {
       symbol: "EURUSD", side: "BUY", quantity: dec(10_000),
-      entryPrice: dec(1.10), markPrice: dec(1.105), marginUsed: dec(500), pnl: dec(50),
+      entryPrice: dec(1.10), marginUsed: dec(500), pnl: dec(50),
       stopLoss: dec(1.095),
     },
     {
       symbol: "XAUUSD", side: "SELL", quantity: dec(5),
-      entryPrice: dec(2000), markPrice: dec(1990), marginUsed: dec(400), pnl: dec(50),
+      entryPrice: dec(2000), marginUsed: dec(400), pnl: dec(50),
       stopLoss: null,
     },
   ]);
   mockWalletFindUnique.mockResolvedValue({ balance: dec(10_000), locked: dec(900) });
+  // Live quotes standing in for this fixture's original markPrice values.
+  mockQuoteCacheGet.mockImplementation((symbol: string) => {
+    if (symbol === "EURUSD") return { symbol, bid: 1.1049, ask: 1.1051, mid: 1.105, spread: 0.0002, changePct: 0, ts: new Date().toISOString() };
+    if (symbol === "XAUUSD") return { symbol, bid: 1989.9, ask: 1990.1, mid: 1990,  spread: 0.2,    changePct: 0, ts: new Date().toISOString() };
+    return undefined;
+  });
 }
 
 describe("PortfolioIntelligenceService — basic assembly", () => {

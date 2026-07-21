@@ -147,7 +147,17 @@ export class PositionPriceMonitor {
     return this.positionCache.size >= MAX_POSITIONS_IN_MEM;
   }
 
-  /** Called externally when a new position is opened (after DB write). */
+  /**
+   * Called externally when a new position is opened (after DB write).
+   *
+   * MARKET_DATA_FREEZE.md §0.3: unlike the fire-and-forget "position.opened"
+   * event listener (_onPositionOpened, below), this awaited path does NOT
+   * swallow a transient DB-read failure -- it calls _loadPosition() directly
+   * and lets the error propagate, exactly as this class's own header comment
+   * always documented ("The caller (order.controller) must log CRITICAL and
+   * alert operations"). order.controller.ts already has a catch block ready
+   * for this (previously only ever exercised by PositionMonitorCapacityError).
+   */
   async addPosition(positionId: string): Promise<void> {
     // P0-3: Enforce capacity BEFORE attempting DB load.
     if (this.isAtCapacity()) {
@@ -158,7 +168,42 @@ export class PositionPriceMonitor {
       );
       throw new PositionMonitorCapacityError(this.positionCache.size, MAX_POSITIONS_IN_MEM);
     }
-    await this._onPositionOpened(positionId);
+    await this._loadPosition(positionId);
+  }
+
+  /**
+   * MARKET_DATA_FREEZE.md §0.3 — periodic reconciliation sweep. Finds any
+   * OPEN position missing from positionCache (a failed addPosition() call
+   * that's since been retried/alerted-on but never actually re-added, a
+   * restart race, or -- per the pre-existing comment on the liquidation
+   * watchdog job this mirrors -- a position whose ticks land on a different
+   * worker's cache) and loads it. This is the "next full refresh" the old
+   * silent-catch comment falsely promised; now it's true. Bounds the
+   * maximum staleness of Position.markPrice/pnl for any dropped position to
+   * one sweep interval instead of "forever."
+   */
+  async reconcile(): Promise<{ scanned: number; added: number }> {
+    if (!IS_PERSISTENT || !prisma?.position) return { scanned: 0, added: 0 };
+    const db = prisma as NonNullable<typeof prisma>;
+
+    const openIds = await db.position.findMany({
+      where:  { status: "OPEN" },
+      select: { id: true },
+      take:   MAX_POSITIONS_IN_MEM,
+    });
+
+    let added = 0;
+    for (const { id } of openIds) {
+      if (this.positionCache.has(id)) continue;
+      if (this.isAtCapacity()) break;
+      try {
+        if (await this._loadPosition(id)) added++;
+      } catch (err) {
+        console.error(`[position-monitor] reconcile: failed to load positionId=${id}:`, (err as Error).message);
+      }
+    }
+
+    return { scanned: openIds.length, added };
   }
 
   /** Remove a position from cache (called after settlement). */
@@ -358,56 +403,91 @@ export class PositionPriceMonitor {
     }
   }
 
+  /**
+   * Fire-and-forget wrapper for the "position.opened" event listener
+   * (registered in start()). This path is never awaited by its caller, so a
+   * thrown error here would become an unhandled rejection -- it must stay
+   * non-throwing. Unlike before MARKET_DATA_FREEZE.md §0.3, a failure is now
+   * loudly logged (not silently swallowed), and reconcile() (the periodic
+   * sweep) will pick up the position on its next run regardless of what
+   * happens on this path -- this listener is now a fast-path optimization,
+   * not the only way a position ever enters the cache.
+   */
   private async _onPositionOpened(positionId: string): Promise<void> {
-    if (!IS_PERSISTENT || !positionId || !prisma?.position) return;
+    try {
+      await this._loadPosition(positionId);
+    } catch (err) {
+      console.error(
+        `[position-monitor] position.opened event handler failed to load positionId=${positionId} ` +
+        `(will self-heal on the next reconcile() sweep):`,
+        (err as Error).message,
+      );
+    }
+  }
+
+  /**
+   * Loads one OPEN position from DB into positionCache. Returns true if
+   * added, false if the position doesn't exist / isn't OPEN (not an error --
+   * e.g. it closed between being queued for load and this read running).
+   * Throws on a genuine DB error (network/pool/timeout) instead of
+   * swallowing it -- MARKET_DATA_FREEZE.md §0.3: the previous silent catch
+   * here meant a transient failure left a position out of positionCache,
+   * and therefore its Position.markPrice/pnl DB columns frozen at
+   * creation-time values, FOREVER (the class's own claim that it would be
+   * "loaded on next full refresh" was false -- the only full refresh,
+   * _loadPositions(), runs once, at process start). Callers now decide how
+   * to handle the failure: addPosition() lets it propagate to
+   * order.controller.ts's existing alert path; _onPositionOpened() logs and
+   * relies on reconcile() to self-heal.
+   */
+  private async _loadPosition(positionId: string): Promise<boolean> {
+    if (!IS_PERSISTENT || !positionId || !prisma?.position) return false;
 
     // Secondary capacity guard — covers the event.on("position.opened") path.
     if (this.positionCache.size >= MAX_POSITIONS_IN_MEM) {
       console.error(
-        `[position-monitor] CRITICAL: at capacity, skipping position.opened for positionId=${positionId}`
+        `[position-monitor] CRITICAL: at capacity, skipping load for positionId=${positionId}`
       );
-      return;
+      return false;
     }
 
     const db = prisma as NonNullable<typeof prisma>;
 
-    try {
-      const pos = await db.position.findUnique({
-        where:  { id: positionId },
-        select: {
-          id: true, userId: true, symbol: true, side: true,
-          quantity: true, entryPrice: true, markPrice: true,
-          pnl: true, pnlPercent: true, marginUsed: true, leverage: true,
-          stopLoss: true, takeProfit: true, openedAt: true, status: true,
-        },
-      });
+    const pos = await db.position.findUnique({
+      where:  { id: positionId },
+      select: {
+        id: true, userId: true, symbol: true, side: true,
+        quantity: true, entryPrice: true, markPrice: true,
+        pnl: true, pnlPercent: true, marginUsed: true, leverage: true,
+        stopLoss: true, takeProfit: true, openedAt: true, status: true,
+      },
+    });
 
-      if (!pos || pos.status !== "OPEN") return;
+    if (!pos || pos.status !== "OPEN") return false;
 
-      this.positionCache.set(pos.id, {
-        id:         pos.id,
-        userId:     pos.userId,
-        symbol:     pos.symbol,
-        side:       pos.side as "BUY" | "SELL",
-        quantity:   pos.quantity.toNumber(),
-        entryPrice: pos.entryPrice.toNumber(),
-        markPrice:  pos.markPrice.toNumber(),
-        pnl:        pos.pnl.toNumber(),
-        pnlPercent: pos.pnlPercent.toNumber(),
-        marginUsed: pos.marginUsed.toNumber(),
-        leverage:   pos.leverage,
-        stopLoss:   pos.stopLoss?.toNumber() ?? null,
-        takeProfit: pos.takeProfit?.toNumber() ?? null,
-        openedAt:   pos.openedAt,
-      });
+    this.positionCache.set(pos.id, {
+      id:         pos.id,
+      userId:     pos.userId,
+      symbol:     pos.symbol,
+      side:       pos.side as "BUY" | "SELL",
+      quantity:   pos.quantity.toNumber(),
+      entryPrice: pos.entryPrice.toNumber(),
+      markPrice:  pos.markPrice.toNumber(),
+      pnl:        pos.pnl.toNumber(),
+      pnlPercent: pos.pnlPercent.toNumber(),
+      marginUsed: pos.marginUsed.toNumber(),
+      leverage:   pos.leverage,
+      stopLoss:   pos.stopLoss?.toNumber() ?? null,
+      takeProfit: pos.takeProfit?.toNumber() ?? null,
+      openedAt:   pos.openedAt,
+    });
 
-      // Ensure wallet is cached for tick-level stop-out checks
-      if (!this.walletCache.has(pos.userId)) {
-        void this._refreshWallet(pos.userId);
-      }
-    } catch {
-      // Non-fatal — position will be loaded on next full refresh
+    // Ensure wallet is cached for tick-level stop-out checks
+    if (!this.walletCache.has(pos.userId)) {
+      void this._refreshWallet(pos.userId);
     }
+
+    return true;
   }
 
   // ── Tick-level stop-out (P0 fix) ──────────────────────────────────────────────

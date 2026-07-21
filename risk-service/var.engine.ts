@@ -17,6 +17,7 @@
  * All values in USD, expressed as positive loss amounts.
  */
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { liveNotional } from "../market-data/position.valuation.js";
 
 // z-scores for common confidence levels
 const Z_SCORES: Record<number, number> = {
@@ -127,7 +128,7 @@ export class VarEngine {
       prisma.walletAccount.findUnique({ where: { userId }, select: { balance: true, locked: true } }),
       prisma.position.findMany({
         where:  { userId, status: "OPEN" },
-        select: { pnl: true, marginUsed: true, quantity: true, entryPrice: true, markPrice: true, symbol: true },
+        select: { pnl: true, marginUsed: true, quantity: true, entryPrice: true, symbol: true },
       }),
       prisma.tradeAudit.findMany({
         where:   { userId, tradeStatus: "CLOSED", closedAt: { gte: since, not: null } },
@@ -169,9 +170,11 @@ export class VarEngine {
     const pVar95  = (Z_SCORES[95]! * sigma * scale) || (equity * 0.016 * scale);
     const pVar99  = (Z_SCORES[99]! * sigma * scale) || (equity * 0.023 * scale);
 
-    // Stress scenarios applied to current portfolio
+    // Stress scenarios applied to current portfolio.
+    // MARKET_DATA_FREEZE.md §0.3: live quoteCache valuation, not the
+    // Position.markPrice DB column -- see market-data/position.valuation.ts.
     const grossNotional = openPositions.reduce(
-      (s, p) => s + p.quantity.toNumber() * (p.markPrice?.toNumber() ?? p.entryPrice.toNumber()), 0
+      (s, p) => s + liveNotional({ symbol: p.symbol, quantity: p.quantity.toNumber(), entryPrice: p.entryPrice.toNumber() }), 0
     );
 
     const stressScenarios: StressScenario[] = STRESS_SCENARIOS.map((sc) => {

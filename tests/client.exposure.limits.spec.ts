@@ -7,8 +7,12 @@
  * notional or position count would exceed their tier's limit, accepts
  * when under it, and falls back to STANDARD limits for an unrecognized
  * tier string.
+ *
+ * MARKET_DATA_FREEZE.md §0.3 — updated to mock quoteCache instead of a
+ * Position.markPrice DB field: this module now values open positions via
+ * market-data/position.valuation.ts's liveNotional(), never the DB column.
  */
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Decimal } from "@prisma/client/runtime/library";
 
 const { mockDb } = vi.hoisted(() => ({
@@ -16,15 +20,22 @@ const { mockDb } = vi.hoisted(() => ({
 }));
 vi.mock("../shared/db.js", () => ({ prisma: mockDb, IS_PERSISTENT: true }));
 
+const { mockQuoteCacheGet } = vi.hoisted(() => ({ mockQuoteCacheGet: vi.fn() }));
+vi.mock("../market-data/quote.cache.js", () => ({ quoteCache: { get: mockQuoteCacheGet } }));
+
 const { clientExposureLimits, CLIENT_EXPOSURE_LIMITS } = await import("../risk-service/client.exposure.limits.js");
 
-function pos(quantity: number, entryPrice: number, markPrice = 0) {
+function pos(symbol: string, quantity: number, entryPrice: number) {
   return {
+    symbol,
     quantity:   new Decimal(quantity),
     entryPrice: new Decimal(entryPrice),
-    markPrice:  new Decimal(markPrice),
   };
 }
+
+beforeEach(() => {
+  mockQuoteCacheGet.mockReturnValue(undefined); // no live quote by default -> falls back to entryPrice
+});
 
 describe("ClientExposureLimitsChecker.check()", () => {
   it("accepts when the client has no open positions and the order is well under the tier cap", async () => {
@@ -35,7 +46,7 @@ describe("ClientExposureLimitsChecker.check()", () => {
   });
 
   it("rejects when projected notional would exceed the tier's cap", async () => {
-    mockDb.position.findMany.mockResolvedValue([pos(100_000, 1.1, 1.1)]); // 110,000 notional open
+    mockDb.position.findMany.mockResolvedValue([pos("EURUSD", 100_000, 1.1)]); // 110,000 notional open
 
     const limit = CLIENT_EXPOSURE_LIMITS.STANDARD.maxNotionalUsd; // 250,000
     const incoming = limit - 110_000 + 1; // pushes 1 USD over the cap
@@ -49,7 +60,7 @@ describe("ClientExposureLimitsChecker.check()", () => {
   });
 
   it("accepts when projected notional is exactly at the cap", async () => {
-    mockDb.position.findMany.mockResolvedValue([pos(100_000, 1.0, 1.0)]);
+    mockDb.position.findMany.mockResolvedValue([pos("EURUSD", 100_000, 1.0)]);
 
     const limit = CLIENT_EXPOSURE_LIMITS.STANDARD.maxNotionalUsd;
     const incoming = limit - 100_000;
@@ -60,7 +71,7 @@ describe("ClientExposureLimitsChecker.check()", () => {
 
   it("rejects when opening the position would exceed the tier's max open position count", async () => {
     const limit = CLIENT_EXPOSURE_LIMITS.STANDARD.maxOpenPositions;
-    const openPositions = Array.from({ length: limit }, () => pos(10, 1.0, 1.0));
+    const openPositions = Array.from({ length: limit }, () => pos("EURUSD", 10, 1.0));
     mockDb.position.findMany.mockResolvedValue(openPositions);
 
     const result = await clientExposureLimits.check("user-1", "STANDARD", 100);
@@ -68,15 +79,27 @@ describe("ClientExposureLimitsChecker.check()", () => {
     if (!result.ok) expect(result.detail).toMatch(/concurrent open positions/);
   });
 
-  it("uses markPrice over entryPrice when computing current notional", async () => {
-    mockDb.position.findMany.mockResolvedValue([pos(1_000, 1.0, 2.0)]); // markPrice doubles notional to 2,000
+  it("uses the live quoteCache price over entryPrice when computing current notional (MARKET_DATA_FREEZE.md §0.3)", async () => {
+    mockDb.position.findMany.mockResolvedValue([pos("EURUSD", 1_000, 1.0)]);
+    mockQuoteCacheGet.mockReturnValue({ symbol: "EURUSD", bid: 1.999, ask: 2.001, mid: 2.0, spread: 0.002, changePct: 0, ts: new Date().toISOString() });
 
     const limit = CLIENT_EXPOSURE_LIMITS.STANDARD.maxNotionalUsd;
-    // If entryPrice (1,000 notional) were used instead of markPrice (2,000), this would pass.
+    // If entryPrice (1,000 notional) were used instead of the live mid (2,000), this would pass.
     const incoming = limit - 1_500;
 
     const result = await clientExposureLimits.check("user-1", "STANDARD", incoming);
     expect(result.ok).toBe(false);
+  });
+
+  it("falls back to entryPrice when quoteCache has no live quote for the symbol", async () => {
+    mockDb.position.findMany.mockResolvedValue([pos("EURUSD", 1_000, 1.0)]); // 1,000 notional via entryPrice fallback
+    mockQuoteCacheGet.mockReturnValue(undefined);
+
+    const limit = CLIENT_EXPOSURE_LIMITS.STANDARD.maxNotionalUsd;
+    const incoming = limit - 1_000; // exactly at cap if entryPrice (not some other value) is used
+
+    const result = await clientExposureLimits.check("user-1", "STANDARD", incoming);
+    expect(result.ok).toBe(true);
   });
 
   it("falls back to STANDARD limits for an unrecognized tier string", async () => {

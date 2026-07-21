@@ -204,6 +204,7 @@ jobCoordinator.register({ id: "outbox-retry-sweep",    ttlSeconds: 25,      inte
 jobCoordinator.register({ id: "outbox-cleanup",        ttlSeconds: 780,     intervalMs: 15 * 60_000,        description: "Prune published OutboxEvent rows older than 2h"        });
 jobCoordinator.register({ id: "audit-outbox-consumer", ttlSeconds: 8,       intervalMs: 10_000,             description: "FASE 2.4: turn order.filled/partial_filled/position.closed outbox rows into TradeAudit/AuditLog" });
 jobCoordinator.register({ id: "liquidation-watchdog", ttlSeconds: 25,       intervalMs: 30_000,             description: "FASE 2.5: periodic SL/TP recovery sweep — catches positions missed by the tick-level monitor" });
+jobCoordinator.register({ id: "position-monitor-reconciliation", ttlSeconds: 25, intervalMs: 30_000,         description: "MARKET_DATA_FREEZE.md §0.3: re-adds any OPEN position missing from PositionPriceMonitor's cache, bounding markPrice/pnl staleness to one sweep instead of forever" });
 jobCoordinator.register({ id: "notification-outbox-consumer", ttlSeconds: 12, intervalMs: 15_000,           description: "FASE 2.6: turn order.filled/position.closed outbox rows into reliable Notification rows + email" });
 jobCoordinator.register({ id: "symbol-circuit-breaker-recovery", ttlSeconds: 25, intervalMs: 30_000,         description: "FASE 3.2: auto re-enable symbols the circuit breaker halted, once their cooldown elapses" });
 jobCoordinator.register({ id: "hedge-queue-sweep",     ttlSeconds: 45,      intervalMs: 60_000,             description: "FASE 3.8: evaluate house exposure and record hedge-order scaffold rows (no live provider — REJECTED by design)" });
@@ -1140,6 +1141,28 @@ setInterval(async () => {
     console.error("[liquidation-watchdog] sweep failed:", (err as Error).message);
   } finally {
     await jobCoordinator.release("liquidation-watchdog");
+  }
+}, 30_000);
+
+// MARKET_DATA_FREEZE.md §0.3 — Position monitor reconciliation: every 30 seconds.
+// Re-adds any OPEN position missing from PositionPriceMonitor's in-memory
+// cache (a failed addPosition()/position.opened event load, a restart race,
+// or a position whose ticks land on a different worker's cache — same
+// class of gap the liquidation watchdog above already covers for SL/TP).
+// Bounds Position.markPrice/pnl staleness for a dropped position to one
+// sweep interval instead of indefinitely.
+setInterval(async () => {
+  if (!prisma) return;
+  if (!(await jobCoordinator.tryLead("position-monitor-reconciliation"))) return;
+  try {
+    const r = await positionPriceMonitor.reconcile();
+    if (r.added > 0) {
+      console.warn(`[position-monitor] reconcile: added ${r.added} missing position(s) (scanned=${r.scanned})`);
+    }
+  } catch (err) {
+    console.error("[position-monitor] reconcile sweep failed:", (err as Error).message);
+  } finally {
+    await jobCoordinator.release("position-monitor-reconciliation");
   }
 }, 30_000);
 

@@ -24,6 +24,7 @@
  */
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import type { AccountTier } from "../shared/contracts.js";
+import { liveNotional } from "../market-data/position.valuation.js";
 
 export type ClientExposureCheckResult =
   | { ok: true }
@@ -45,7 +46,7 @@ class ClientExposureLimitsChecker {
 
     const positions = await prisma!.position.findMany({
       where:  { userId, status: "OPEN" },
-      select: { quantity: true, entryPrice: true, markPrice: true },
+      select: { symbol: true, quantity: true, entryPrice: true },
     });
 
     if (positions.length + 1 > limit.maxOpenPositions) {
@@ -56,8 +57,10 @@ class ClientExposureLimitsChecker {
       };
     }
 
+    // MARKET_DATA_FREEZE.md §0.3: live quoteCache valuation, not the
+    // Position.markPrice DB column -- see market-data/position.valuation.ts.
     const currentNotional = positions.reduce(
-      (sum, p) => sum + p.quantity.toNumber() * (p.markPrice?.toNumber() ?? p.entryPrice.toNumber()),
+      (sum, p) => sum + liveNotional({ symbol: p.symbol, quantity: p.quantity.toNumber(), entryPrice: p.entryPrice.toNumber() }),
       0,
     );
     const projectedNotional = currentNotional + incomingNotional;

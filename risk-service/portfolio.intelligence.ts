@@ -16,6 +16,7 @@ import { correlationMatrix } from "./correlation.matrix.js";
 import { exposureAnalyticsService, type ExposureAnalytics, type AssetClassExposure } from "../analytics/exposure.analytics.js";
 import { portfolioAnalyticsService } from "../analytics/portfolio.analytics.js";
 import { currenciesForSymbol } from "../economic-calendar/economic.event.service.js";
+import { liveMarkPrice } from "../market-data/position.valuation.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -70,14 +71,16 @@ async function openPositionRiskRows(userId: string): Promise<PositionRiskRow[]> 
   if (!IS_PERSISTENT) return [];
   const rows = await prisma.position.findMany({
     where:  { userId, status: "OPEN" },
-    select: { symbol: true, side: true, quantity: true, entryPrice: true, markPrice: true, stopLoss: true },
+    select: { symbol: true, side: true, quantity: true, entryPrice: true, stopLoss: true },
   });
+  // MARKET_DATA_FREEZE.md §0.3: live quoteCache valuation, not the
+  // Position.markPrice DB column -- see market-data/position.valuation.ts.
   return rows.map((p) => ({
     symbol:     p.symbol,
     side:       p.side,
     quantity:   p.quantity.toNumber(),
     entryPrice: p.entryPrice.toNumber(),
-    markPrice:  p.markPrice?.toNumber() ?? p.entryPrice.toNumber(),
+    markPrice:  liveMarkPrice(p.symbol, p.entryPrice.toNumber()),
     stopLoss:   p.stopLoss?.toNumber() ?? null,
   }));
 }

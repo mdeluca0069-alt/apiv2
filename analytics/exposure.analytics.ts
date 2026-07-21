@@ -15,6 +15,7 @@
  *   assetClassDiversification — 1 - HHI (higher = more diversified)
  */
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { liveNotional } from "../market-data/position.valuation.js";
 
 export type AssetClassExposure = {
   class:     string;
@@ -87,7 +88,6 @@ export class ExposureAnalyticsService {
         side:      true,
         quantity:  true,
         entryPrice: true,
-        markPrice:  true,
         marginUsed: true,
         pnl:        true,
       },
@@ -104,7 +104,9 @@ export class ExposureAnalyticsService {
     const symbolMap = new Map<string, { long: number; short: number; pnl: number; margin: number; side: string }>();
 
     for (const pos of positions) {
-      const notional = pos.quantity.toNumber() * (pos.markPrice?.toNumber() ?? pos.entryPrice.toNumber());
+      // MARKET_DATA_FREEZE.md §0.3: live quoteCache valuation, not the
+      // Position.markPrice DB column -- see market-data/position.valuation.ts.
+      const notional = liveNotional({ symbol: pos.symbol, quantity: pos.quantity.toNumber(), entryPrice: pos.entryPrice.toNumber() });
       const side     = pos.side;
       const pnl      = pos.pnl.toNumber();
       const margin   = pos.marginUsed.toNumber();
@@ -150,7 +152,7 @@ export class ExposureAnalyticsService {
     const classMap = new Map<string, { long: number; short: number }>();
     for (const pos of positions) {
       const cls      = classifySymbol(pos.symbol);
-      const notional = pos.quantity.toNumber() * (pos.markPrice?.toNumber() ?? pos.entryPrice.toNumber());
+      const notional = liveNotional({ symbol: pos.symbol, quantity: pos.quantity.toNumber(), entryPrice: pos.entryPrice.toNumber() });
       const existing = classMap.get(cls) ?? { long: 0, short: 0 };
       if (pos.side === "BUY") existing.long  += notional;
       else                    existing.short += notional;

@@ -24,6 +24,7 @@
  * positions" is blocked from concentrating further.
  */
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { liveNotional } from "../market-data/position.valuation.js";
 
 const MIN_POSITIONS_BEFORE_ENFORCEMENT = 3;
 const MAX_CONCENTRATION_HHI_PCT        = 40; // same 0-100 scale as exposure.analytics.ts's concentrationRisk
@@ -38,14 +39,16 @@ class ConcentrationGuard {
 
     const positions = await prisma!.position.findMany({
       where:  { userId, status: "OPEN" },
-      select: { symbol: true, quantity: true, entryPrice: true, markPrice: true },
+      select: { symbol: true, quantity: true, entryPrice: true },
     });
 
     if (positions.length + 1 < MIN_POSITIONS_BEFORE_ENFORCEMENT) return { ok: true };
 
+    // MARKET_DATA_FREEZE.md §0.3: live quoteCache valuation, not the
+    // Position.markPrice DB column -- see market-data/position.valuation.ts.
     const bySymbol = new Map<string, number>();
     for (const p of positions) {
-      const notional = p.quantity.toNumber() * (p.markPrice?.toNumber() ?? p.entryPrice.toNumber());
+      const notional = liveNotional({ symbol: p.symbol, quantity: p.quantity.toNumber(), entryPrice: p.entryPrice.toNumber() });
       bySymbol.set(p.symbol, (bySymbol.get(p.symbol) ?? 0) + notional);
     }
     bySymbol.set(symbol, (bySymbol.get(symbol) ?? 0) + incomingNotional);
