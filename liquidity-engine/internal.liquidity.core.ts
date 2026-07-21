@@ -101,6 +101,32 @@ export type LiquidityCoreStats = {
   staleSymbols:   string[];
 };
 
+// MARKET_DATA_FREEZE.md §0.5: before this table, the only validation any
+// tick received anywhere in the ingestion chain (WS/REST feeds, this
+// class) was `isFinite && > 0` -- a wild print (a decimal-point error, a
+// corrupted feed message, "999999" for EURUSD) would be written into
+// quoteCache immediately and unconditionally, visible to every downstream
+// consumer, with only symbol.circuit.breaker.ts's async, order-blocking-
+// only halt reacting afterward -- never a rejection of the bad print
+// itself.
+//
+// Deliberately much more permissive than symbol.circuit.breaker.ts's
+// HALT_THRESHOLD_PCT (10s-window) or GAP_HALT_THRESHOLD_PCT (reopen-gap)
+// tables -- this is an outlier/sanity filter for prints that cannot be
+// real market data under any circumstance (fat-finger, decimal shift,
+// feed corruption), not a volatility control. A single legitimate tick
+// moving an FX major 5%+ has essentially never happened; these bounds
+// exist to catch data corruption, not to gate real (if extreme) moves.
+const SANITY_BOUND_PCT: Record<string, number> = {
+  FX_MAJOR:  5,
+  FX_MINOR:  7,
+  INDEX:     10,
+  COMMODITY: 15,
+  CRYPTO:    30,
+  EQUITY:    25,
+};
+const DEFAULT_SANITY_BOUND_PCT = 15;
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function precisionFor(symbol: string, ac: string): number {
@@ -280,6 +306,26 @@ export class InternalLiquidityCore {
     const wasStale     = state.isStale;
     const hadExternal  = state.hasExternal;
     const previousMid  = state.mid;
+
+    // MARKET_DATA_FREEZE.md §0.5: outlier/sanity check -- reject a tick
+    // outright (never mutate state, never write quoteCache, never reach
+    // the circuit breaker's window) if it deviates from the last known
+    // real price by more than what's physically plausible for a single
+    // tick. Skipped for a symbol's very first-ever tick (hadExternal
+    // false): there is no real previous price to compare against yet,
+    // only the synthetic seed, which could itself be far from today's
+    // real level and would cause false rejections.
+    if (hadExternal && previousMid > 0) {
+      const movePct = Math.abs((externalMid - previousMid) / previousMid) * 100;
+      const bound = SANITY_BOUND_PCT[state.assetClass] ?? DEFAULT_SANITY_BOUND_PCT;
+      if (movePct > bound) {
+        console.error(
+          `[liquidity-core] REJECTED outlier tick for ${key}: ${previousMid} -> ${externalMid} ` +
+          `(${movePct.toFixed(2)}% move, sanity bound ${bound}%) -- discarded, not written anywhere`,
+        );
+        return;
+      }
+    }
 
     // FASE 3.2: per-symbol circuit breaker — halts new order acceptance for
     // THIS symbol if the price moved abnormally fast within a short window.
