@@ -425,8 +425,15 @@ export class SignalGenerator {
       }
     }
 
+    // MARKET_DATA_FREEZE.md §0.4: surface synthetic-vs-real composition at
+    // the exact point indicator engines are warmed -- without this, a
+    // restart silently seeding EMA200 mostly (or entirely) from
+    // synthetic.seeder.ts's placeholder data was indistinguishable in the
+    // logs from a real warm-up.
+    const syntheticCount = candles.filter((c) => c.synthetic).length;
     console.log(
-      `[signal-generator] seeded ${symbol} with ${candles.length} historical candles — ` +
+      `[signal-generator] seeded ${symbol} with ${candles.length} historical candles ` +
+      `(${syntheticCount} synthetic, ${candles.length - syntheticCount} real) — ` +
       `ema200.ready=${eng.ema200.ready}`,
     );
   }

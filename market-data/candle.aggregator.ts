@@ -7,6 +7,16 @@ export type Candle = {
   low: number;
   close: number;
   volume: number;
+  /**
+   * MARKET_DATA_FREEZE.md §0.4: true only for candles fabricated by
+   * synthetic.seeder.ts's Box-Muller GBM placeholder generator at boot.
+   * false/omitted for every real candle (live ticks via onTick(), or real
+   * TwelveData history via historical.seeder.ts) -- so a consumer can
+   * always tell whether the data underlying an indicator/dataQuality
+   * verdict is real or fabricated, instead of the two being visually and
+   * structurally identical.
+   */
+  synthetic?: boolean;
 };
 
 export type Timeframe = "1M" | "5M" | "15M" | "30M" | "1H" | "4H" | "1D";
@@ -54,7 +64,7 @@ function onTick(symbol: string, mid: number, volumeEstimate: number, nowMs: numb
 
     if (!existing) {
       // First tick ever for this symbol+timeframe
-      symbolCurr.set(tf, { time: slot, open: mid, high: mid, low: mid, close: mid, volume: volumeEstimate });
+      symbolCurr.set(tf, { time: slot, open: mid, high: mid, low: mid, close: mid, volume: volumeEstimate, synthetic: false });
       continue;
     }
 
@@ -70,6 +80,7 @@ function onTick(symbol: string, mid: number, volumeEstimate: number, nowMs: numb
         low:    Math.min(existing.close, mid),
         close:  mid,
         volume: volumeEstimate,
+        synthetic: false,
       });
     } else {
       // Still within the same candle period

@@ -137,9 +137,15 @@ export class MultiTimeframeEngine {
     this._feed(bundle, newCandles);
 
     const candleCount = candles.length;
+    // MARKET_DATA_FREEZE.md §0.4: dataQuality must reflect real market data,
+    // not a count that synthetic-seeded placeholder candles (indistinguishable
+    // from real ones before the Candle.synthetic flag existed) could trivially
+    // satisfy from the very first evaluation after a restart. A timeframe
+    // whose history is majority-synthetic is never reported "FULL".
+    const realCandleCount = candles.filter((c) => !c.synthetic).length;
     const dataQuality: DataQuality =
-      candleCount === 0 || candleCount < MIN_USABLE_CANDLES ? "INSUFFICIENT"
-      : candleCount < MIN_CANDLES[tf] ? "PARTIAL"
+      realCandleCount === 0 || realCandleCount < MIN_USABLE_CANDLES ? "INSUFFICIENT"
+      : realCandleCount < MIN_CANDLES[tf] ? "PARTIAL"
       : "FULL";
 
     if (dataQuality === "INSUFFICIENT") {

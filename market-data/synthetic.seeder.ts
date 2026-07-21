@@ -155,6 +155,7 @@ function generateCandles(
       low:    Number((bodyMin - lowerWick).toFixed(prec)),
       close:  candleClose,
       volume: Math.round(vol),
+      synthetic: true,
     });
 
     price = open; // step backwards

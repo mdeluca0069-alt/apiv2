@@ -15,6 +15,8 @@ export type OHLCV = {
   close: number;
   volume?: number;
   timestamp?: string;
+  /** MARKET_DATA_FREEZE.md §0.4: see Candle.synthetic (market-data/candle.aggregator.ts). */
+  synthetic?: boolean;
 };
 
 export class VolatilityEngine {

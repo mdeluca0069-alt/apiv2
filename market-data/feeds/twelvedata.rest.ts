@@ -170,7 +170,7 @@ export async function fetchHistoricalCandles(
 
       if (!time || isNaN(open) || isNaN(high) || isNaN(low) || isNaN(close)) return null;
 
-      return { time, open, high, low, close, volume: isNaN(volume) ? 0 : volume };
+      return { time, open, high, low, close, volume: isNaN(volume) ? 0 : volume, synthetic: false };
     })
     .filter((c): c is Candle => c !== null)
     .reverse(); // oldest first
