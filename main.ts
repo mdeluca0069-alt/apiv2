@@ -78,6 +78,7 @@ import { FeedManager }              from "./market-data/feed.manager.js";
 // which is written exclusively by the core on every tick.
 import {
   InternalLiquidityCore,
+  normaliseSymbol,
 } from "./liquidity-engine/internal.liquidity.core.js";
 import { brokerSpreadConfig } from "./liquidity-engine/broker.spread.config.js";
 import { exposureRegistry }   from "./risk-service/exposure.limits.js";
@@ -628,8 +629,19 @@ const feedManager = new FeedManager({
   symbols:       SYMBOLS,               // all 22 instruments
   wsSymbols:     TWELVEDATA_WS_SYMBOLS, // WS limited to 8 on free plan
   ingestPrice: (symbol, mid, bid, ask) => {
-    feedHealthMonitor.recordQuote(symbol, bid ?? 0, ask ?? 0, "feed-manager");
-    liquidityCore.ingestExternalPrice(symbol, mid, bid, ask);
+    // MARKET_DATA_FREEZE.md §0.2: normalize once, here, before handing the
+    // symbol to EITHER consumer. feedHealthMonitor used to receive the raw
+    // feed-format symbol (e.g. "EUR/USD" from the WS feed) while
+    // liquidityCore normalized internally (-> "EURUSD") -- feedHealthMonitor
+    // stored freshness under a key nothing else ever queried, so it reported
+    // the WS-covered symbols (the freshest, best-covered ones) as
+    // permanently stale. ingestExternalPrice() still normalizes internally
+    // too (idempotent on an already-clean symbol), so this doesn't change
+    // its behavior -- it just guarantees both consumers key off the exact
+    // same string.
+    const key = normaliseSymbol(symbol);
+    feedHealthMonitor.recordQuote(key, bid ?? 0, ask ?? 0, "feed-manager");
+    liquidityCore.ingestExternalPrice(key, mid, bid, ask);
   },
 });
 

@@ -16,7 +16,7 @@
  * quoteCache has real data for, and that a live quoteCache update is
  * reflected on the very next read with no explicit refresh step.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { BrokerState } from "../shared/state.js";
 import { quoteCache } from "../market-data/quote.cache.js";
 import type { Quote } from "../shared/contracts.js";
