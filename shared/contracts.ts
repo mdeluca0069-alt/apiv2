@@ -55,6 +55,12 @@ export const QuoteSchema = z.object({
   spread: z.number().nonnegative(),
   changePct: z.number(),
   ts: z.string(),
+  // MARKET_DATA_FREEZE.md §0.7: true when this symbol's feed has gone
+  // silent past STALE_THRESHOLD_MS -- until this field existed, WS
+  // broadcasts and REST snapshots had no way to tell a client "this price
+  // is not live," even though the backend already tracks staleness
+  // internally (quoteCache.isStale()) and rejects orders on it.
+  isStale: z.boolean().optional(),
 });
 
 export const LoginRequestSchema = z.object({

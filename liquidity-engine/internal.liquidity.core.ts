@@ -400,6 +400,8 @@ export class InternalLiquidityCore {
       spread:    Number((ask - bid).toFixed(prec)),
       changePct,
       ts:        new Date(now).toISOString(),
+      // A real tick just landed -- definitionally not stale at this instant.
+      isStale:   false,
     };
 
     quoteCache.set(quote);
@@ -566,6 +568,7 @@ export class InternalLiquidityCore {
         spread:    Number((ask - bid).toFixed(prec)),
         changePct: existing?.changePct ?? 0,
         ts:        now,
+        isStale:   false,
       };
       quoteCache.set(quote);
     }
@@ -599,6 +602,13 @@ export class InternalLiquidityCore {
       spread:    Number((state.ask - state.bid).toFixed(prec)),
       changePct,
       ts:        now.toISOString(),
+      // MARKET_DATA_FREEZE.md §0.7: surface the staleness this class
+      // already tracks internally (state.isStale, cleared/set alongside
+      // quoteCache.isStale()'s own age-based check) so every consumer of
+      // this quote -- WS broadcast, REST snapshot -- can tell a dead feed
+      // from a live one, instead of only the backend's own order-rejection
+      // path knowing.
+      isStale:   state.isStale,
     };
   }
 }
