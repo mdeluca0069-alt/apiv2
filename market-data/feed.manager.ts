@@ -77,8 +77,11 @@ export type FeedManagerOptions = {
   /**
    * Routes each external price into InternalLiquidityCore.
    * This is the single canonical write path for quoteCache.
+   * `source` (MARKET_DATA_FREEZE.md §0.6) identifies which feed produced
+   * this tick, so a lower-priority source can't overwrite a higher-
+   * priority one's more recent data purely by arriving later at the server.
    */
-  ingestPrice: (symbol: string, mid: number, bid?: number, ask?: number) => void;
+  ingestPrice: (symbol: string, mid: number, bid?: number, ask?: number, source?: FeedName) => void;
 };
 
 // ─── Per-feed stats ───────────────────────────────────────────────────────────
@@ -162,7 +165,7 @@ export class FeedManager {
           if (price > 0) {
             this.stats["twelvedata-rest"].record();
             this._closeCircuit("twelvedata-rest");
-            this.opts.ingestPrice(sym, price);
+            this.opts.ingestPrice(sym, price, undefined, undefined, "twelvedata-rest");
             refreshed++;
           }
         }
@@ -211,6 +214,7 @@ export class FeedManager {
           q.symbol, q.mid,
           q.isRealSpread ? q.bid  : undefined,
           q.isRealSpread ? q.ask  : undefined,
+          "twelvedata-ws",
         );
       },
       onError: (err) => {
@@ -233,7 +237,7 @@ export class FeedManager {
       onQuote: (q) => {
         this.stats["binance-ws"].record();
         this._closeCircuit("binance-ws");
-        this.opts.ingestPrice(q.symbol, q.mid, q.bid, q.ask);
+        this.opts.ingestPrice(q.symbol, q.mid, q.bid, q.ask, "binance-ws");
       },
       onError: (err) => {
         this.stats["binance-ws"].error();
@@ -293,7 +297,7 @@ export class FeedManager {
         if (price > 0) {
           this.stats["twelvedata-rest"].record();
           this._closeCircuit("twelvedata-rest");
-          this.opts.ingestPrice(sym, price);
+          this.opts.ingestPrice(sym, price, undefined, undefined, "twelvedata-rest");
         }
       }
     } catch {

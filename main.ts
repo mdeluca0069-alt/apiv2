@@ -629,7 +629,7 @@ const feedManager = new FeedManager({
   apiKey:        twelvedataKey,
   symbols:       SYMBOLS,               // all 22 instruments
   wsSymbols:     TWELVEDATA_WS_SYMBOLS, // WS limited to 8 on free plan
-  ingestPrice: (symbol, mid, bid, ask) => {
+  ingestPrice: (symbol, mid, bid, ask, source) => {
     // MARKET_DATA_FREEZE.md §0.2: normalize once, here, before handing the
     // symbol to EITHER consumer. feedHealthMonitor used to receive the raw
     // feed-format symbol (e.g. "EUR/USD" from the WS feed) while
@@ -642,7 +642,10 @@ const feedManager = new FeedManager({
     // same string.
     const key = normaliseSymbol(symbol);
     feedHealthMonitor.recordQuote(key, bid ?? 0, ask ?? 0, "feed-manager");
-    liquidityCore.ingestExternalPrice(key, mid, bid, ask);
+    // MARKET_DATA_FREEZE.md §0.6: forward which feed produced this tick so
+    // a lower-priority source can't overwrite a higher-priority one's
+    // fresher data purely by arriving later at the server.
+    liquidityCore.ingestExternalPrice(key, mid, bid, ask, source);
   },
 });
 

@@ -127,6 +127,26 @@ const SANITY_BOUND_PCT: Record<string, number> = {
 };
 const DEFAULT_SANITY_BOUND_PCT = 15;
 
+// MARKET_DATA_FREEZE.md §0.6: source priority, lower rank = more
+// authoritative. Mirrors feed.manager.ts's own documented priority
+// (PRIMARY TwelveData-WS, SECONDARY Binance-WS, TERTIARY TwelveData-REST)
+// -- previously undeclared in code, so the last tick to arrive always won
+// regardless of which feed produced it or how stale that feed's own data
+// actually was at fetch time.
+const SOURCE_PRIORITY: Record<string, number> = {
+  "twelvedata-ws":   1,
+  "binance-ws":      1,
+  "twelvedata-rest": 2,
+};
+const DEFAULT_SOURCE_PRIORITY = 1; // unspecified source (tests, _seedDemoQuotes) treated as top priority
+// A higher-priority source's tick "protects" a symbol from being
+// overwritten by a lower-priority source for this long -- long enough to
+// cover normal WS tick cadence gaps, short enough that a genuinely dead
+// higher-priority feed doesn't block the lower-priority one forever
+// (STALE_THRESHOLD_MS's own staleness marking already handles that case
+// independently).
+const SOURCE_PROTECTION_MS = 10_000;
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function precisionFor(symbol: string, ac: string): number {
@@ -143,6 +163,11 @@ export function normaliseSymbol(raw: string): string {
 
 export class InternalLiquidityCore {
   private readonly instruments = new Map<string, InstrumentState>();
+  // MARKET_DATA_FREEZE.md §0.6: last source+time a tick was actually
+  // accepted for each symbol, so a lower-priority source's slower/older
+  // data can't silently overwrite a higher-priority source's fresher tick
+  // that arrived moments earlier (see ingestExternalPrice()).
+  private readonly lastAcceptedSource = new Map<string, { rank: number; at: number }>();
   private readonly onBatch?:    (quotes: Quote[]) => void;
   private readonly tickMs:      number;
 
@@ -290,10 +315,26 @@ export class InternalLiquidityCore {
     externalMid: number,
     externalBid?: number,
     externalAsk?: number,
+    source?:     string,
   ): void {
     const key   = normaliseSymbol(rawSymbol);
     const state = this.instruments.get(key);
     if (!state || !isFinite(externalMid) || externalMid <= 0) return;
+
+    // MARKET_DATA_FREEZE.md §0.6: ordering guard -- a lower-priority
+    // source (e.g. TwelveData-REST, a batch poll that can reflect data up
+    // to REST_ROTATION_MS old by the time it's fetched) must not overwrite
+    // a higher-priority source's (WS) tick that was accepted moments ago.
+    // Arrival order at this server is not the same as data recency. Only
+    // the CHECK happens here -- lastAcceptedSource is recorded further
+    // down, only once this tick has also passed the sanity-bound check
+    // below, so a rejected outlier never "protects" a symbol under a rank
+    // it was never legitimately accepted at.
+    const sourceRank = SOURCE_PRIORITY[source ?? ""] ?? DEFAULT_SOURCE_PRIORITY;
+    const lastSource  = this.lastAcceptedSource.get(key);
+    if (lastSource && sourceRank > lastSource.rank && (Date.now() - lastSource.at) < SOURCE_PROTECTION_MS) {
+      return; // a higher-priority source is actively covering this symbol -- discard the slower one
+    }
 
     const ac   = state.assetClass;
     const prec = precisionFor(key, ac);
@@ -326,6 +367,11 @@ export class InternalLiquidityCore {
         return;
       }
     }
+
+    // Tick has passed both the priority-ordering and sanity-bound checks --
+    // now legitimately accepted. Record its source/rank so a subsequent
+    // lower-priority tick can be measured against it.
+    this.lastAcceptedSource.set(key, { rank: sourceRank, at: now });
 
     // FASE 3.2: per-symbol circuit breaker — halts new order acceptance for
     // THIS symbol if the price moved abnormally fast within a short window.
