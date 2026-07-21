@@ -1712,12 +1712,12 @@ export class BrokerState {
   }
 
   getQuotes(): Quote[] {
-    const liveQuotes = quoteCache.getAll();
-    if (liveQuotes.length === 0) return [...this.quotes.values()];
-
-    // Merge: live price takes priority; fall back to synthetic for any
-    // symbol the feed hasn't delivered yet (partial quoteCache state).
-    const liveMap = new Map(liveQuotes.map(q => [q.symbol, q]));
+    // MARKET_DATA_FREEZE.md §0.1: quoteCache is the single canonical price
+    // source. Merge its live entries in; for any symbol quoteCache has no
+    // tick for at all (no feed coverage), makeQuote() computes a fresh
+    // (not frozen) synthetic placeholder — never the stale construction-time
+    // snapshot this.quotes used to fall back to here.
+    const liveMap = new Map(quoteCache.getAll().map((q) => [q.symbol, q]));
     return instrumentsSeed.map(
       (inst) => liveMap.get(inst.symbol) ?? this.makeQuote(inst.symbol, this.tick),
     );
@@ -1729,7 +1729,16 @@ export class BrokerState {
   }
 
   getQuote(symbol: string): Quote | null {
-    return this.quotes.get(symbol.toUpperCase()) ?? null;
+    // MARKET_DATA_FREEZE.md §0.1: this used to read the frozen this.quotes
+    // Map (populated once at construction, before quoteCache even existed,
+    // and never refreshed — updateQuotes() is dead code). Every caller
+    // (getLiquidityBook, getIndicatorSnapshot, placeOrder's sandbox fallback,
+    // PnL/margin calcs) now sees the same live quoteCache-backed value
+    // makeQuote() already computes for getQuotes() -- one price per symbol,
+    // not two independently-stale ones.
+    const key = symbol.toUpperCase();
+    if (!instrumentsSeed.some((inst) => inst.symbol === key)) return null;
+    return this.makeQuote(key, this.tick);
   }
 
   placeOrder(order: NewOrderRequest, principal: Principal): OrderAck {
