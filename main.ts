@@ -654,6 +654,11 @@ const feedManager = new FeedManager({
     const accepted = liquidityCore.ingestExternalPrice(key, mid, bid, ask, source);
     if (accepted) {
       feedHealthMonitor.recordQuote(key, bid ?? 0, ask ?? 0, "feed-manager");
+      // MARKET_DATA_FREEZE.md §0.10: relay this worker's own local tick to
+      // every other worker (no-op if Redis is unavailable — see
+      // publishTick's own doc comment for why this is safe to fire from
+      // exactly this call site and no other).
+      void redisPubSub.publishTick(key, mid, bid, ask);
     }
   },
 });
@@ -859,6 +864,16 @@ function onBroadcastEvent(eventType: string, payload: Record<string, unknown>): 
     if (liveTradingEnabled && !client.authenticated) continue;
     try { client.send(msg); } catch { /* ignore */ }
   }
+}
+
+// MARKET_DATA_FREEZE.md §0.10: applies a tick relayed from another worker's
+// own local feed connections. Always tagged "redis-relay" (the lowest
+// SOURCE_PRIORITY rank) so this worker's own local feeds, when active,
+// always win -- a relayed tick only fills in data this worker's own feeds
+// haven't produced recently. Never re-published (see publishTick's own
+// doc comment) -- this is strictly a one-hop relay, not a chain.
+function onTickEvent(symbol: string, mid: number, bid?: number, ask?: number): void {
+  liquidityCore.ingestExternalPrice(symbol, mid, bid, ask, "redis-relay");
 }
 
 /**
@@ -1333,7 +1348,7 @@ setTimeout(function retentionJob() {
 // ─── Redis Pub/Sub: cross-node WebSocket delivery ────────────────────────────
 // Start AFTER pushToUser / onUserEvent / onBroadcastEvent are defined above.
 // Gracefully degrades to single-node-only if Redis is unavailable.
-await redisPubSub.start(onUserEvent, onBroadcastEvent).catch((err) => {
+await redisPubSub.start(onUserEvent, onBroadcastEvent, onTickEvent).catch((err) => {
   console.warn("[redis-pubsub] start failed (single-node mode):", (err as Error).message);
 });
 

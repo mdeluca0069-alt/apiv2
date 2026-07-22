@@ -98,4 +98,32 @@ describe("InternalLiquidityCore.ingestExternalPrice() — source-priority orderi
 
     expect(core.tickSymbol("EURUSD")!.mid).toBeCloseTo(1.1010, 4);
   });
+
+  it("MARKET_DATA_FREEZE.md §0.10: a redis-relay tick is the lowest priority -- discarded when any local feed ticked recently", () => {
+    core = makeCore(["EURUSD"]);
+    core.ingestExternalPrice("EURUSD", 1.1000, 1.0999, 1.1001, "twelvedata-rest"); // even the lowest LOCAL priority...
+    vi.advanceTimersByTime(50);
+    core.ingestExternalPrice("EURUSD", 1.0500, 1.0499, 1.0501, "redis-relay"); // ...still beats a relayed tick
+
+    expect(core.tickSymbol("EURUSD")!.mid).toBeCloseTo(1.1000, 4);
+  });
+
+  it("a redis-relay tick fills in data once no local feed has ticked recently", () => {
+    core = makeCore(["EURUSD"]);
+    core.ingestExternalPrice("EURUSD", 1.1000, 1.0999, 1.1001, "twelvedata-ws");
+    vi.advanceTimersByTime(10_001); // past SOURCE_PROTECTION_MS -- local feed may be degraded
+
+    core.ingestExternalPrice("EURUSD", 1.1020, 1.1019, 1.1021, "redis-relay");
+
+    expect(core.tickSymbol("EURUSD")!.mid).toBeCloseTo(1.1020, 4);
+  });
+
+  it("a local feed tick always overrides a relayed one, even moments later", () => {
+    core = makeCore(["EURUSD"]);
+    core.ingestExternalPrice("EURUSD", 1.1000, 1.0999, 1.1001, "redis-relay");
+    vi.advanceTimersByTime(50);
+    core.ingestExternalPrice("EURUSD", 1.1030, 1.1029, 1.1031, "twelvedata-ws");
+
+    expect(core.tickSymbol("EURUSD")!.mid).toBeCloseTo(1.1030, 4);
+  });
 });

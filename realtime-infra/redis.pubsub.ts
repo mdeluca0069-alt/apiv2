@@ -37,6 +37,14 @@ import { randomUUID } from "node:crypto";
 // ── Channels ──────────────────────────────────────────────────────────────────
 const CH_USER      = "igfx:ws:user";
 const CH_BROADCAST = "igfx:ws:broadcast";
+// MARKET_DATA_FREEZE.md §0.10: quoteCache/InternalLiquidityCore are
+// per-process singletons with no cross-node sync -- in a horizontally
+// scaled deployment, a client's WS connection pinned to one worker and an
+// order routed to another could read genuinely different quoteCache
+// contents (not just latency-delayed, independently derived). Reuses this
+// same relay class/pattern (workerId self-echo-skip, graceful degradation
+// when Redis is unavailable) rather than a new mechanism.
+const CH_TICK       = "igfx:market:tick";
 
 // ── Worker identity ────────────────────────────────────────────────────────────
 // PM2 sets PM2_INSTANCE_ID or cluster ID. Fall back to a random UUID suffix.
@@ -53,9 +61,18 @@ export type WsEnvelope = {
   payload:   Record<string, unknown>;
 };
 
+export type TickEnvelope = {
+  workerId: string;
+  symbol:   string;
+  mid:      number;
+  bid?:     number;
+  ask?:     number;
+};
+
 // ── Callbacks ─────────────────────────────────────────────────────────────────
 export type OnUserEvent      = (userId: string, eventType: string, payload: Record<string, unknown>) => void;
 export type OnBroadcastEvent = (eventType: string, payload: Record<string, unknown>) => void;
+export type OnTickEvent      = (symbol: string, mid: number, bid?: number, ask?: number) => void;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -65,6 +82,7 @@ export class RedisPubSub {
 
   private onUserEvent?:      OnUserEvent;
   private onBroadcastEvent?: OnBroadcastEvent;
+  private onTickEvent?:      OnTickEvent;
 
   /**
    * Start the subscriber connection and register delivery callbacks.
@@ -73,6 +91,7 @@ export class RedisPubSub {
   async start(
     onUserEvent:      OnUserEvent,
     onBroadcastEvent: OnBroadcastEvent,
+    onTickEvent?:     OnTickEvent,
   ): Promise<void> {
     const redis = getRedis();
     if (!redis) {
@@ -82,6 +101,7 @@ export class RedisPubSub {
 
     this.onUserEvent      = onUserEvent;
     this.onBroadcastEvent = onBroadcastEvent;
+    this.onTickEvent      = onTickEvent;
 
     // Duplicate the shared client — subscriber connections cannot issue
     // non-subscribe commands (SET, GET, PUBLISH, etc.) on the same connection.
@@ -99,9 +119,21 @@ export class RedisPubSub {
       this.connected = false;
     });
 
-    await this.subscriber.subscribe(CH_USER, CH_BROADCAST);
+    await this.subscriber.subscribe(CH_USER, CH_BROADCAST, CH_TICK);
 
     this.subscriber.on("message", (channel, raw) => {
+      if (channel === CH_TICK) {
+        let tick: TickEnvelope;
+        try {
+          tick = JSON.parse(raw) as TickEnvelope;
+        } catch {
+          return;
+        }
+        if (tick.workerId === WORKER_ID) return; // skip echo
+        this.onTickEvent?.(tick.symbol, tick.mid, tick.bid, tick.ask);
+        return;
+      }
+
       let envelope: WsEnvelope;
       try {
         envelope = JSON.parse(raw) as WsEnvelope;
@@ -120,7 +152,7 @@ export class RedisPubSub {
     });
 
     this.connected = true;
-    console.log(`[redis-pubsub] worker=${WORKER_ID} subscribed to ${CH_USER} + ${CH_BROADCAST}`);
+    console.log(`[redis-pubsub] worker=${WORKER_ID} subscribed to ${CH_USER} + ${CH_BROADCAST} + ${CH_TICK}`);
   }
 
   /** Whether the subscriber connection is active. */
@@ -151,6 +183,18 @@ export class RedisPubSub {
     await this._publish(CH_BROADCAST, { workerId: WORKER_ID, userId: null, eventType, payload });
   }
 
+  /**
+   * MARKET_DATA_FREEZE.md §0.10 — publish a real market tick this worker's
+   * OWN feed connections just accepted, so every other worker's
+   * InternalLiquidityCore/quoteCache can apply it too. Only ever called
+   * from the feed-ingestion path for a LOCALLY-sourced tick (never from
+   * the onTickEvent receive callback) -- publishing a relayed tick back
+   * out would create an infinite cross-node echo.
+   */
+  async publishTick(symbol: string, mid: number, bid?: number, ask?: number): Promise<void> {
+    await this._publish(CH_TICK, { workerId: WORKER_ID, symbol, mid, bid, ask });
+  }
+
   async stop(): Promise<void> {
     this.connected = false;
     if (this.subscriber) {
@@ -160,7 +204,7 @@ export class RedisPubSub {
     console.log(`[redis-pubsub] worker=${WORKER_ID} stopped`);
   }
 
-  private async _publish(channel: string, envelope: WsEnvelope): Promise<void> {
+  private async _publish(channel: string, envelope: Record<string, unknown>): Promise<void> {
     const redis = getRedis();
     if (!redis) return;
     try {

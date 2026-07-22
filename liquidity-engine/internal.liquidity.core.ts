@@ -137,6 +137,14 @@ const SOURCE_PRIORITY: Record<string, number> = {
   "twelvedata-ws":   1,
   "binance-ws":      1,
   "twelvedata-rest": 2,
+  // MARKET_DATA_FREEZE.md §0.10: a tick relayed from another worker's
+  // Redis publish (see realtime-infra/redis.pubsub.ts). Deliberately the
+  // lowest priority -- this worker's own local feeds always win when
+  // active; a relayed tick only fills in data when this specific worker's
+  // own feed connections haven't produced anything more authoritative
+  // recently (e.g. this worker's own TwelveData-WS free-plan symbol
+  // subset doesn't cover this symbol, or its own feed is degraded).
+  "redis-relay":     3,
 };
 const DEFAULT_SOURCE_PRIORITY = 1; // unspecified source (tests, _seedDemoQuotes) treated as top priority
 // A higher-priority source's tick "protects" a symbol from being
