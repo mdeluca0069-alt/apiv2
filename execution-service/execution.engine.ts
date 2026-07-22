@@ -126,6 +126,21 @@ export class ExecutionEngine {
     // the check, keeps the original behavior) if quoteCache has no live
     // quote at all right now — this is a new protective check, it should
     // never itself become a new way to block an order.
+    // MARKET_DATA_FREEZE.md §0.13: checkRequote() only detects PRICE DRIFT —
+    // if the feed died completely while this order was queued, quoteCache
+    // still returns the same frozen quote it had at acceptance time, so
+    // checkRequote() computes 0% movement and passes. A total feed outage
+    // during the queueing window was previously indistinguishable from a
+    // perfectly quiet market. Checked before the drift check, using the
+    // exact same NO_LIVE_MARKET_DATA reason order.controller.ts already
+    // uses for the same underlying condition at order-acceptance time.
+    if (quoteCache.isStale(req.symbol)) {
+      const reason = `NO_LIVE_MARKET_DATA: ${req.symbol} feed went stale while your order was queued`;
+      await orderLifecycle.rejectOrder(req.orderId, reason);
+      emitOrderRejected(req, reason);
+      return { status: "REJECTED", orderId: req.orderId, reason: "NO_LIVE_MARKET_DATA" };
+    }
+
     const freshQuote = quoteCache.get(req.symbol);
     if (freshQuote) {
       const rq = checkRequote(req.symbol, req.side, quote, freshQuote);

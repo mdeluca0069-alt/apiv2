@@ -13,9 +13,15 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockGetQuote } = vi.hoisted(() => ({ mockGetQuote: vi.fn() }));
+const { mockGetQuote, mockIsStale } = vi.hoisted(() => ({
+  mockGetQuote: vi.fn(),
+  // MARKET_DATA_FREEZE.md §0.13: defaults to "live" so the pre-existing
+  // requote-drift scenarios below are unaffected; the dedicated stale-feed
+  // scenario overrides this explicitly.
+  mockIsStale:  vi.fn().mockReturnValue(false),
+}));
 vi.mock("../market-data/quote.cache.js", () => ({
-  quoteCache: { get: mockGetQuote },
+  quoteCache: { get: mockGetQuote, isStale: mockIsStale },
 }));
 
 const { mockTx, mockPrisma } = vi.hoisted(() => {
@@ -98,6 +104,7 @@ function makeQueryRawDispatcher(walletBalance: string, walletLocked: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockIsStale.mockReturnValue(false);
   mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx));
   mockTx.$queryRaw.mockImplementation(makeQueryRawDispatcher("10000", "0"));
   mockTx.position.create.mockResolvedValue({});
@@ -127,12 +134,42 @@ describe("ExecutionEngine.execute() — requote check", () => {
     expect(mockFill).toHaveBeenCalledTimes(1);
   });
 
-  it("fails open (executes normally) when quoteCache has no live quote to compare against", async () => {
+  it("still executes when quoteCache has no live quote to compare against but the symbol is NOT flagged stale (edge case: fails open on the drift check specifically)", async () => {
+    // checkRequote() itself has nothing to compare against and is skipped --
+    // this isolates that the drift check alone still fails open, distinct
+    // from the dedicated stale-feed gate below.
     mockGetQuote.mockReturnValue(undefined);
 
     const result = await executionEngine.execute(REQ, ORIGINAL_QUOTE);
 
     expect(result.status).toBe("FILLED");
     expect(mockFill).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ExecutionEngine.execute() — stale-feed gate at fill time (MARKET_DATA_FREEZE.md §0.13)", () => {
+  it("rejects with NO_LIVE_MARKET_DATA when the feed went stale while the order was queued, instead of filling against a frozen price", async () => {
+    // This is exactly the gap checkRequote() alone can't catch: the feed
+    // died completely after order acceptance, so quoteCache still returns
+    // the SAME quote it had at acceptance time (0% drift) -- but it's now
+    // flagged stale.
+    mockGetQuote.mockReturnValue(ORIGINAL_QUOTE);
+    mockIsStale.mockReturnValue(true);
+
+    const result = await executionEngine.execute(REQ, ORIGINAL_QUOTE);
+
+    expect(result.status).toBe("REJECTED");
+    expect((result as { reason?: string }).reason).toBe("NO_LIVE_MARKET_DATA");
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    expect(mockFill).not.toHaveBeenCalled();
+  });
+
+  it("does not reject on staleness when the feed is live", async () => {
+    mockGetQuote.mockReturnValue({ bid: 1.0869, ask: 1.0871, mid: 1.0870, symbol: "EURUSD", spread: 0.0002, changePct: 0.1 });
+    mockIsStale.mockReturnValue(false);
+
+    const result = await executionEngine.execute(REQ, ORIGINAL_QUOTE);
+
+    expect(result.status).toBe("FILLED");
   });
 });

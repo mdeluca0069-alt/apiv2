@@ -12,7 +12,7 @@
  * modules now provide (an optional `db`/`tx` parameter defaulting to the
  * top-level prisma client), not just a re-statement of the test's own mocks.
  * Only shared/db.ts (prisma), fill.engine.ts, exposure.limits.ts,
- * gateway/metrics.ts, and reconciliation.engine.ts are mocked.
+ * gateway/metrics.ts, quote.cache.ts, and reconciliation.engine.ts are mocked.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { eventBus } from "../events-bus/event.bus.js";
@@ -40,6 +40,15 @@ vi.mock("../shared/db.js", () => ({ prisma: mockPrisma, IS_PERSISTENT: true }));
 const { mockFill } = vi.hoisted(() => ({ mockFill: vi.fn() }));
 vi.mock("../execution-service/fill.engine.js", () => ({
   fillEngine: { fill: mockFill, providerId: "MOCK_LP" },
+}));
+
+// MARKET_DATA_FREEZE.md §0.13: this file tests margin/atomicity, not market
+// data -- quoteCache mocked minimally so the new stale-feed gate in
+// execute() never fires here (get() has no live-quote-drift assertions in
+// this file either, so `undefined` -- fails open on the drift check --
+// matches this file's original, unmocked-but-effectively-empty behavior).
+vi.mock("../market-data/quote.cache.js", () => ({
+  quoteCache: { get: vi.fn().mockReturnValue(undefined), isStale: vi.fn().mockReturnValue(false) },
 }));
 
 const { mockCheckCanOpenAtomic } = vi.hoisted(() => ({

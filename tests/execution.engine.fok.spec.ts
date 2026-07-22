@@ -14,8 +14,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const { mockGetQuote } = vi.hoisted(() => ({ mockGetQuote: vi.fn() }));
+// MARKET_DATA_FREEZE.md §0.13: this file doesn't test staleness -- always live.
 vi.mock("../market-data/quote.cache.js", () => ({
-  quoteCache: { get: mockGetQuote },
+  quoteCache: { get: mockGetQuote, isStale: vi.fn().mockReturnValue(false) },
 }));
 
 const { mockTx, mockPrisma } = vi.hoisted(() => {
