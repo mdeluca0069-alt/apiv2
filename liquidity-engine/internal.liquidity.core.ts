@@ -703,7 +703,14 @@ export class InternalLiquidityCore {
       mid:       Number(state.mid.toFixed(prec)),
       spread:    Number((state.ask - state.bid).toFixed(prec)),
       changePct,
-      ts:        now.toISOString(),
+      // MARKET_DATA_FREEZE.md §0.9: this is called every periodic
+      // broadcast tick (_tick(), ~1/sec), not only on a real external tick
+      // -- stamping `now` unconditionally meant a symbol whose feed died
+      // still broadcast a fresh-looking timestamp every cycle, forever.
+      // Reflects the real last-tick time once one has happened; a
+      // consumer computing "age" from ts (instead of reading isStale
+      // directly) now sees the truth too, not just this field's sibling.
+      ts: state.hasExternal ? new Date(state.lastExternalAt).toISOString() : now.toISOString(),
       // MARKET_DATA_FREEZE.md §0.7: surface the staleness this class
       // already tracks internally (state.isStale, cleared/set alongside
       // quoteCache.isStale()'s own age-based check) so every consumer of
