@@ -417,7 +417,6 @@ export class BrokerState {
   private readonly _amlAlerts = new Map<string, AmlAlert>();
   private readonly users = new Map<string, UserRecord>();
   private readonly sessions = new Map<string, SessionRecord>();
-  private readonly quotes = new Map<string, Quote>();
   private readonly orders = new Map<string, OrderAck>();
   private readonly positions = new Map<string, Position>();
   private readonly clientAccounts = new Map<string, BrokerClientAccount>();
@@ -519,7 +518,6 @@ export class BrokerState {
       }
     });
     instrumentsSeed.forEach((instrument) => {
-      this.quotes.set(instrument.symbol, this.makeQuote(instrument.symbol, 0));
       this.liquidityControls.set(instrument.symbol, {
         symbol: instrument.symbol,
         enabled: true,
@@ -1644,7 +1642,6 @@ export class BrokerState {
     };
     this.liquidityControls.set(symbol, next);
     void this.persistBrokerSetting("liquidityControls", Object.fromEntries(this.liquidityControls.entries()));
-    this.quotes.set(symbol, this.makeQuote(symbol, this.tick));
     this.recordAudit(actor.sub, "admin.liquidity_updated", "liquidity_control", next);
     return next;
   }
@@ -1691,24 +1688,6 @@ export class BrokerState {
 
   getInstruments(): Instrument[] {
     return instrumentsSeed;
-  }
-
-  updateQuotes(): Quote[] {
-    this.tick += 1;
-    for (const instrument of instrumentsSeed) {
-      const quote = this.makeQuote(instrument.symbol, this.tick);
-      this.quotes.set(instrument.symbol, quote);
-      eventBus.emit("market.quote", {
-        symbol:    quote.symbol,
-        bid:       quote.bid,
-        ask:       quote.ask,
-        mid:       quote.mid,
-        spread:    quote.spread,
-        changePct: quote.changePct,
-        timestamp: quote.ts,
-      });
-    }
-    return this.getQuotes();
   }
 
   getQuotes(): Quote[] {
