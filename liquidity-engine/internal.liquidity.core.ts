@@ -198,6 +198,19 @@ export class InternalLiquidityCore {
       // Symbol is marked stale because no real external data has arrived.
       // quoteCache.isStale() will return true — orders will be rejected
       // until the first real TwelveData tick sets hasExternal = true.
+      //
+      // MARKET_DATA_FREEZE.md §0.12 (LATENT, investigated, no fix applied):
+      // this.instruments is deliberately NOT mirrored into quoteCache here.
+      // quoteCache.isStale() treats an ABSENT entry as stale (`if (!q?.ts)
+      // return true`), which is what actually keeps orders rejected before
+      // the first real tick. Seeding quoteCache with this placeholder would
+      // give it a fresh `ts` (now.toISOString(), since hasExternal=false),
+      // which would make isStale() return false for a symbol that has NEVER
+      // received a real price — a financial-correctness regression, not a
+      // fix. Confirmed via grep that no production code reads
+      // this.instruments via getBook()/getAllQuotes()/tickSymbol() outside
+      // test files, so the asymmetry has no live consumer today; it must
+      // stay asymmetric rather than be "fixed" into this bug.
       this.instruments.set(key, {
         mid:            base,
         bid:            base,
