@@ -701,6 +701,14 @@ setInterval(async () => {
 
     const quote = quoteCache.get(symbol); // ← reads from LiquidityCore output
     if (!quote) return;
+    // MARKET_DATA_FREEZE.md §0.14: unlike order.controller.ts/liquidation.
+    // engine.ts, this loop never checked quoteCache.isStale() -- a symbol
+    // that HAD a quote once but whose feed has since died still passed the
+    // `!quote` check (the last frozen quote is never cleared) and could
+    // generate a signal off a stale price/candle, while a real order on
+    // the same symbol would simultaneously be rejected with
+    // NO_LIVE_MARKET_DATA at the same instant.
+    if (quoteCache.isStale(symbol)) return;
 
     const utcHour = new Date().getUTCHours();
     const sessionMult = (utcHour >= 13 && utcHour <= 17) ? 1.4
