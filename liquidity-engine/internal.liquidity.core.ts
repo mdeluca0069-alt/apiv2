@@ -309,6 +309,15 @@ export class InternalLiquidityCore {
    *   - When only mid is provided (free plan), bid/ask are derived from the
    *     last real spread recorded by SpreadStore. If no real spread is known
    *     yet, bid = ask = mid (zero spread).
+   *
+   * Returns true if the tick was actually accepted and written, false if it
+   * was rejected (invalid input, source-priority ordering, sanity-bound
+   * outlier). MARKET_DATA_FREEZE.md §0.8: callers that also track feed
+   * health (main.ts's ingestPrice -> feedHealthMonitor.recordQuote()) must
+   * only record a tick as "fresh" when it was genuinely accepted here --
+   * otherwise a tick this method rejects can still be counted as a live,
+   * healthy quote by a separate tracker that ran unconditionally before
+   * this one had a chance to validate it.
    */
   ingestExternalPrice(
     rawSymbol:   string,
@@ -316,10 +325,10 @@ export class InternalLiquidityCore {
     externalBid?: number,
     externalAsk?: number,
     source?:     string,
-  ): void {
+  ): boolean {
     const key   = normaliseSymbol(rawSymbol);
     const state = this.instruments.get(key);
-    if (!state || !isFinite(externalMid) || externalMid <= 0) return;
+    if (!state || !isFinite(externalMid) || externalMid <= 0) return false;
 
     // MARKET_DATA_FREEZE.md §0.6: ordering guard -- a lower-priority
     // source (e.g. TwelveData-REST, a batch poll that can reflect data up
@@ -333,7 +342,7 @@ export class InternalLiquidityCore {
     const sourceRank = SOURCE_PRIORITY[source ?? ""] ?? DEFAULT_SOURCE_PRIORITY;
     const lastSource  = this.lastAcceptedSource.get(key);
     if (lastSource && sourceRank > lastSource.rank && (Date.now() - lastSource.at) < SOURCE_PROTECTION_MS) {
-      return; // a higher-priority source is actively covering this symbol -- discard the slower one
+      return false; // a higher-priority source is actively covering this symbol -- discard the slower one
     }
 
     const ac   = state.assetClass;
@@ -364,7 +373,7 @@ export class InternalLiquidityCore {
           `[liquidity-core] REJECTED outlier tick for ${key}: ${previousMid} -> ${externalMid} ` +
           `(${movePct.toFixed(2)}% move, sanity bound ${bound}%) -- discarded, not written anywhere`,
         );
-        return;
+        return false;
       }
     }
 
@@ -497,6 +506,7 @@ export class InternalLiquidityCore {
     };
 
     quoteCache.set(quote);
+    return true;
   }
 
   /** Returns true if the symbol has no live market data (stale or never received). */

@@ -641,11 +641,20 @@ const feedManager = new FeedManager({
     // its behavior -- it just guarantees both consumers key off the exact
     // same string.
     const key = normaliseSymbol(symbol);
-    feedHealthMonitor.recordQuote(key, bid ?? 0, ask ?? 0, "feed-manager");
     // MARKET_DATA_FREEZE.md §0.6: forward which feed produced this tick so
     // a lower-priority source can't overwrite a higher-priority one's
     // fresher data purely by arriving later at the server.
-    liquidityCore.ingestExternalPrice(key, mid, bid, ask, source);
+    //
+    // MARKET_DATA_FREEZE.md §0.8: feedHealthMonitor used to be recorded
+    // BEFORE ingestExternalPrice() validated the tick at all -- a tick
+    // ingestExternalPrice rejected (invalid, outlier, lower-priority) could
+    // still be counted as a fresh, healthy quote by the health monitor,
+    // with garbage bid=0/ask=0 when bid/ask were undefined. Now only a
+    // tick this class actually accepted and wrote is recorded as fresh.
+    const accepted = liquidityCore.ingestExternalPrice(key, mid, bid, ask, source);
+    if (accepted) {
+      feedHealthMonitor.recordQuote(key, bid ?? 0, ask ?? 0, "feed-manager");
+    }
   },
 });
 
