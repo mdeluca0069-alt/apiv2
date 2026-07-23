@@ -999,6 +999,16 @@ eventBus.on("risk.warning", (event) => {
 eventBus.on("position.opened", (event) => {
   enqueueAndPush(event.userId, "position.opened", event as unknown as Record<string, unknown>);
 });
+// REALTIME_FREEZE.md H.6: position.service.ts has emitted this on every
+// SL/TP edit since it was written, but nothing ever bridged it to WS -- a
+// user who modified SL/TP got no live confirmation of their own change
+// (only whatever the synchronous REST response showed). Discrete,
+// low-frequency, meaningful edit -- durable via enqueueAndPush like
+// position.opened, not fire-and-forget like the high-frequency
+// position.pnl_updated tick stream below.
+eventBus.on("position.updated", (event) => {
+  enqueueAndPush(event.userId, "position.updated", event as unknown as Record<string, unknown>);
+});
 eventBus.on("position.closed", (event) => {
   // FASE 2.1: see order.filled above — outboxId points at the row already
   // committed atomically with the close in settlement.engine.ts.
