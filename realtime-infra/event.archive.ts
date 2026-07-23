@@ -60,9 +60,12 @@ const ARCHIVED_EVENTS: Array<keyof import("../events-bus/event.bus.js").BrokerEv
   "position.closed",
   "signal.generated",
   "risk.warning",
-  "risk.stop_out",
-  "risk.margin_call",
   "wallet.event",
+  // REALTIME_FREEZE.md Critical #1: "risk.stop_out"/"risk.margin_call" were
+  // removed as event names entirely -- stopout.engine.ts now emits a single
+  // canonical "margin.warning" for all three thresholds (WARNING/
+  // MARGIN_CALL/STOP_OUT, disambiguated by its own `threshold` field), so
+  // this one archive subscription now covers what used to require three.
   "margin.warning",
   "trade.closed",
   "swap.accrued",

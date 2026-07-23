@@ -288,13 +288,23 @@ export type OrderStatusChangedEvent = {
   timestamp: string;
 };
 
+// REALTIME_FREEZE.md Critical #1: the single canonical event for all three
+// margin-risk thresholds (WARNING 150%, MARGIN_CALL 100%, STOP_OUT 50%).
+// Previously WARNING had no event at all, and MARGIN_CALL/STOP_OUT emitted
+// under two other names ("risk.margin_call"/"risk.stop_out") that had zero
+// listeners anywhere -- three broken/half-wired paths pretending to be one
+// working pipeline. `threshold` disambiguates which level fired;
+// `positionsClosed`/`totalPnl` are only populated for STOP_OUT.
 export type MarginWarningEvent = {
   userId:          string;
   marginLevelPct:  number;
   freeMargin:      number;
   equity:          number;
-  threshold:       "MARGIN_CALL" | "STOP_OUT";
+  marginUsed:      number;
+  threshold:       "WARNING" | "MARGIN_CALL" | "STOP_OUT";
   timestamp:       string;
+  positionsClosed?: number;
+  totalPnl?:        number;
 };
 
 export type PositionPnlUpdatedEvent = {
@@ -305,24 +315,6 @@ export type PositionPnlUpdatedEvent = {
   pnl:         number;
   pnlPercent:  number;
   timestamp:   string;
-};
-
-export type RiskStopOutEvent = {
-  userId:          string;
-  marginLevel:     number;
-  equity:          number;
-  marginUsed:      number;
-  positionsClosed: number;
-  totalPnl:        number;
-  triggeredAt:     string;
-};
-
-export type RiskMarginCallEvent = {
-  userId:      string;
-  marginLevel: number;
-  equity:      number;
-  marginUsed:  number;
-  triggeredAt: string;
 };
 
 export type TradeClosedEvent = {
@@ -428,9 +420,6 @@ export interface BrokerEventMap {
   "autopilot.rejected":     [AutopilotRejectedEvent];
   "autopilot.config_changed": [AutopilotConfigChangedEvent];
   "autopilot.daily_loss_lock": [AutopilotDailyLossLockEvent];
-  // Risk engine
-  "risk.stop_out":          [RiskStopOutEvent];
-  "risk.margin_call":       [RiskMarginCallEvent];
   // Trade lifecycle
   "trade.closed":           [TradeClosedEvent];
   // Swap

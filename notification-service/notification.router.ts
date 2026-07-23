@@ -228,11 +228,35 @@ export class NotificationRouter {
       );
     });
 
-    // Margin warnings
+    // Margin warnings — REALTIME_FREEZE.md Critical #1: single canonical
+    // event for all three ESMA thresholds (WARNING 150%, MARGIN_CALL 100%,
+    // STOP_OUT 50%). Previously this listener existed but nothing ever
+    // emitted "margin.warning" -- unreachable dead code. Threshold-specific
+    // copy/priority mirrors what stopout.engine.ts used to write directly
+    // to the Notification table itself (now consolidated here, so it also
+    // respects notificationPreference opt-outs like every other channel).
     eventBus.on("margin.warning", (e) => {
-      void this.sendAll(e.userId, "margin", "CRITICAL",
-        "Margin warning",
-        String((e as Record<string, unknown>).message ?? "Margin level critical"),
+      const copy: Record<string, { title: string; body: string; priority: NotifPriority }> = {
+        WARNING: {
+          title:    "Margin Warning",
+          body:     `Your margin level has dropped to ${e.marginLevelPct.toFixed(0)}%. Add funds or reduce positions to avoid a margin call.`,
+          priority: "HIGH",
+        },
+        MARGIN_CALL: {
+          title:    "Margin Call",
+          body:     `Margin level is ${e.marginLevelPct.toFixed(0)}%. New positions are restricted. Add funds immediately to avoid stop-out.`,
+          priority: "CRITICAL",
+        },
+        STOP_OUT: {
+          title:    "Stop-Out Triggered",
+          body:     `Your margin level dropped to ${e.marginLevelPct.toFixed(0)}% and ${e.positionsClosed ?? 0} position(s) ` +
+                    `were automatically closed to protect your account (net P&L ${(e.totalPnl ?? 0).toFixed(2)} USD).`,
+          priority: "CRITICAL",
+        },
+      };
+      const msg = copy[e.threshold];
+      if (!msg) return;
+      void this.sendAll(e.userId, "margin", msg.priority, msg.title, msg.body,
         e as unknown as Record<string, unknown>,
       );
     });

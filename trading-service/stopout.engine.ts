@@ -197,15 +197,22 @@ export class StopOutEngine {
     }
 
     // Emit warning notification at 150%
+    // REALTIME_FREEZE.md Critical #1: this used to only call _notify() (a
+    // direct db.notification.create() with no eventBus emit at all) -- the
+    // WARNING threshold had no live/WS path whatsoever. Now emits the same
+    // canonical "margin.warning" event MARGIN_CALL/STOP_OUT use below, so
+    // WebSocket + NotificationRouter both fire for every threshold.
     if (marginLevel >= MARGIN_CALL_PCT && marginLevel < WARNING_PCT) {
-      await this._notify(userId, "WARNING", marginLevel);
       await this._saveMarginSnapshot(userId, equity, balance, marginUsed, marginLevel, "WARNING");
+      eventBus.emit("margin.warning", {
+        userId, marginLevelPct: marginLevel, freeMargin: Math.max(0, equity - marginUsed),
+        equity, marginUsed, threshold: "WARNING", timestamp: triggeredAt,
+      });
       return { userId, marginLevel, action: "WARNING", liquidated: 0, totalPnl: 0, triggeredAt };
     }
 
     // Restrict new orders at 100% (margin call level)
     if (marginLevel >= STOP_OUT_PCT && marginLevel < MARGIN_CALL_PCT) {
-      await this._notify(userId, "MARGIN_CALL", marginLevel);
       await this._saveMarginSnapshot(userId, equity, balance, marginUsed, marginLevel, "MARGIN_CALL");
 
       // Write risk warning for dashboard
@@ -220,7 +227,13 @@ export class StopOutEngine {
       });
 
       metrics.inc("margin_calls_total");
-      eventBus.emit("risk.margin_call", { userId, marginLevel, equity, marginUsed, triggeredAt });
+      // REALTIME_FREEZE.md Critical #1: was "risk.margin_call", a name with
+      // zero listeners anywhere -- the event fired into the void. Now the
+      // same canonical "margin.warning" event as WARNING/STOP_OUT.
+      eventBus.emit("margin.warning", {
+        userId, marginLevelPct: marginLevel, freeMargin: Math.max(0, equity - marginUsed),
+        equity, marginUsed, threshold: "MARGIN_CALL", timestamp: triggeredAt,
+      });
       return { userId, marginLevel, action: "MARGIN_CALL", liquidated: 0, totalPnl: 0, triggeredAt };
     }
 
@@ -371,20 +384,21 @@ export class StopOutEngine {
     metrics.inc("stop_out_episodes_total");
     if (skippedHalted > 0) metrics.inc("stop_out_skipped_halted_total", skippedHalted);
     if (skippedStale > 0)  metrics.inc("stop_out_skipped_stale_total", skippedStale);
-    eventBus.emit("risk.stop_out", {
-      userId, marginLevel, equity, marginUsed,
-      positionsClosed: liquidated, totalPnl,
-      triggeredAt,
-    });
 
-    // LEDGER_FREEZE.md §0.11: _notify() only ever handled WARNING/MARGIN_CALL
-    // -- a client who was actually stopped out got nothing beyond the
-    // generic per-position "Position closed" notice, never a dedicated
-    // "you were stopped out" message. Only fires if something was actually
+    // REALTIME_FREEZE.md Critical #1: was "risk.stop_out", a name with zero
+    // listeners anywhere. Now the same canonical "margin.warning" event as
+    // WARNING/MARGIN_CALL -- a client who was actually stopped out gets a
+    // dedicated "you were stopped out" push (via NotificationRouter/WS),
+    // not just the generic per-position "Position closed" notice from
+    // settlementEngine.settle(). Only fires if something was actually
     // closed (a sweep that only skipped halted/stale positions has nothing
-    // to tell the client yet).
+    // new to tell the client yet).
     if (liquidated > 0) {
-      await this._notify(userId, "STOP_OUT", marginLevel, { liquidated, totalPnl });
+      eventBus.emit("margin.warning", {
+        userId, marginLevelPct: marginLevel, freeMargin: Math.max(0, equity - marginUsed),
+        equity, marginUsed, threshold: "STOP_OUT", timestamp: triggeredAt,
+        positionsClosed: liquidated, totalPnl,
+      });
     }
 
     console.warn(`[stop-out] userId=${userId} marginLevel=${marginLevel.toFixed(1)}% closed=${liquidated} totalPnl=${totalPnl}` +
@@ -404,50 +418,6 @@ export class StopOutEngine {
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
-
-  private async _notify(
-    userId: string, level: "WARNING" | "MARGIN_CALL" | "STOP_OUT", marginLevel: number,
-    stopOutDetail?: { liquidated: number; totalPnl: number },
-  ) {
-    if (!prisma?.notification) return;
-    const db = prisma as NonNullable<typeof prisma>;
-
-    const messages: Record<string, { title: string; body: string }> = {
-      WARNING: {
-        title: "Margin Warning",
-        body:  `Your margin level has dropped to ${marginLevel.toFixed(0)}%. Add funds or reduce positions to avoid a margin call.`,
-      },
-      MARGIN_CALL: {
-        title: "Margin Call",
-        body:  `Margin level is ${marginLevel.toFixed(0)}%. New positions are restricted. Add funds immediately to avoid stop-out.`,
-      },
-      STOP_OUT: {
-        title: "Stop-Out Triggered",
-        body:  `Your margin level dropped to ${marginLevel.toFixed(0)}% and ${stopOutDetail?.liquidated ?? 0} position(s) ` +
-               `were automatically closed to protect your account (net P&L ${(stopOutDetail?.totalPnl ?? 0).toFixed(2)} USD).`,
-      },
-    };
-
-    const msg = messages[level];
-    if (!msg) return;
-
-    try {
-      await db.notification.create({
-        data: {
-          id:       randomUUID(),
-          userId,
-          channel:  "IN_APP",
-          category: "margin",
-          priority: level === "WARNING" ? "HIGH" : "CRITICAL",
-          title:    msg.title,
-          body:     msg.body,
-          payload:  level === "STOP_OUT" ? { marginLevel, ...stopOutDetail } as object : { marginLevel } as object,
-        },
-      });
-    } catch {
-      // Non-fatal — stop-out proceeds regardless
-    }
-  }
 
   private async _saveMarginSnapshot(
     userId:      string,

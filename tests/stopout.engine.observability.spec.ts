@@ -15,6 +15,14 @@
  *   3. _notify() never fired for the STOP_OUT branch itself -- the client
  *      got only the generic per-position "Position closed" notice, never a
  *      dedicated "you were stopped out" message. Now fires when liquidated > 0.
+ *
+ * REALTIME_FREEZE.md Critical #1 (2026-07-23): _notify()/db.notification.create()
+ * was removed from this engine entirely -- StopOutEngine now emits a single
+ * canonical "margin.warning" eventBus event (threshold: WARNING/MARGIN_CALL/
+ * STOP_OUT) and notification.router.ts's own "margin.warning" listener
+ * creates the Notification row, so it also respects notificationPreference
+ * opt-outs. The third describe block below was updated to assert against
+ * eventBus.emit(...) instead of the (now-removed) direct DB write.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Decimal } from "@prisma/client/runtime/library";
@@ -126,8 +134,8 @@ describe("StopOutEngine.checkUser() — audit write failure is visible, not sile
   });
 });
 
-describe("StopOutEngine.checkUser() — dedicated stop-out notification (Bug #11)", () => {
-  it("creates a dedicated STOP_OUT notification when at least one position was liquidated", async () => {
+describe("StopOutEngine.checkUser() — dedicated stop-out notification (Bug #11, updated for REALTIME_FREEZE.md Critical #1)", () => {
+  it("emits a canonical margin.warning(threshold: STOP_OUT) event when at least one position was liquidated", async () => {
     mockDb.walletAccount.findUnique.mockResolvedValue({ balance: decimalLike(10_000), locked: decimalLike(6_000) });
     mockDb.position.findMany.mockResolvedValue([makePosition("pos-A", "EURUSD", 1.9000, 3_000)]);
     mockQuoteGet.mockReturnValue({ symbol: "EURUSD", bid: 1.1000, ask: 1.1002, mid: 1.1001 });
@@ -135,14 +143,16 @@ describe("StopOutEngine.checkUser() — dedicated stop-out notification (Bug #11
 
     await stopOutEngine.checkUser("user-1");
 
-    expect(mockDb.notification.create).toHaveBeenCalledTimes(1);
-    const call = mockDb.notification.create.mock.calls[0][0].data as { title: string; body: string; priority: string };
-    expect(call.title).toBe("Stop-Out Triggered");
-    expect(call.body).toContain("1 position(s)");
-    expect(call.priority).toBe("CRITICAL");
+    const stopOutCalls = mockEmit.mock.calls.filter(
+      (c) => c[0] === "margin.warning" && c[1]?.threshold === "STOP_OUT",
+    );
+    expect(stopOutCalls).toHaveLength(1);
+    const payload = stopOutCalls[0][1] as { userId: string; positionsClosed: number; totalPnl: number };
+    expect(payload.userId).toBe("user-1");
+    expect(payload.positionsClosed).toBe(1);
   });
 
-  it("does NOT create a notification when nothing was actually closed (e.g. all positions skipped)", async () => {
+  it("does NOT emit margin.warning(STOP_OUT) when nothing was actually closed (e.g. all positions skipped)", async () => {
     // balance/locked chosen so margin level is below the STOP_OUT floor even
     // with pnl=0 (the staleness fallback) -- otherwise the STOP_OUT branch
     // is never entered at all and this test would prove nothing.
@@ -155,6 +165,9 @@ describe("StopOutEngine.checkUser() — dedicated stop-out notification (Bug #11
 
     expect(result.action).toBe("STOP_OUT");
     expect(result.liquidated).toBe(0);
-    expect(mockDb.notification.create).not.toHaveBeenCalled();
+    const stopOutCalls = mockEmit.mock.calls.filter(
+      (c) => c[0] === "margin.warning" && c[1]?.threshold === "STOP_OUT",
+    );
+    expect(stopOutCalls).toHaveLength(0);
   });
 });
