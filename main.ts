@@ -385,6 +385,11 @@ interface AuthenticatedSocket extends WebSocket {
   tenantId?: string;
   authenticated: boolean;
   isAlive?: boolean;
+  // REALTIME_FREEZE.md H.2: role claims from the same JWT already used for
+  // userId/tenantId (TokenPayload.roles -- always present on a valid token,
+  // see shared/security.ts). Lets pushToStaff() target admin/compliance/risk
+  // operators without a second auth round-trip.
+  roles?: string[];
 }
 
 // ─── HTTP + WebSocket server ──────────────────────────────────────────────────
@@ -403,8 +408,9 @@ const wss = new WebSocketServer({
       if (token) {
         const payload = jwtKeyManager.verifyToken(token) ?? verifyToken(token, verifyKey);
         if (payload) {
-          (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string })._jwtSub      = payload.sub;
-          (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string })._jwtTenantId = payload.tenantId;
+          (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtSub      = payload.sub;
+          (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtTenantId = payload.tenantId;
+          (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtRoles    = payload.roles;
         }
       }
       cb(true);
@@ -416,8 +422,9 @@ const wss = new WebSocketServer({
     const payload = jwtKeyManager.verifyToken(token) ?? verifyToken(token, verifyKey);
     if (!payload) { cb(false, 4001, "Invalid or expired JWT"); return; }
 
-    (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string })._jwtSub      = payload.sub;
-    (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string })._jwtTenantId = payload.tenantId;
+    (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtSub      = payload.sub;
+    (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtTenantId = payload.tenantId;
+    (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtRoles    = payload.roles;
     cb(true);
   },
 });
@@ -449,11 +456,12 @@ setInterval(() => {
 
 wss.on("connection", (rawSocket: WebSocket, req: IncomingMessage) => {
   const socket = rawSocket as AuthenticatedSocket;
-  const extReq = req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string };
+  const extReq = req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] };
 
   socket.isAlive      = true;
   socket.userId       = extReq._jwtSub;
   socket.tenantId     = extReq._jwtTenantId;
+  socket.roles        = extReq._jwtRoles;
   socket.authenticated = Boolean(socket.userId);
 
   socket.on("pong",  () => { socket.isAlive = true; });
@@ -840,6 +848,43 @@ function pushToUser(userId: string, type: string, data: unknown): boolean {
   return delivered;
 }
 
+// REALTIME_FREEZE.md H.2: admin/compliance/risk staff previously had zero WS
+// signal for anything -- MarginRiskBoard, AMLAlerts, etc. were pure poll
+// (10-30s) with no live push of any kind, including for margin calls and AML
+// flags an operator should see immediately. Local-node-only by design: unlike
+// pushToUser/broadcast, this filters by role, and the existing cross-node
+// relay (redisPubSub.publishBroadcast → onBroadcastEvent) fans a broadcast
+// out to EVERY authenticated client on every other node with no role
+// filtering -- reusing it here would leak compliance-sensitive alerts (AML
+// flags) to any authenticated trader connected to a different node. A
+// role-aware cross-node channel is a larger, separate piece of work (tracked
+// in REALTIME_CERTIFICATION_REPORT.md); this delivers to staff connected to
+// THIS node only, which is the same single-node reach pushToUser had before
+// Task 9's Redis relay was added.
+//
+// `allowedRoles` are lowercase ("admin", "risk", "compliance", "super_admin")
+// -- the actual vocabulary TokenPayload.roles carries end-to-end (issued by
+// auth.service.ts straight from User.roles, matched against by
+// access.policy.ts's real ROLE_PERMISSIONS table; see prisma/seed.ts's admin
+// user: roles: ["admin", "compliance", "risk"]). Deliberately NOT
+// security/rbac.engine.ts's RoleName ("ADMIN", "RISK_MANAGER", ...) -- that's
+// a separate, uppercase vocabulary that permission.middleware.ts casts real
+// lowercase roles into with `as RoleName[]`, an unsafe cast that never
+// matches at runtime. Copying that mismatch here would make every staff push
+// silently match nobody. Not fixing permission.middleware.ts itself -- that
+// RBAC case-sensitivity bug is real but outside REALTIME_FREEZE.md's scope;
+// flagged separately in REALTIME_CERTIFICATION_REPORT.md.
+function pushToStaff(type: string, data: unknown, allowedRoles: readonly string[]): void {
+  const msg = JSON.stringify({ type, payload: data });
+  for (const rawClient of wss.clients) {
+    const client = rawClient as AuthenticatedSocket;
+    if (client.readyState !== client.OPEN) continue;
+    if (!client.authenticated || !client.roles) continue;
+    if (!client.roles.some((r) => allowedRoles.includes(r))) continue;
+    try { client.send(msg); } catch { /* ignore broken pipe */ }
+  }
+}
+
 // ─── Redis cross-node delivery callbacks ─────────────────────────────────────
 // These are registered with redisPubSub.start() below and called when a message
 // arrives from another node that was NOT originated by this worker.
@@ -995,6 +1040,13 @@ eventBus.on("signal.generated", (event) => {
 });
 eventBus.on("risk.warning", (event) => {
   enqueueAndPush(event.userId, "risk.warning", { warning: event });
+  // REALTIME_FREEZE.md H.2: compliance-engine/aml.engine.ts emits this with
+  // type "AML_FLAG" for HIGH/CRITICAL risk assessments -- previously only
+  // ever reached the flagged user themselves (above); compliance staff had
+  // no live signal and relied on AMLAlerts.tsx's 30s poll.
+  if (event.type === "AML_FLAG" && (event.severity === "HIGH" || event.severity === "CRITICAL")) {
+    pushToStaff("admin.aml_alert", event, ["super_admin", "admin", "compliance"]);
+  }
 });
 eventBus.on("position.opened", (event) => {
   enqueueAndPush(event.userId, "position.opened", event as unknown as Record<string, unknown>);
@@ -1028,6 +1080,16 @@ eventBus.on("wallet.event", (event) => {
 });
 eventBus.on("margin.warning", (event) => {
   enqueueAndPush(event.userId, "margin.warning", event as unknown as Record<string, unknown>);
+  // REALTIME_FREEZE.md H.2 (paired with Critical #1's margin.warning fix):
+  // MARGIN_CALL/STOP_OUT are the two actionable thresholds an operator needs
+  // to react to, not the softer WARNING level -- pushing WARNING too would
+  // fire far more often than is useful for an admin alert. MarginRiskBoard.tsx
+  // previously had zero live signal (15s poll only, per the finding's own
+  // callout that it "could have been the second safety channel" for these
+  // thresholds).
+  if (event.threshold === "MARGIN_CALL" || event.threshold === "STOP_OUT") {
+    pushToStaff("admin.margin_alert", event, ["super_admin", "admin", "risk"]);
+  }
 });
 
 // P6 — Background retry sweep: recover events for users who just came online.
