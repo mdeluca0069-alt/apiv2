@@ -22,10 +22,21 @@
  */
 
 import { eventBus } from "../events-bus/event.bus.js";
+import { STALE_THRESHOLD_MS } from "../liquidity-engine/internal.liquidity.core.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const STALE_THRESHOLD_MS      = Number(process.env.STALE_THRESHOLD_MS  ?? 360_000);  // 6 min
+// MARKET_DATA_FREEZE.md Global Verification (post-§0.2/§0.8): this used to
+// define its own STALE_THRESHOLD_MS, independently overridable via
+// process.env.STALE_THRESHOLD_MS. quoteCache.isStale() (the check that
+// actually gates order execution) and this monitor's own isQuoteFresh()/
+// getSnapshot() (which feeds the global risk supervisor's stale-symbol
+// alerting) would silently diverge the moment that env var was ever set --
+// the emergency supervisor could see a symbol as healthy while orders for
+// it were already being rejected as stale, or vice versa. Imports the same
+// constant quoteCache itself imports from internal.liquidity.core.ts
+// (market-data/quote.cache.ts) so there is exactly one threshold, not two
+// copies that happen to agree today only because no env var is set.
 const QUALITY_CHECK_INTERVAL  = 5_000;   // check quality every 5s
 const MAX_SPREAD_MULTIPLIER   = 20;      // quote rejected if spread > 20× normal
 const MIN_TICK_FREQ_PER_MIN   = 0.1;     // at least 1 tick per 10 min (relaxed for REST fallback)
