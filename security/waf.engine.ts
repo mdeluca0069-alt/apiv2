@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { immutableAudit } from "./immutable.audit.js";
 import { getRedis }   from "../shared/redis.js";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 
@@ -336,14 +337,11 @@ export class WAFEngine {
     const critical = violations.filter((v) => v.severity === "CRITICAL" || v.severity === "HIGH");
     if (critical.length === 0 || !IS_PERSISTENT || !prisma) return;
 
-    await prisma.auditLog.create({
-      data: {
-        id:     randomUUID(),
-        actor:  ip,
-        action: blocked ? "waf.blocked" : "waf.detected",
-        entity: path,
-        payload: { method, path, violations: critical.slice(0, 5), blocked } as object,
-      },
+    await immutableAudit.write({
+      actor:  ip,
+      action: blocked ? "waf.blocked" : "waf.detected",
+      entity: path,
+      payload: { method, path, violations: critical.slice(0, 5), blocked } as object,
     }).catch(() => undefined);
   }
 }

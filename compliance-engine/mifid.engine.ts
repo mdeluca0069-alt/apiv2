@@ -9,6 +9,7 @@
  */
 import { randomUUID }    from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -74,14 +75,11 @@ export class MifidEngine {
     const appropriate = score >= 60 && acknowledgesRisk;
 
     if (IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   userId,
-          action:  `mifid.appropriateness.${appropriate ? "passed" : "failed"}`,
-          entity:  userId,
-          payload: { score, answers, warnings, appropriate } as object,
-        },
+      await immutableAudit.write({
+        actor:   userId,
+        action:  `mifid.appropriateness.${appropriate ? "passed" : "failed"}`,
+        entity:  userId,
+        payload: { score, answers, warnings, appropriate } as object,
       });
 
       // Update KYC status if not appropriate
@@ -122,14 +120,11 @@ export class MifidEngine {
     };
 
     if (IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "MIFID_ENGINE",
-          action:  "mifid.trade_report",
-          entity:  params.orderId,
-          payload: report as unknown as object,
-        },
+      await immutableAudit.write({
+        actor:   "MIFID_ENGINE",
+        action:  "mifid.trade_report",
+        entity:  params.orderId,
+        payload: report as unknown as object,
       });
     }
 

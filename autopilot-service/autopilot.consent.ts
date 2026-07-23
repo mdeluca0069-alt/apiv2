@@ -8,6 +8,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 export const CURRENT_CONSENT_VERSION = "2026-06-30-v1";
 
@@ -68,14 +69,11 @@ export class AutopilotConsentService {
       update: { consentVersion: CURRENT_CONSENT_VERSION, consentAcceptedAt: acceptedAt },
     });
 
-    await prisma.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   actorId,
-        action:  "autopilot.consent_accepted",
-        entity:  userId,
-        payload: { version: CURRENT_CONSENT_VERSION, acceptedAt: acceptedAt.toISOString() },
-      },
+    await immutableAudit.write({
+      actor:   actorId,
+      action:  "autopilot.consent_accepted",
+      entity:  userId,
+      payload: { version: CURRENT_CONSENT_VERSION, acceptedAt: acceptedAt.toISOString() },
     });
   }
 }

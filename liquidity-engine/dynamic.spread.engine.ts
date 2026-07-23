@@ -21,8 +21,8 @@
  * The result replaces the base broker spread for the next execution window.
  */
 
-import { randomUUID }       from "node:crypto";
 import { prisma }           from "../shared/db.js";
+import { immutableAudit }   from "../security/immutable.audit.js";
 import { brokerSpreadConfig } from "./broker.spread.config.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -188,14 +188,11 @@ export class DynamicSpreadEngine {
   ): Promise<void> {
     if (!prisma) return;
     try {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "DYNAMIC_SPREAD_ENGINE",
-          action:  "spread.widened",
-          entity:  symbol,
-          payload: { baseSpread: base, effectiveSpread: effective, multiplier: mult, reason } as object,
-        },
+      await immutableAudit.write({
+        actor:   "DYNAMIC_SPREAD_ENGINE",
+        action:  "spread.widened",
+        entity:  symbol,
+        payload: { baseSpread: base, effectiveSpread: effective, multiplier: mult, reason } as object,
       });
     } catch {
       // Non-fatal — spread audit logging is best-effort

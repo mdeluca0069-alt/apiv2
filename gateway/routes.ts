@@ -4181,16 +4181,11 @@ export const routes: Route[] = [
 
       // Write audit trail
       if (IS_PERSISTENT) {
-        const { randomUUID } = await import("node:crypto");
-        const db = (await import("../shared/db.js")).prisma;
-        await (db as NonNullable<typeof db>).auditLog.create({
-          data: {
-            id:      randomUUID(),
-            actor:   p.sub,
-            action:  "trading.suspension_lifted",
-            entity:  userId,
-            payload: { adminId: p.sub, reason: "Manual admin unsuspend" } as object,
-          },
+        await immutableAudit.write({
+          actor:   p.sub,
+          action:  "trading.suspension_lifted",
+          entity:  userId,
+          payload: { adminId: p.sub, reason: "Manual admin unsuspend" } as object,
         });
       }
 

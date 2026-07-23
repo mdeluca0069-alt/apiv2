@@ -45,6 +45,7 @@
 
 import { Decimal }   from "@prisma/client/runtime/library";
 import { prisma }    from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { metrics }   from "../gateway/metrics.js";
 import { alertManager } from "../alerting/alert.manager.js";
 
@@ -249,33 +250,31 @@ export class AuditOutboxConsumer {
         });
       }
 
-      await tx.auditLog.create({
-        data: {
-          actor:   p.userId,
-          action:  `position.${p.reason.toLowerCase()}`,
-          entity:  p.positionId,
-          payload: {
-            positionId:          p.positionId,
-            symbol:              p.symbol,
-            side:                p.side,
-            quantity:            p.quantity,
-            entryPrice:          p.entryPrice,
-            exitPrice:           p.exitPrice,
-            rawPnl:              p.rawPnl,
-            cappedPnl:           p.pnl,
-            commission:          p.commission,
-            swap:                p.swap,
-            netCredit:           p.netCredit,
-            marginUsedRequested: p.marginUsedRequested,
-            marginUsedReleased:  p.marginUsedReleased,
-            marginDiscrepancy:   p.marginDiscrepancy,
-            nbpWriteOff:         p.nbpWriteOff,
-            reason:              p.reason,
-            detail:              p.detail,
-          } as object,
-          createdAt: closedAt,
-        },
-      });
+      await immutableAudit.write({
+        actor:   p.userId,
+        action:  `position.${p.reason.toLowerCase()}`,
+        entity:  p.positionId,
+        payload: {
+          positionId:          p.positionId,
+          symbol:              p.symbol,
+          side:                p.side,
+          quantity:            p.quantity,
+          entryPrice:          p.entryPrice,
+          exitPrice:           p.exitPrice,
+          rawPnl:              p.rawPnl,
+          cappedPnl:           p.pnl,
+          commission:          p.commission,
+          swap:                p.swap,
+          netCredit:           p.netCredit,
+          marginUsedRequested: p.marginUsedRequested,
+          marginUsedReleased:  p.marginUsedReleased,
+          marginDiscrepancy:   p.marginDiscrepancy,
+          nbpWriteOff:         p.nbpWriteOff,
+          reason:              p.reason,
+          detail:              p.detail,
+        } as object,
+        timestamp: closedAt,
+      }, tx);
 
       await tx.outboxEvent.update({ where: { id: outboxId }, data: { auditProcessed: true } });
     });

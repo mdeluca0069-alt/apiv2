@@ -28,6 +28,7 @@
 import { randomUUID }             from "node:crypto";
 import { Decimal }                from "@prisma/client/runtime/library";
 import { prisma, IS_PERSISTENT }  from "../shared/db.js";
+import { immutableAudit }         from "../security/immutable.audit.js";
 import { quoteCache }             from "../market-data/quote.cache.js";
 import { reconciliationEngine }   from "./reconciliation.engine.js";
 import { tradingSuspension }      from "../shared/trading.suspension.js";
@@ -141,15 +142,12 @@ export class RecoveryService {
                 creditAccount: `CLIENT_FREE:${w.userId}`,
               },
             });
-            await tx.auditLog.create({
-              data: {
-                id:      randomUUID(),
-                actor:   "SYSTEM_RECOVERY",
-                action:  "margin.orphan_released",
-                entity:  w.userId,
-                payload: { orphanAmount: delta, locked, posTotal, ranAt } as object,
-              },
-            });
+            await immutableAudit.write({
+              actor:   "SYSTEM_RECOVERY",
+              action:  "margin.orphan_released",
+              entity:  w.userId,
+              payload: { orphanAmount: delta, locked, posTotal, ranAt } as object,
+            }, tx);
           }, { maxWait: 10000, timeout: 15000 });
 
           orphanMarginReleased.push(
@@ -175,14 +173,11 @@ export class RecoveryService {
           `MARGIN_DEFICIT: locked=${locked.toFixed(2)} positionTotal=${posTotal.toFixed(2)} deficit=${Math.abs(delta).toFixed(2)}`
         );
 
-        await db.auditLog.create({
-          data: {
-            id:      randomUUID(),
-            actor:   "SYSTEM_RECOVERY",
-            action:  "margin.deficit_detected",
-            entity:  w.userId,
-            payload: { locked, posTotal, delta, ranAt, tradingSuspended: true } as object,
-          },
+        await immutableAudit.write({
+          actor:   "SYSTEM_RECOVERY",
+          action:  "margin.deficit_detected",
+          entity:  w.userId,
+          payload: { locked, posTotal, delta, ranAt, tradingSuspended: true } as object,
         });
       }
     }
@@ -297,18 +292,15 @@ export class RecoveryService {
         },
       });
 
-      await db.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "SYSTEM_RECOVERY",
-          action:  "order.auto_rejected",
-          entity:  order.id,
-          payload: {
-            stuckStatus: order.status,
-            age:         Date.now() - order.createdAt.getTime(),
-            marginReleased,
-          } as object,
-        },
+      await immutableAudit.write({
+        actor:   "SYSTEM_RECOVERY",
+        action:  "order.auto_rejected",
+        entity:  order.id,
+        payload: {
+          stuckStatus: order.status,
+          age:         Date.now() - order.createdAt.getTime(),
+          marginReleased,
+        } as object,
       });
 
       stuckOrdersRejected++;

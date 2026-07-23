@@ -3,6 +3,7 @@ import type { PrismaClient } from "@prisma/client";
 import { Decimal }          from "@prisma/client/runtime/library";
 import { eventBus }         from "../events-bus/event.bus.js";
 import { metrics }          from "../gateway/metrics.js";
+import { immutableAudit }   from "../security/immutable.audit.js";
 
 // ─── Status constants ────────────────────────────────────────────────────────
 
@@ -126,21 +127,18 @@ export class DepositStateMachine {
       });
 
       // Audit event
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "PAYMENT_SERVICE",
-          action:  "deposit.credited",
-          entity:  depositId,
-          payload: {
-            depositId,
-            pspRef:  params.pspRef,
-            amount:  creditAmount.toFixed(8),
-            userId:  dep.userId,
-            psp:     dep.psp,
-          } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   "PAYMENT_SERVICE",
+        action:  "deposit.credited",
+        entity:  depositId,
+        payload: {
+          depositId,
+          pspRef:  params.pspRef,
+          amount:  creditAmount.toFixed(8),
+          userId:  dep.userId,
+          psp:     dep.psp,
+        } as object,
+      }, tx);
 
       // Advance deposit status — terminal
       await tx.depositTransaction.update({
@@ -201,14 +199,11 @@ export class DepositStateMachine {
         webhookData: (webhookData as object) ?? undefined,
       },
     });
-    await this.db.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   "PAYMENT_SERVICE",
-        action:  "deposit.failed",
-        entity:  depositId,
-        payload: { depositId, reason } as object,
-      },
+    await immutableAudit.write({
+      actor:   "PAYMENT_SERVICE",
+      action:  "deposit.failed",
+      entity:  depositId,
+      payload: { depositId, reason } as object,
     });
   }
 

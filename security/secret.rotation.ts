@@ -28,7 +28,7 @@
  */
 
 import { randomBytes, generateKeyPairSync } from "node:crypto";
-import { randomUUID } from "node:crypto";
+import { immutableAudit } from "./immutable.audit.js";
 import { getSecret, setSecret } from "./secrets-vault.js";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 
@@ -250,14 +250,11 @@ export class SecretRotationService {
 
   private async _auditRotation(name: string, versionId: string): Promise<void> {
     if (!IS_PERSISTENT || !prisma) return;
-    await prisma.auditLog.create({
-      data: {
-        id:     randomUUID(),
-        actor:  "SYSTEM_ROTATION",
-        action: "secret.rotated",
-        entity: name,
-        payload: { name, versionId, timestamp: new Date().toISOString() } as object,
-      },
+    await immutableAudit.write({
+      actor:  "SYSTEM_ROTATION",
+      action: "secret.rotated",
+      entity: name,
+      payload: { name, versionId, timestamp: new Date().toISOString() } as object,
     }).catch(() => undefined);
   }
 }

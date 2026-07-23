@@ -5,6 +5,7 @@ import { LiquidityProvider, type LiquidityBook } from "../liquidity-engine/liqui
 import { quoteCache } from "../market-data/quote.cache.js";
 import { eventBus } from "../events-bus/event.bus.js";
 import { metrics } from "../gateway/metrics.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { WalletRepository } from "../wallet-service/wallet.repository.js";
 import {
   type AiSignal,
@@ -2327,16 +2328,18 @@ export class BrokerState {
     };
     this.audit.push(entry);
     if (this.prisma) {
-      void this.prisma.auditLog.create({
-        data: {
-          id: entry.id,
-          actor: entry.actor,
-          action: entry.action,
-          entity: entry.entity,
-          payload: entry.payload as Prisma.InputJsonValue,
-          createdAt: new Date(entry.createdAt),
-        },
-      }).catch((error) => console.error("[broker-state] persist audit failed", error));
+      // Note: the persisted AuditLog row gets its own id from
+      // immutableAudit.write() (not entry.id) -- this.audit (the in-memory
+      // array above) is only ever read back via getAuditLog()'s
+      // slice(-100), never cross-referenced against the DB row by id, so
+      // this divergence is safe.
+      void immutableAudit.write({
+        actor:   entry.actor,
+        action:  entry.action,
+        entity:  entry.entity,
+        payload: entry.payload,
+        timestamp: new Date(entry.createdAt),
+      }, this.prisma).catch((error) => console.error("[broker-state] persist audit failed", error));
     }
   }
 

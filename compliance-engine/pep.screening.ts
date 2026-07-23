@@ -17,7 +17,8 @@
  * in production — this constitutes an AMLD5/6 compliance failure.
  */
 import { randomUUID } from "node:crypto";
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { eventBus }  from "../events-bus/event.bus.js";
 
 export type PepResult = {
@@ -188,14 +189,11 @@ export class PepScreening {
     }
 
     if (IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "PEP_SCREENING",
-          action:  `pep.screen.${result.isPep ? "hit" : result.requiresEdd ? "manual-review" : "clear"}`,
-          entity:  userId,
-          payload: { fullName, countryCode, ...result } as object,
-        },
+      await immutableAudit.write({
+        actor:   "PEP_SCREENING",
+        action:  `pep.screen.${result.isPep ? "hit" : result.requiresEdd ? "manual-review" : "clear"}`,
+        entity:  userId,
+        payload: { fullName, countryCode, ...result } as object,
       }).catch(() => {});
 
       if (result.isPep || result.requiresEdd) {

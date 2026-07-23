@@ -30,6 +30,7 @@
 import { randomUUID }          from "node:crypto";
 import { Decimal }             from "@prisma/client/runtime/library";
 import { prisma }              from "../shared/db.js";
+import { immutableAudit }      from "../security/immutable.audit.js";
 import { metrics }             from "../gateway/metrics.js";
 import { alertManager }        from "../alerting/alert.manager.js";
 import { DistributedJobLock }  from "../shared/distributed.job.lock.js";
@@ -343,15 +344,12 @@ export class ReconciliationEngine {
       // as complete as an ordinary user-initiated action, not less. Same
       // action/actor shape as recovery.service.ts's equivalent startup-time
       // repair (the one branch already doing this right).
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "SYSTEM_RECONCILIATION",
-          action:  "margin.orphan_released",
-          entity:  userId,
-          payload: { orphanAmount: orphan, locked: currentLocked, positionTotal, repairedAt } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   "SYSTEM_RECONCILIATION",
+        action:  "margin.orphan_released",
+        entity:  userId,
+        payload: { orphanAmount: orphan, locked: currentLocked, positionTotal, repairedAt } as object,
+      }, tx);
       released = orphan;
     }, { maxWait: 10000, timeout: 15000 });
 

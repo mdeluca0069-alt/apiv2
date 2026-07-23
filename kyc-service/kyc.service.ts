@@ -10,6 +10,7 @@
  */
 import { randomUUID }    from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { ocrProvider, type OcrDocumentType } from "./ocr.provider.js";
 import { livenessProvider }   from "./liveness.provider.js";
 import { kycRiskEngine }      from "./kyc.risk.engine.js";
@@ -262,15 +263,12 @@ export class KycService {
         data:  { kycStatus: "approved" },
       });
 
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   adminId,
-          action:  "kyc.case_approved",
-          entity:  caseId,
-          payload: { userId: kase.userId, notes } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   adminId,
+        action:  "kyc.case_approved",
+        entity:  caseId,
+        payload: { userId: kase.userId, notes } as object,
+      }, tx);
     }, { maxWait: 10000, timeout: 15000 });
 
     eventBus.emit("kyc.approved", {
@@ -392,15 +390,12 @@ export class KycService {
         data:  { kycStatus: "rejected" },
       });
 
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   actorId,
-          action:  "kyc.case_rejected",
-          entity:  caseId,
-          payload: { userId: kase.userId, reason } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   actorId,
+        action:  "kyc.case_rejected",
+        entity:  caseId,
+        payload: { userId: kase.userId, reason } as object,
+      }, tx);
     }, { maxWait: 10000, timeout: 15000 });
 
     eventBus.emit("kyc.rejected", {
@@ -545,19 +540,16 @@ export class KycService {
         });
       }
 
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "sumsub",
-          action:  `kyc.sumsub.${type}`,
-          entity:  kase.id,
-          payload: {
-            applicantId, externalUserId, type,
-            reviewAnswer, reviewStatus: event.reviewStatus,
-            rejectLabels: reviewResult?.rejectLabels,
-          } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   "sumsub",
+        action:  `kyc.sumsub.${type}`,
+        entity:  kase.id,
+        payload: {
+          applicantId, externalUserId, type,
+          reviewAnswer, reviewStatus: event.reviewStatus,
+          rejectLabels: reviewResult?.rejectLabels,
+        } as object,
+      }, tx);
     }, { maxWait: 10000, timeout: 15000 });
 
     // Emit domain events
@@ -579,9 +571,7 @@ export class KycService {
 
   private async _audit(actor: string, action: string, entity: string, payload: object): Promise<void> {
     if (!IS_PERSISTENT) return;
-    await prisma.auditLog.create({
-      data: { id: randomUUID(), actor, action, entity, payload: payload as object },
-    });
+    await immutableAudit.write({ actor, action, entity, payload });
   }
 
   private _toSummary(row: {

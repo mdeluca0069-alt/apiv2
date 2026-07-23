@@ -5,7 +5,7 @@
  * In SANDBOX mode (no DB) the config lives in memory only.
  * Every config change writes an immutable AuditLog entry.
  */
-import { randomUUID } from "node:crypto";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { z }          from "zod";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { eventBus }              from "../events-bus/event.bus.js";
@@ -180,14 +180,11 @@ export class AutopilotService {
       update: this._toDbInput(validated),
     });
 
-    await prisma.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   actorId,
-        action:  "autopilot.config_updated",
-        entity:  userId,
-        payload: validated as object,
-      },
+    await immutableAudit.write({
+      actor:   actorId,
+      action:  "autopilot.config_updated",
+      entity:  userId,
+      payload: validated as object,
     });
 
     const full = this._toFull(row);
@@ -238,14 +235,11 @@ export class AutopilotService {
       },
     });
 
-    await prisma.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   actorId,
-        action:  "autopilot.admin_pause",
-        entity:  userId,
-        payload: { paused, reason } as object,
-      },
+    await immutableAudit.write({
+      actor:   actorId,
+      action:  "autopilot.admin_pause",
+      entity:  userId,
+      payload: { paused, reason } as object,
     });
 
     _configCache.delete(userId);
@@ -274,14 +268,11 @@ export class AutopilotService {
 
     _configCache.delete(userId);
 
-    await prisma.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   actorId,
-        action:  "autopilot.daily_loss_lock",
-        entity:  userId,
-        payload: { lockedUntil: until.toISOString() },
-      },
+    await immutableAudit.write({
+      actor:   actorId,
+      action:  "autopilot.daily_loss_lock",
+      entity:  userId,
+      payload: { lockedUntil: until.toISOString() },
     });
   }
 
@@ -304,14 +295,11 @@ export class AutopilotService {
       data:  { lastDecision: decision as object },
     });
 
-    await prisma.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   "AUTOPILOT_ENGINE",
-        action:  `autopilot.decision.${action.toLowerCase()}`,
-        entity:  userId,
-        payload: decision as object,
-      },
+    await immutableAudit.write({
+      actor:   "AUTOPILOT_ENGINE",
+      action:  `autopilot.decision.${action.toLowerCase()}`,
+      entity:  userId,
+      payload: decision as object,
     });
   }
 

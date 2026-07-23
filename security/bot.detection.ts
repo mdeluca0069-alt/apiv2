@@ -22,6 +22,7 @@
 import { getRedis }   from "../shared/redis.js";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { randomUUID } from "node:crypto";
+import { immutableAudit } from "./immutable.audit.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -225,12 +226,10 @@ export class BotDetector {
       await redis.setex(`iprep:blocked:${ip}`, 86400, `honeypot:${path}`).catch(() => null);
     }
     if (IS_PERSISTENT && prisma) {
-      await prisma.auditLog.create({
-        data: {
-          id: randomUUID(), actor: ip,
-          action: "bot.honeypot_triggered", entity: path,
-          payload: { ip, path, timestamp: new Date().toISOString() } as object,
-        },
+      await immutableAudit.write({
+        actor: ip,
+        action: "bot.honeypot_triggered", entity: path,
+        payload: { ip, path, timestamp: new Date().toISOString() } as object,
       }).catch(() => undefined);
     }
   }
@@ -241,12 +240,10 @@ export class BotDetector {
       await redis.incr(`bot:blocks:${ip}`).catch(() => null);
     }
     if (IS_PERSISTENT && prisma && score >= 80) {
-      await prisma.auditLog.create({
-        data: {
-          id: randomUUID(), actor: ip,
-          action: "bot.blocked", entity: ip,
-          payload: { score, reasons } as object,
-        },
+      await immutableAudit.write({
+        actor: ip,
+        action: "bot.blocked", entity: ip,
+        payload: { score, reasons } as object,
       }).catch(() => undefined);
     }
   }

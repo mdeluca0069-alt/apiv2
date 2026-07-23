@@ -27,15 +27,27 @@
 
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
+import type { PrismaClient, Prisma } from "@prisma/client";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 
-// ─── Chain State ──────────────────────────────────────────────────────────────
-
-// In-memory last-known hash for the current process (to chain new entries)
-// Initialized from DB on first write.
-let _chainHead: string | null = null;
+/** Same composability contract as wallet-service/ledger.engine.ts's `Db`. */
+type Db = Prisma.TransactionClient | PrismaClient;
 
 const GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000000000";
+
+// REALTIME_FREEZE.md Critical #2: fixed, arbitrary key for a Postgres
+// session-level advisory lock (pg_advisory_xact_lock) scoped to the
+// current transaction -- serializes the chain-head read + insert against
+// every other concurrent write() call, both in this process AND across
+// every other worker process sharing this Postgres instance. Without it,
+// two concurrent writers could both read the same prevHash and both
+// insert, forking the chain; verifyChain() would then flag that fork as
+// tampering -- a false positive on a pair of writes that were both
+// entirely legitimate. This matters far more once write() has ~60 call
+// sites across every security-sensitive module instead of the original 3
+// low-frequency admin/compliance ones, where the race was improbable but
+// not impossible.
+const AUDIT_CHAIN_LOCK_KEY = 728_401_996_215n;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -43,8 +55,24 @@ export type AuditEntryInput = {
   actor:    string;
   action:   string;
   entity:   string;
-  payload:  Record<string, unknown>;
+  // `object`, not `Record<string, unknown>`: every call site in this
+  // codebase passes its payload as `{...} as object` (matching Prisma's
+  // own `Json` field type) -- matches that existing convention instead of
+  // requiring ~30 call sites to drop a cast that was already correct for
+  // its actual destination (the AuditLog.payload Json column).
+  payload:  object;
   severity?: "INFO" | "WARNING" | "CRITICAL";
+  /**
+   * REALTIME_FREEZE.md Critical #2: overrides the timestamp used for BOTH
+   * the hash computation and the stored `createdAt` column (see write()'s
+   * docstring for why these two must always be identical). Only needed by
+   * callers recording a past event asynchronously -- e.g.
+   * compliance/audit.outbox.consumer.ts processing an OutboxEvent seconds
+   * or minutes after the position it documents actually closed, where the
+   * audit row should carry the real event time, not the processing time.
+   * Defaults to `new Date()` (the write-time instant) when omitted.
+   */
+  timestamp?: Date;
 };
 
 export type AuditChainVerification = {
@@ -60,33 +88,82 @@ export class ImmutableAuditLog {
   /**
    * Write an immutable audit entry with hash-chain integrity.
    * This is the ONLY function that should write to AuditLog.
+   *
+   * REALTIME_FREEZE.md Critical #2: accepts an optional `tx` -- most
+   * callers (ledger, KYC, order cancel/modify, margin, deposit state
+   * machine, reconciliation, ...) must write their audit row atomically
+   * inside the SAME database transaction as the financial/state mutation
+   * it documents (the FASE 2.1/5 pattern this codebase already enforces
+   * for OutboxEvent rows). Passing `tx` writes within the caller's own
+   * transaction instead of opening a new one, so a rollback of the
+   * caller's transaction also rolls back the audit row -- and, just as
+   * importantly, so the audit row can never commit while the mutation it
+   * documents does not.
+   *
+   * CRITICAL FIX bundled into this same change: `createdAt` is now always
+   * set EXPLICITLY to the same `ts` value used to compute `_chain_hash`.
+   * Before this fix, `createdAt` was left to Postgres's own
+   * `@default(now())` -- a DIFFERENT instant than the app-level `now` this
+   * method hashed, off by however many milliseconds the write took to
+   * reach the database. verifyChain() re-derives each hash from the
+   * STORED `createdAt` column, so that mismatch meant verification could
+   * never actually reproduce the original hash for ANY row -- the chain
+   * would report itself broken from entry #1, always, for every entry
+   * ever written by any of the (previously 3, now ~60) call sites. This
+   * was already true before this change; it simply had no test coverage
+   * to catch it (see immutable.audit.spec.ts, added alongside this fix).
    */
-  async write(input: AuditEntryInput): Promise<string> {
-    const id        = randomUUID();
-    const now       = new Date();
-    const prevHash  = await this._getChainHead();
-    const chainHash = this._computeHash(prevHash, id, input.actor, input.action, input.entity, now.toISOString(), input.payload);
+  async write(input: AuditEntryInput, tx?: Db): Promise<string> {
+    const id = randomUUID();
+    const ts = input.timestamp ?? new Date();
 
-    const enrichedPayload: Record<string, unknown> = {
-      ...input.payload,
-      _chain_hash:  chainHash,
-      _prev_hash:   prevHash,
-      _severity:    input.severity ?? "INFO",
-      _written_at:  now.toISOString(),
-    };
+    if (!IS_PERSISTENT || !prisma) return id;
 
-    if (IS_PERSISTENT && prisma) {
-      await prisma.auditLog.create({
+    const run = async (client: Db) => {
+      // Must hold this lock for the read+insert of a SINGLE write() call --
+      // never span it across the caller's whole transaction -- otherwise
+      // two audit writes inside the same caller transaction would
+      // deadlock against each other (Postgres advisory locks are
+      // re-entrant per session, but re-acquiring inside the same
+      // transaction is still fine; the risk is holding it across an
+      // `await` that yields to other work). Acquired and used immediately
+      // below, nothing else runs between acquisition and the insert.
+      //
+      // $executeRaw, NOT $queryRaw: pg_advisory_xact_lock() returns SQL
+      // type `void`, which Prisma's query engine cannot deserialize into
+      // any Prisma scalar -- $queryRaw throws "Failed to deserialize
+      // column of type 'void'" on every single call. $executeRaw doesn't
+      // attempt to deserialize a result set (it only reports affected row
+      // count), so it works for a void-returning function call.
+      await client.$executeRaw`SELECT pg_advisory_xact_lock(${AUDIT_CHAIN_LOCK_KEY})`;
+
+      const prevHash  = await this._getChainHead(client);
+      const chainHash = this._computeHash(prevHash, id, input.actor, input.action, input.entity, ts.toISOString(), input.payload);
+
+      const enrichedPayload: Record<string, unknown> = {
+        ...input.payload,
+        _chain_hash:  chainHash,
+        _prev_hash:   prevHash,
+        _severity:    input.severity ?? "INFO",
+        _written_at:  new Date().toISOString(),
+      };
+
+      await client.auditLog.create({
         data: {
           id,
-          actor:   input.actor,
-          action:  input.action,
-          entity:  input.entity,
-          payload: enrichedPayload as object,
+          actor:     input.actor,
+          action:    input.action,
+          entity:    input.entity,
+          payload:   enrichedPayload as object,
+          createdAt: ts,
         },
       });
-      // Update chain head in memory
-      _chainHead = chainHash;
+    };
+
+    if (tx) {
+      await run(tx);
+    } else {
+      await prisma.$transaction(run);
     }
 
     return id;
@@ -206,26 +283,30 @@ export class ImmutableAuditLog {
     action:   string,
     entity:   string,
     ts:       string,
-    payload:  Record<string, unknown>,
+    payload:  object,
   ): string {
     const content = JSON.stringify({ prevHash, id, actor, action, entity, ts, payload });
     return createHash("sha256").update(content).digest("hex");
   }
 
-  private async _getChainHead(): Promise<string> {
-    if (_chainHead !== null) return _chainHead;
-    if (!IS_PERSISTENT || !prisma) return GENESIS_HASH;
-
-    const latest = await prisma.auditLog.findFirst({
+  /**
+   * REALTIME_FREEZE.md Critical #2: always reads fresh from `client` under
+   * the advisory lock in write() -- no in-memory cache. A per-process
+   * cache would go stale the instant ANY other worker process wrote a new
+   * entry (this platform runs a multi-worker PM2 cluster, see
+   * realtime-infra/redis.pubsub.ts), silently chaining a new entry off an
+   * outdated head and producing exactly the kind of fork the advisory
+   * lock exists to prevent. One extra SELECT per write is the correct
+   * trade for a security control -- see the write() docstring.
+   */
+  private async _getChainHead(client: Db): Promise<string> {
+    const latest = await client.auditLog.findFirst({
       orderBy: { createdAt: "desc" },
       select:  { payload: true },
     }).catch(() => null);
 
-    if (!latest) { _chainHead = GENESIS_HASH; return GENESIS_HASH; }
-
-    const hash = ((latest.payload as Record<string, unknown>)["_chain_hash"] as string) ?? GENESIS_HASH;
-    _chainHead = hash;
-    return hash;
+    if (!latest) return GENESIS_HASH;
+    return ((latest.payload as Record<string, unknown>)["_chain_hash"] as string) ?? GENESIS_HASH;
   }
 
   private async _writeToS3(bucket: string, key: string, body: string, hash: string): Promise<void> {

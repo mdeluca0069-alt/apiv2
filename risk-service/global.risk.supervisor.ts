@@ -25,7 +25,7 @@
  * — no new Prisma model needed.
  */
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
-import { randomUUID } from "node:crypto";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { checkDatabaseHealth, checkRedisHealth, checkMarketDataHealth } from "../shared/health.check.js";
 import { feedHealthMonitor } from "../market-data/feed.health.monitor.js";
 import { getRegimeSnapshot } from "../ai-core/regime.snapshot.js";
@@ -185,8 +185,8 @@ export class GlobalRiskSupervisor {
 
   async clearOverride(actorId: string): Promise<void> {
     this._cached = { ...this._cached, adminOverride: null };
-    await prisma?.auditLog.create({
-      data: { id: randomUUID(), actor: actorId, action: "risk_supervisor.override_cleared", entity: "global", payload: {} },
+    await immutableAudit.write({
+      actor: actorId, action: "risk_supervisor.override_cleared", entity: "global", payload: {},
     }).catch(() => undefined);
 
     if (!IS_PERSISTENT || !prisma) {
@@ -257,14 +257,11 @@ export class GlobalRiskSupervisor {
   }
 
   private async _auditAndAlert(mode: SupervisorMode, reason: string, actor: "system" | "admin"): Promise<void> {
-    await prisma?.auditLog.create({
-      data: {
-        id: randomUUID(),
-        actor: actor === "admin" ? "admin" : "system_risk_supervisor",
-        action: "risk_supervisor.mode_changed",
-        entity: "global",
-        payload: { mode, reason } as object,
-      },
+    await immutableAudit.write({
+      actor: actor === "admin" ? "admin" : "system_risk_supervisor",
+      action: "risk_supervisor.mode_changed",
+      entity: "global",
+      payload: { mode, reason } as object,
     }).catch(() => undefined);
 
     const severity = mode === "NORMAL" ? "INFO" : mode === "SAFE_MODE" ? "WARNING" : "CRITICAL";

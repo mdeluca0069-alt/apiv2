@@ -4,8 +4,8 @@
  * Production: wire to ComplyAdvantage, World-Check, or LexisNexis via
  * the SanctionsProvider interface.
  */
-import { randomUUID }    from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { eventBus }      from "../events-bus/event.bus.js";
 
 export const SANCTIONED_COUNTRIES = new Set([
@@ -55,13 +55,11 @@ export class SanctionsScreeningService {
   ): Promise<void> {
     if (!IS_PERSISTENT) return;
     const db = prisma as NonNullable<typeof prisma>;
-    await db.auditLog.create({
-      data: {
-        id: randomUUID(), actor: "SANCTIONS_ENGINE",
-        action: `sanctions.${result.action.toLowerCase()}`,
-        entity: userId,
-        payload: { fullName, countryCode, ...result } as object,
-      },
+    await immutableAudit.write({
+      actor: "SANCTIONS_ENGINE",
+      action: `sanctions.${result.action.toLowerCase()}`,
+      entity: userId,
+      payload: { fullName, countryCode, ...result } as object,
     });
     if (result.action !== "ALLOW") {
       eventBus.emit("risk.warning", {

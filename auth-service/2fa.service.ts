@@ -13,8 +13,8 @@
  *   6. disable2fa()      — removes secret after password re-confirmation
  */
 import { createHmac, randomBytes } from "node:crypto";
-import { randomUUID }    from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 // ─── TOTP implementation (RFC 6238 / RFC 4226) ────────────────────────────────
 
@@ -128,12 +128,10 @@ export class TwoFactorService {
         update: { value: { secret, backupCodes, enabledAt: new Date().toISOString() } as object },
       });
 
-      await db.auditLog.create({
-        data: {
-          id: randomUUID(), actor: userId,
-          action: "auth.2fa.enabled", entity: userId,
-          payload: { enabledAt: new Date().toISOString() } as object,
-        },
+      await immutableAudit.write({
+        actor: userId,
+        action: "auth.2fa.enabled", entity: userId,
+        payload: { enabledAt: new Date().toISOString() } as object,
       });
     }
 
@@ -169,12 +167,10 @@ export class TwoFactorService {
         where: { key: `2fa:${userId}` },
         data:  { value: cfg as object },
       });
-      await db.auditLog.create({
-        data: {
-          id: randomUUID(), actor: userId,
-          action: "auth.2fa.backup_code_used", entity: userId,
-          payload: { remaining: cfg.backupCodes.length } as object,
-        },
+      await immutableAudit.write({
+        actor: userId,
+        action: "auth.2fa.backup_code_used", entity: userId,
+        payload: { remaining: cfg.backupCodes.length } as object,
       });
       return { valid: true, usedBackup: true };
     }
@@ -195,12 +191,10 @@ export class TwoFactorService {
     if (!IS_PERSISTENT) return;
     const db = prisma as NonNullable<typeof prisma>;
     await db.brokerSetting.delete({ where: { key: `2fa:${userId}` } }).catch(() => {});
-    await db.auditLog.create({
-      data: {
-        id: randomUUID(), actor: userId,
-        action: "auth.2fa.disabled", entity: userId,
-        payload: { disabledAt: new Date().toISOString() } as object,
-      },
+    await immutableAudit.write({
+      actor: userId,
+      action: "auth.2fa.disabled", entity: userId,
+      payload: { disabledAt: new Date().toISOString() } as object,
     });
   }
 }

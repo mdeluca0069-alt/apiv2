@@ -42,7 +42,13 @@ function makeDb(overrides: { status: string; balance: number; amount: number }) 
       update: vi.fn().mockResolvedValue({}),
     },
     ledgerEntry: { create: vi.fn().mockResolvedValue({}) },
-    auditLog:    { create: vi.fn().mockResolvedValue({}) },
+    // findFirst backs immutableAudit.write()'s chain-head lookup;
+    // $executeRaw backs its advisory-lock acquisition (pg_advisory_xact_lock
+    // returns void, which $queryRaw cannot deserialize) -- deposit.state.
+    // machine.ts now routes its AuditLog write through immutableAudit.
+    // write(..., tx), passing this same mock transaction client.
+    auditLog:    { create: vi.fn().mockResolvedValue({}), findFirst: vi.fn().mockResolvedValue(null) },
+    $executeRaw: vi.fn().mockResolvedValue(0),
   };
   type Tx = typeof tx;
   const db = {

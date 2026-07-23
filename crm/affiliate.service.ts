@@ -10,6 +10,7 @@
 import { randomUUID }            from "node:crypto";
 import { Prisma }                from "@prisma/client";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit }        from "../security/immutable.audit.js";
 import { eventBus }              from "../events-bus/event.bus.js";
 
 export type AffiliateStatus = "PENDING" | "ACTIVE" | "INACTIVE";
@@ -99,8 +100,8 @@ class AffiliateService {
       },
     });
 
-    await db.auditLog.create({
-      data: { id: randomUUID(), actor: adminId, action: `affiliate.${status.toLowerCase()}`, entity: affiliateId, payload: {} },
+    await immutableAudit.write({
+      actor: adminId, action: `affiliate.${status.toLowerCase()}`, entity: affiliateId, payload: {},
     }).catch(() => {});
 
     eventBus.emit("affiliate.status_changed", { affiliateId, status, adminId, timestamp: new Date().toISOString() });
@@ -191,8 +192,8 @@ class AffiliateService {
       data:  { status: "PAID", paidAt: new Date() },
     });
 
-    await db.auditLog.create({
-      data: { id: randomUUID(), actor: adminId, action: "affiliate.commissions_paid", entity: affiliateId, payload: { count: result.count } },
+    await immutableAudit.write({
+      actor: adminId, action: "affiliate.commissions_paid", entity: affiliateId, payload: { count: result.count },
     }).catch(() => {});
 
     return { count: result.count };

@@ -16,39 +16,54 @@
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
+// REALTIME_FREEZE.md Critical #2: global.risk.supervisor.ts now routes
+// through immutableAudit.write() (real module, not mocked) instead of
+// calling prisma.auditLog.create() directly -- $transaction/$queryRaw/
+// auditLog.findFirst satisfy its chain-head lock and lookup.
 const {
   mockBSFindUnique, mockBSUpsert, mockAuditCreate,
   mockPosFindMany, mockPosAggregate, mockWalletAggregate, mockOrderFindMany,
   mockCheckDb, mockCheckRedis, mockCheckMarket,
   mockGetSnapshot, mockGetRegimeSnapshot, mockMetricsGet, mockAlertSend,
-} = vi.hoisted(() => ({
-  mockBSFindUnique: vi.fn(),
-  mockBSUpsert:     vi.fn().mockResolvedValue({}),
-  mockAuditCreate:  vi.fn().mockResolvedValue({}),
-  mockPosFindMany:  vi.fn().mockResolvedValue([]),
-  mockPosAggregate: vi.fn(),
-  mockWalletAggregate: vi.fn(),
-  mockOrderFindMany:   vi.fn().mockResolvedValue([]),
-  mockCheckDb:      vi.fn(),
-  mockCheckRedis:   vi.fn(),
-  mockCheckMarket:  vi.fn(),
-  mockGetSnapshot:  vi.fn(),
-  mockGetRegimeSnapshot: vi.fn(),
-  mockMetricsGet:   vi.fn(),
-  mockAlertSend:    vi.fn().mockResolvedValue(undefined),
-}));
+  mockPrisma,
+} = vi.hoisted(() => {
+  const mockBSFindUnique = vi.fn();
+  const mockBSUpsert     = vi.fn().mockResolvedValue({});
+  const mockAuditCreate  = vi.fn().mockResolvedValue({});
+  const mockPosFindMany  = vi.fn().mockResolvedValue([]);
+  const mockPosAggregate = vi.fn();
+  const mockWalletAggregate = vi.fn();
+  const mockOrderFindMany   = vi.fn().mockResolvedValue([]);
+  const mockCheckDb      = vi.fn();
+  const mockCheckRedis   = vi.fn();
+  const mockCheckMarket  = vi.fn();
+  const mockGetSnapshot  = vi.fn();
+  const mockGetRegimeSnapshot = vi.fn();
+  const mockMetricsGet   = vi.fn();
+  const mockAlertSend    = vi.fn().mockResolvedValue(undefined);
+  const mockPrisma: Record<string, unknown> = {
+    brokerSetting: { findUnique: mockBSFindUnique, upsert: mockBSUpsert },
+    auditLog:      { create: mockAuditCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    position:      { findMany: mockPosFindMany, aggregate: mockPosAggregate },
+    walletAccount: { aggregate: mockWalletAggregate },
+    order:         { findMany: mockOrderFindMany },
+    $executeRaw:   vi.fn().mockResolvedValue(0),
+  };
+  mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
+  return {
+    mockBSFindUnique, mockBSUpsert, mockAuditCreate,
+    mockPosFindMany, mockPosAggregate, mockWalletAggregate, mockOrderFindMany,
+    mockCheckDb, mockCheckRedis, mockCheckMarket,
+    mockGetSnapshot, mockGetRegimeSnapshot, mockMetricsGet, mockAlertSend,
+    mockPrisma,
+  };
+});
 
 let isPersistent = true;
 
 vi.mock("../shared/db.js", () => ({
   get IS_PERSISTENT() { return isPersistent; },
-  prisma: {
-    brokerSetting: { findUnique: mockBSFindUnique, upsert: mockBSUpsert },
-    auditLog:      { create: mockAuditCreate },
-    position:      { findMany: mockPosFindMany, aggregate: mockPosAggregate },
-    walletAccount: { aggregate: mockWalletAggregate },
-    order:         { findMany: mockOrderFindMany },
-  },
+  prisma: mockPrisma,
 }));
 
 vi.mock("../shared/health.check.js", () => ({

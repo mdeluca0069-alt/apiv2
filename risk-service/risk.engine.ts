@@ -1,5 +1,5 @@
-import { randomUUID }      from "node:crypto";
 import { prisma }           from "../shared/db.js";
+import { immutableAudit }   from "../security/immutable.audit.js";
 import {
   type PreTradeRiskResult,
   type RejectionReason,
@@ -203,20 +203,17 @@ export class RiskEngine {
 
     // ── Audit pass ────────────────────────────────────────────────────────
     const latencyMs = Date.now() - startMs;
-    void prisma.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   input.userId,
-        action:  "PRE_TRADE_RISK_PASS",
-        entity:  input.symbol,
-        payload: {
-          latencyMs,
-          effectiveLeverage,
-          marginRequired,
-          notional,
-          marginLevelPct: marginState.marginLevelPct,
-        } as object,
-      },
+    void immutableAudit.write({
+      actor:   input.userId,
+      action:  "PRE_TRADE_RISK_PASS",
+      entity:  input.symbol,
+      payload: {
+        latencyMs,
+        effectiveLeverage,
+        marginRequired,
+        notional,
+        marginLevelPct: marginState.marginLevelPct,
+      } as object,
     });
 
     return { pass: true, marginRequired, notional, effectiveLeverage };

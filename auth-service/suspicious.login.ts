@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 /**
  * SuspiciousLoginService — records login attempt audit events for SIEM
@@ -10,27 +10,21 @@ import { prisma, IS_PERSISTENT } from "../shared/db.js";
 class SuspiciousLoginService {
   async recordFailedAttempt(ip: string, email: string): Promise<void> {
     if (!IS_PERSISTENT) return;
-    await (prisma as NonNullable<typeof prisma>).auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   ip,
-        action:  "auth.login.failed",
-        entity:  email.toLowerCase(),
-        payload: { ip, email, at: new Date().toISOString() } as object,
-      },
+    await immutableAudit.write({
+      actor:   ip,
+      action:  "auth.login.failed",
+      entity:  email.toLowerCase(),
+      payload: { ip, email, at: new Date().toISOString() } as object,
     }).catch(() => {});
   }
 
   async recordSuccess(userId: string, ip: string, userAgent: string): Promise<void> {
     if (!IS_PERSISTENT) return;
-    await (prisma as NonNullable<typeof prisma>).auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   ip,
-        action:  "auth.login.success",
-        entity:  userId,
-        payload: { ip, ua: userAgent.slice(0, 200), at: new Date().toISOString() } as object,
-      },
+    await immutableAudit.write({
+      actor:   ip,
+      action:  "auth.login.success",
+      entity:  userId,
+      payload: { ip, ua: userAgent.slice(0, 200), at: new Date().toISOString() } as object,
     }).catch(() => {});
   }
 }

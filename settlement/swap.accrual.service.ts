@@ -24,6 +24,7 @@ import { randomUUID }          from "node:crypto";
 import { Decimal }             from "@prisma/client/runtime/library";
 import { Prisma }              from "@prisma/client";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit }        from "../security/immutable.audit.js";
 import { quoteCache }          from "../market-data/quote.cache.js";
 import { swapCalculator }      from "../trading-service/swap.calculator.js";
 import { assetClassOf }        from "../liquidity-engine/liquidity.provider.js";
@@ -226,15 +227,12 @@ export class SwapAccrualService {
       // trail and no Metrics at all -- not even a registered counter existed
       // for a successful accrual (swap_accrual_errors_total was registered
       // but, like this one, never actually incremented anywhere).
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "SYSTEM_SWAP_ACCRUAL",
-          action:  "swap.accrued",
-          entity:  pos.id,
-          payload: { userId: pos.userId, symbol: pos.symbol, amount: chargeAmount, nights, rateAnnual, reference } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   "SYSTEM_SWAP_ACCRUAL",
+        action:  "swap.accrued",
+        entity:  pos.id,
+        payload: { userId: pos.userId, symbol: pos.symbol, amount: chargeAmount, nights, rateAnnual, reference } as object,
+      }, tx);
 
       return chargeAmount;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable, maxWait: 10000, timeout: 15000 });

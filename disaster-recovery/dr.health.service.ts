@@ -76,7 +76,15 @@ export async function getDRHealth(): Promise<DRHealthStatus> {
         checks.push({ name: "db-write", status: "fail", message: "Database is in recovery mode (read-only)" });
         criticalFailures++;
       } else {
-        // Do a lightweight write to confirm we can actually write
+        // Do a lightweight write to confirm we can actually write.
+        // REALTIME_FREEZE.md Critical #2: deliberately NOT routed through
+        // immutableAudit.write() -- this is a DB-writability liveness
+        // probe, not a security-sensitive audit event (no user/financial/
+        // compliance action to record). Routing it through the hash chain
+        // would add an advisory-lock acquisition + extra read + a nested
+        // transaction to what should be the simplest possible canary
+        // write, and would pollute the compliance-relevant chain with
+        // high-frequency synthetic health-check noise.
         await db.auditLog.create({
           data: {
             id:      `dr-hc-${Date.now()}`,

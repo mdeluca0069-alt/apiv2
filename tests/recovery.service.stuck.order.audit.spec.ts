@@ -51,9 +51,20 @@ const {
 }));
 
 vi.mock("../shared/db.js", () => {
+  // REALTIME_FREEZE.md Critical #2: recovery.service.ts's order-auto-reject
+  // AuditLog write is non-transactional (no `tx` threaded through), so it
+  // now calls immutableAudit.write() with no tx -- which internally opens
+  // its OWN prisma.$transaction(). Since this test's mockTransaction is a
+  // single shared mock also used for recovery.service.ts's own internal
+  // margin-release transaction, `tx` needs $executeRaw/auditLog too so
+  // either transaction's callback can run against it. $executeRaw (not
+  // $queryRaw): pg_advisory_xact_lock() returns void, which $queryRaw
+  // cannot deserialize.
   const tx = {
     walletAccount: { findUnique: mockWalletFindUnique, update: mockWalletUpdate },
     ledgerEntry:   { create: mockLedgerCreate },
+    auditLog:      { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    $executeRaw:   vi.fn().mockResolvedValue(0),
   };
   return {
     IS_PERSISTENT: true,
@@ -61,7 +72,8 @@ vi.mock("../shared/db.js", () => {
       position:      { findMany: mockPositionFindMany, findFirst: mockPositionFindFirst, aggregate: vi.fn().mockResolvedValue({ _sum: { marginUsed: null } }), update: vi.fn() },
       walletAccount: { findMany: mockWalletFindMany },
       order:         { findMany: mockOrderFindMany, update: mockOrderUpdate },
-      auditLog:      { create: mockAuditLogCreate },
+      auditLog:      { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+      $executeRaw:   vi.fn().mockResolvedValue(0),
       $transaction:  mockTransaction,
       __tx: tx,
     },
@@ -131,7 +143,14 @@ describe("RecoveryService — stuck-order audit payload reflects the real outcom
 
     await recoveryService.run();
 
-    expect(mockTransaction).not.toHaveBeenCalled();
+    // REALTIME_FREEZE.md Critical #2: mockTransaction is now ALSO the
+    // transaction wrapper immutableAudit.write() opens for the (always
+    // fired, unconditional) order.auto_rejected audit write itself -- so
+    // it's no longer zero in this case. The actual invariant this test
+    // guards -- the margin-RELEASE step was never attempted -- is what
+    // mockWalletUpdate/mockLedgerCreate being uncalled proves.
+    expect(mockWalletUpdate).not.toHaveBeenCalled();
+    expect(mockLedgerCreate).not.toHaveBeenCalled();
     const payload = mockAuditLogCreate.mock.calls[0][0].data.payload as { marginReleased: boolean };
     expect(payload.marginReleased).toBe(false);
   });

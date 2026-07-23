@@ -3,8 +3,9 @@
  * Called by AML, sanctions, PEP, and transaction monitoring engines.
  */
 import { randomUUID } from "node:crypto";
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { IS_PERSISTENT } from "../shared/db.js";
 import { eventBus }  from "../events-bus/event.bus.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 export type AlertSeverity = "INFO" | "WARNING" | "HIGH" | "CRITICAL";
 
@@ -40,14 +41,16 @@ export class ComplianceAlertService {
     };
 
     if (IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id:      alert.id,
-          actor:   "COMPLIANCE_ALERTS",
-          action:  `compliance.alert.${alertType.toLowerCase()}`,
-          entity:  userId,
-          payload: alert as unknown as object,
-        },
+      // Note: the underlying AuditLog row gets its OWN id from
+      // immutableAudit.write() (not alert.id) -- nothing looks up an
+      // AuditLog row by alert.id (resolve() below references it only as
+      // a payload/entity value, never as a row lookup key), so this is
+      // safe. alert.id remains the identifier callers actually use.
+      await immutableAudit.write({
+        actor:   "COMPLIANCE_ALERTS",
+        action:  `compliance.alert.${alertType.toLowerCase()}`,
+        entity:  userId,
+        payload: alert as unknown as object,
       });
     }
 
@@ -62,13 +65,11 @@ export class ComplianceAlertService {
 
   async resolve(alertId: string, resolvedBy: string, note: string): Promise<void> {
     if (!IS_PERSISTENT) return;
-    await (prisma as NonNullable<typeof prisma>).auditLog.create({
-      data: {
-        id: randomUUID(), actor: resolvedBy,
-        action: "compliance.alert.resolved",
-        entity: alertId,
-        payload: { alertId, note } as object,
-      },
+    await immutableAudit.write({
+      actor: resolvedBy,
+      action: "compliance.alert.resolved",
+      entity: alertId,
+      payload: { alertId, note } as object,
     });
   }
 }

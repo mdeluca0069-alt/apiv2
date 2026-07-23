@@ -11,6 +11,7 @@
  */
 import { randomUUID }           from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit }        from "../security/immutable.audit.js";
 import { eventBus }             from "../events-bus/event.bus.js";
 
 export type TicketPriority = "LOW" | "NORMAL" | "HIGH" | "URGENT";
@@ -132,14 +133,11 @@ export class SupportService {
     });
 
     // Audit log
-    await prisma.auditLog.create({
-      data: {
-        id:       randomUUID(),
-        actor:    actorId,
-        action:   "support.ticket.created",
-        entity:   `ticket:${ticket.id}`,
-        payload:  { subject: ticket.subject, priority, category },
-      },
+    await immutableAudit.write({
+      actor:    actorId,
+      action:   "support.ticket.created",
+      entity:   `ticket:${ticket.id}`,
+      payload:  { subject: ticket.subject, priority, category },
     });
 
     eventBus.emit("support.ticket_created", {
@@ -211,14 +209,11 @@ export class SupportService {
       },
     });
 
-    await prisma.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   actorId,
-        action:  "support.ticket.replied",
-        entity:  `ticket:${ticketId}`,
-        payload: { agentNote },
-      },
+    await immutableAudit.write({
+      actor:   actorId,
+      action:  "support.ticket.replied",
+      entity:  `ticket:${ticketId}`,
+      payload: { agentNote },
     });
 
     eventBus.emit("support.ticket_updated", {
@@ -308,14 +303,11 @@ export class SupportService {
       },
     });
 
-    await prisma.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   actorId,
-        action:  `support.ticket.${status.toLowerCase()}`,
-        entity:  `ticket:${ticketId}`,
-        payload: { status, resolution: resolution ?? null },
-      },
+    await immutableAudit.write({
+      actor:   actorId,
+      action:  `support.ticket.${status.toLowerCase()}`,
+      entity:  `ticket:${ticketId}`,
+      payload: { status, resolution: resolution ?? null },
     });
 
     eventBus.emit("support.ticket_updated", {

@@ -3,7 +3,8 @@
  * Provides broker-configurable limits that may be tighter than ESMA minimums.
  */
 import { ESMA_LEVERAGE_CAPS } from "./esma.rules.js";
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 // Broker may tighten limits below ESMA maximums
 const BROKER_LEVERAGE_OVERRIDES: Partial<Record<string, number>> = {
@@ -45,14 +46,11 @@ export class LeverageLimitsService {
     const result = this.check(assetClass, requestedLev);
 
     if (!result.compliant && IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id:      crypto.randomUUID(),
-          actor:   userId,
-          action:  "leverage.limit_exceeded",
-          entity:  userId,
-          payload: result as unknown as object,
-        },
+      await immutableAudit.write({
+        actor:   userId,
+        action:  "leverage.limit_exceeded",
+        entity:  userId,
+        payload: result as unknown as object,
       });
     }
 

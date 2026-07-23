@@ -41,10 +41,18 @@ const { mockWalletUpdate, mockLedgerCreate, mockAuditLogCreate, mockAggregate, m
 vi.mock("../shared/db.js", () => {
   const tx = {
     $queryRaw:            mockQueryRaw,
+    // reconciliation.engine.ts's own lock query uses $queryRaw (returns
+    // rows). REALTIME_FREEZE.md Critical #2's immutableAudit.write() uses
+    // $executeRaw for its advisory lock (pg_advisory_xact_lock returns
+    // void, which $queryRaw cannot deserialize) -- a distinct mock.
+    $executeRaw:          vi.fn().mockResolvedValue(0),
     walletAccount:        { update: mockWalletUpdate },
     position:             { aggregate: mockAggregate },
     ledgerEntry:           { create: mockLedgerCreate },
-    auditLog:              { create: mockAuditLogCreate },
+    // findFirst backs immutableAudit.write()'s chain-head lookup --
+    // reconciliation.engine.ts now routes its AuditLog write through
+    // immutableAudit.write(..., tx).
+    auditLog:              { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
   };
   return {
     IS_PERSISTENT: true,

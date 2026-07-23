@@ -15,7 +15,7 @@
  */
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { eventBus }               from "../events-bus/event.bus.js";
-import { randomUUID }             from "node:crypto";
+import { immutableAudit }         from "../security/immutable.audit.js";
 import { Decimal }                from "@prisma/client/runtime/library";
 import type { BrokerState }       from "../shared/state.js";
 
@@ -85,16 +85,12 @@ async function modifyDb(req: ModifyRequest): Promise<ModifyResult> {
       data:  updateData as Parameters<typeof tx.position.update>[0]["data"],
     });
 
-    await tx.auditLog.create({
-      data: {
-        id:        randomUUID(),
-        actor:     userId,
-        action:    "trading.order_modify",
-        entity:    positionId,
-        payload:   { positionId, stopLoss, takeProfit } as object,
-        createdAt: new Date(),
-      },
-    });
+    await immutableAudit.write({
+      actor:     userId,
+      action:    "trading.order_modify",
+      entity:    positionId,
+      payload:   { positionId, stopLoss, takeProfit } as object,
+    }, tx);
   }, { maxWait: 10000, timeout: 15000 });
 
   // Notify via WebSocket

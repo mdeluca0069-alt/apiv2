@@ -55,9 +55,16 @@ function makeDb(overrides: { balance: number; existingApproval?: unknown }) {
       findFirst:  vi.fn().mockResolvedValue(overrides.existingApproval ?? null),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
+    // findFirst backs immutableAudit.write()'s chain-head lookup;
+    // $executeRaw (below) backs its advisory-lock acquisition
+    // (pg_advisory_xact_lock returns void, which $queryRaw cannot
+    // deserialize) -- ledger.engine.ts now routes its AuditLog write
+    // through immutableAudit.write(..., tx), passing this same mock tx.
     auditLog: {
       create: vi.fn().mockResolvedValue({}),
+      findFirst: vi.fn().mockResolvedValue(null),
     },
+    $executeRaw: vi.fn().mockResolvedValue(0),
   };
 
   return {

@@ -12,19 +12,27 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { AdminAutopilotPauseSchema } from "../shared/contracts.js";
 
-const { mockUpsert, mockAuditCreate } = vi.hoisted(() => ({
-  mockUpsert:     vi.fn(),
-  mockAuditCreate: vi.fn().mockResolvedValue({}),
-}));
+// REALTIME_FREEZE.md Critical #2: autopilot.service.ts now routes through
+// immutableAudit.write() (real module, not mocked) instead of calling
+// prisma.auditLog.create() directly -- $transaction/$queryRaw/
+// auditLog.findFirst satisfy its chain-head lock and lookup.
+const { mockUpsert, mockAuditCreate, mockPrisma } = vi.hoisted(() => {
+  const mockUpsert      = vi.fn();
+  const mockAuditCreate = vi.fn().mockResolvedValue({});
+  const mockPrisma: Record<string, unknown> = {
+    autopilotConfig: { upsert: mockUpsert },
+    auditLog: { create: mockAuditCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    $executeRaw: vi.fn().mockResolvedValue(0),
+  };
+  mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
+  return { mockUpsert, mockAuditCreate, mockPrisma };
+});
 
 let isPersistent = true;
 
 vi.mock("../shared/db.js", () => ({
   get IS_PERSISTENT() { return isPersistent; },
-  prisma: {
-    autopilotConfig: { upsert: mockUpsert },
-    auditLog: { create: mockAuditCreate },
-  },
+  prisma: mockPrisma,
 }));
 
 vi.mock("../events-bus/event.bus.js", () => ({

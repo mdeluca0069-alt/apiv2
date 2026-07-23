@@ -6,6 +6,7 @@ import { BalanceCalculator } from "./balance.calculator.js";
 import { quoteCache }        from "../market-data/quote.cache.js";
 import { eventBus }          from "../events-bus/event.bus.js";
 import { metrics }           from "../gateway/metrics.js";
+import { immutableAudit }    from "../security/immutable.audit.js";
 
 /** Same composability contract as balance.calculator.ts / order.lifecycle.ts. */
 type Db = Prisma.TransactionClient | PrismaClient;
@@ -121,15 +122,12 @@ export class LedgerEngine {
       // LEDGER_FREEZE.md §0.5: same gap as approveWithdrawal (§0.4) -- an
       // admin crediting a manual deposit (e.g. a bank wire) left zero audit
       // trail of which admin moved the money in, unlike rejectDeposit().
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   adminId,
-          action:  "deposit.approved",
-          entity:  userId,
-          payload: { amount, reference: depositReference, newBalance: newBalance.toNumber() } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   adminId,
+        action:  "deposit.approved",
+        entity:  userId,
+        payload: { amount, reference: depositReference, newBalance: newBalance.toNumber() } as object,
+      }, tx);
 
       approved = true;
     }, { isolationLevel: "Serializable", maxWait: 10000, timeout: 15000 });
@@ -247,15 +245,12 @@ export class LedgerEngine {
       // withdrawal flow that actually sends real client money out of the
       // platform -- it had zero audit trail of which admin approved it,
       // unlike rejectWithdrawal() below. Same action/actor shape.
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   adminId,
-          action:  "withdrawal.approved",
-          entity:  userId,
-          payload: { amount, reference: withdrawalReference, newBalance: newBalance.toNumber() } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   adminId,
+        action:  "withdrawal.approved",
+        entity:  userId,
+        payload: { amount, reference: withdrawalReference, newBalance: newBalance.toNumber() } as object,
+      }, tx);
 
       approved = true;
     }, { isolationLevel: "Serializable", maxWait: 10000, timeout: 15000 });
@@ -282,15 +277,12 @@ export class LedgerEngine {
         throw new Error("ENTRY_NOT_FOUND_OR_INVALID_STATE");
       }
       await tx.ledgerEntry.updateMany({ where: { id: entryId }, data: { status: "REJECTED" } });
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   adminId,
-          action:  "deposit.rejected",
-          entity:  entryId,
-          payload: { userId, reference: entry.reference, amount: Number(entry.amount) } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   adminId,
+        action:  "deposit.rejected",
+        entity:  entryId,
+        payload: { userId, reference: entry.reference, amount: Number(entry.amount) } as object,
+      }, tx);
     }, { maxWait: 10000, timeout: 15000 });
   }
 
@@ -302,15 +294,12 @@ export class LedgerEngine {
         throw new Error("ENTRY_NOT_FOUND_OR_INVALID_STATE");
       }
       await tx.ledgerEntry.updateMany({ where: { id: entryId }, data: { status: "REJECTED" } });
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   adminId,
-          action:  "withdrawal.rejected",
-          entity:  entryId,
-          payload: { userId, reference: entry.reference, amount: Number(entry.amount) } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   adminId,
+        action:  "withdrawal.rejected",
+        entity:  entryId,
+        payload: { userId, reference: entry.reference, amount: Number(entry.amount) } as object,
+      }, tx);
     }, { maxWait: 10000, timeout: 15000 });
   }
 }

@@ -22,7 +22,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { randomUUID }  from "node:crypto";
+import { immutableAudit } from "./immutable.audit.js";
 import { getRedis }    from "../shared/redis.js";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { twoFactorService } from "../auth-service/2fa.service.js";
@@ -248,14 +248,11 @@ export class MFAEnforcer {
     reason:         string,
   ): Promise<void> {
     if (!IS_PERSISTENT || !prisma) return;
-    await prisma.auditLog.create({
-      data: {
-        id:     randomUUID(),
-        actor:  userId,
-        action: `mfa.stepup.${success ? "granted" : "denied"}`,
-        entity: userId,
-        payload: { operationClass, reason } as object,
-      },
+    await immutableAudit.write({
+      actor:  userId,
+      action: `mfa.stepup.${success ? "granted" : "denied"}`,
+      entity: userId,
+      payload: { operationClass, reason } as object,
     }).catch(() => undefined);
   }
 
@@ -265,14 +262,11 @@ export class MFAEnforcer {
     method:         MFAVerificationMethod,
   ): Promise<void> {
     if (!IS_PERSISTENT || !prisma) return;
-    await prisma.auditLog.create({
-      data: {
-        id:     randomUUID(),
-        actor:  userId,
-        action: "mfa.stepup.issued",
-        entity: userId,
-        payload: { operationClass, method } as object,
-      },
+    await immutableAudit.write({
+      actor:  userId,
+      action: "mfa.stepup.issued",
+      entity: userId,
+      payload: { operationClass, method } as object,
     }).catch(() => undefined);
   }
 }

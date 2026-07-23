@@ -8,8 +8,8 @@
  * For production: wire to a real AML provider (ComplyAdvantage, Onfido,
  * LexisNexis) by implementing the AmlProvider interface below.
  */
-import { randomUUID }    from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { eventBus }      from "../events-bus/event.bus.js";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
@@ -160,20 +160,16 @@ export class AmlEngine {
   ): Promise<void> {
     if (!IS_PERSISTENT) return;
 
-    const db = prisma as NonNullable<typeof prisma>;
-    await db.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   "AML_ENGINE",
-        action:  `aml.assessment.${assessment.risk.toLowerCase()}`,
-        entity:  userId,
-        payload: {
-          amount, transactionType, reference,
-          risk:       assessment.risk,
-          flags:      assessment.flags,
-          requiresSar: assessment.requiresSar,
-        } as object,
-      },
+    await immutableAudit.write({
+      actor:   "AML_ENGINE",
+      action:  `aml.assessment.${assessment.risk.toLowerCase()}`,
+      entity:  userId,
+      payload: {
+        amount, transactionType, reference,
+        risk:       assessment.risk,
+        flags:      assessment.flags,
+        requiresSar: assessment.requiresSar,
+      } as object,
     });
 
     if (assessment.risk !== "LOW") {

@@ -7,27 +7,38 @@
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
+// REALTIME_FREEZE.md Critical #2: autopilot.service.ts now routes through
+// immutableAudit.write() (real module, not mocked) instead of calling
+// prisma.auditLog.create() directly -- $transaction/$queryRaw/
+// auditLog.findFirst satisfy its chain-head lock and lookup.
 const {
   mockFindUnique, mockUpsert, mockUpdate, mockAuditCreate, mockEventEmit,
-  mockAssertEligible, mockGetConsentStatus,
-} = vi.hoisted(() => ({
-  mockFindUnique: vi.fn(),
-  mockUpsert:     vi.fn(),
-  mockUpdate:     vi.fn(),
-  mockAuditCreate: vi.fn().mockResolvedValue({}),
-  mockEventEmit:  vi.fn(),
-  mockAssertEligible:    vi.fn(),
-  mockGetConsentStatus:  vi.fn(),
-}));
+  mockAssertEligible, mockGetConsentStatus, mockPrisma,
+} = vi.hoisted(() => {
+  const mockFindUnique = vi.fn();
+  const mockUpsert     = vi.fn();
+  const mockUpdate     = vi.fn();
+  const mockAuditCreate = vi.fn().mockResolvedValue({});
+  const mockEventEmit  = vi.fn();
+  const mockAssertEligible   = vi.fn();
+  const mockGetConsentStatus = vi.fn();
+  const mockPrisma: Record<string, unknown> = {
+    autopilotConfig: { findUnique: mockFindUnique, upsert: mockUpsert, update: mockUpdate },
+    auditLog: { create: mockAuditCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    $executeRaw: vi.fn().mockResolvedValue(0),
+  };
+  mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
+  return {
+    mockFindUnique, mockUpsert, mockUpdate, mockAuditCreate, mockEventEmit,
+    mockAssertEligible, mockGetConsentStatus, mockPrisma,
+  };
+});
 
 let isPersistent = true;
 
 vi.mock("../shared/db.js", () => ({
   get IS_PERSISTENT() { return isPersistent; },
-  prisma: {
-    autopilotConfig: { findUnique: mockFindUnique, upsert: mockUpsert, update: mockUpdate },
-    auditLog: { create: mockAuditCreate },
-  },
+  prisma: mockPrisma,
 }));
 
 vi.mock("../events-bus/event.bus.js", () => ({

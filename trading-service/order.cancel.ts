@@ -12,8 +12,8 @@
  *   - Persistent: updates Order status to CANCELLED + AuditLog
  *   - Sandbox: updates in-memory order Map
  */
-import { randomUUID }      from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { eventBus }        from "../events-bus/event.bus.js";
 import { outboxService }   from "../realtime-infra/outbox.service.js";
 import type { BrokerState } from "../shared/state.js";
@@ -55,15 +55,12 @@ async function cancelOrderDb(orderId: string, userId: string): Promise<CancelRes
       data:  { status: "CANCELLED" },
     });
 
-    await tx.auditLog.create({
-      data: {
-        id:      randomUUID(),
-        actor:   userId,
-        action:  "trading.order_cancelled",
-        entity:  orderId,
-        payload: { orderId, previousStatus: order.status } as object,
-      },
-    });
+    await immutableAudit.write({
+      actor:   userId,
+      action:  "trading.order_cancelled",
+      entity:  orderId,
+      payload: { orderId, previousStatus: order.status } as object,
+    }, tx);
   }, { maxWait: 10000, timeout: 15000 });
 
   const ts = new Date().toISOString();

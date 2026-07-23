@@ -27,9 +27,9 @@
  *    50% → STOP_OUT (liquidate the minimal necessary positions)
  */
 
-import { randomUUID }         from "node:crypto";
 import { Decimal }            from "@prisma/client/runtime/library";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit }     from "../security/immutable.audit.js";
 import { quoteCache }         from "../market-data/quote.cache.js";
 import { settlementEngine, PositionAlreadyClosedError } from "../settlement/settlement.engine.js";
 import { eventBus }           from "../events-bus/event.bus.js";
@@ -216,14 +216,11 @@ export class StopOutEngine {
       await this._saveMarginSnapshot(userId, equity, balance, marginUsed, marginLevel, "MARGIN_CALL");
 
       // Write risk warning for dashboard
-      await db.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "risk-engine",
-          action:  "margin.call.triggered",
-          entity:  `user:${userId}`,
-          payload: { marginLevel: marginLevel.toFixed(2), equity, marginUsed } as object,
-        },
+      await immutableAudit.write({
+        actor:   "risk-engine",
+        action:  "margin.call.triggered",
+        entity:  `user:${userId}`,
+        payload: { marginLevel: marginLevel.toFixed(2), equity, marginUsed } as object,
       });
 
       metrics.inc("margin_calls_total");
@@ -345,22 +342,19 @@ export class StopOutEngine {
     // never be undone by an audit-write failure (the money is already
     // moved), but the failure itself must be visible somewhere.
     try {
-      await db.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "risk-engine",
-          action:  "stop_out.triggered",
-          entity:  `user:${userId}`,
-          payload: {
-            marginLevel:  marginLevel.toFixed(2),
-            equity,
-            marginUsed,
-            positionsClosed: liquidated,
-            totalPnl,
-            skippedHalted,
-            skippedStale,
-          } as object,
-        },
+      await immutableAudit.write({
+        actor:   "risk-engine",
+        action:  "stop_out.triggered",
+        entity:  `user:${userId}`,
+        payload: {
+          marginLevel:  marginLevel.toFixed(2),
+          equity,
+          marginUsed,
+          positionsClosed: liquidated,
+          totalPnl,
+          skippedHalted,
+          skippedStale,
+        } as object,
       });
     } catch (err) {
       console.error(`[stop-out] CRITICAL: failed to write stop_out.triggered audit summary for userId=${userId}:`, (err as Error).message);

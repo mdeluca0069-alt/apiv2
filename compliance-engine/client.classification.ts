@@ -3,8 +3,8 @@
  * All retail clients under ESMA jurisdiction are classified as RETAIL
  * by default. Professional / ECP requires opt-up request + assessment.
  */
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
-import { randomUUID } from "node:crypto";
+import { IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 export type ClientCategory = "RETAIL" | "PROFESSIONAL" | "ELIGIBLE_COUNTERPARTY";
 
@@ -27,13 +27,11 @@ export class ClientClassificationService {
     };
 
     if (IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id: randomUUID(), actor: "CLIENT_CLASSIFICATION",
-          action: "client.classified",
-          entity: userId,
-          payload: result as unknown as object,
-        },
+      await immutableAudit.write({
+        actor: "CLIENT_CLASSIFICATION",
+        action: "client.classified",
+        entity: userId,
+        payload: result as unknown as object,
       });
     }
 
@@ -56,13 +54,11 @@ export class ClientClassificationService {
     const approved = score >= 2;
 
     if (IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id: randomUUID(), actor: userId,
-          action: `client.opt_up.${approved ? "approved" : "rejected"}`,
-          entity: userId,
-          payload: { evidence, score, approved } as object,
-        },
+      await immutableAudit.write({
+        actor: userId,
+        action: `client.opt_up.${approved ? "approved" : "rejected"}`,
+        entity: userId,
+        payload: { evidence, score, approved } as object,
       });
     }
 

@@ -30,12 +30,19 @@ const { mockQueryRaw, mockWalletUpdate, mockLedgerCreate, mockAuditLogCreate, mo
 
 vi.mock("../shared/db.js", () => {
   const tx = {
+    // margin.controller.ts's own row-lock SELECT (returns rows -- $queryRaw
+    // is correct here). Separately, REALTIME_FREEZE.md Critical #2's
+    // immutableAudit.write() uses $executeRaw for its advisory lock
+    // (pg_advisory_xact_lock returns void, which $queryRaw cannot
+    // deserialize) -- two distinct Prisma methods, neither asserted on by
+    // call count/args in these tests.
     $queryRaw:     mockQueryRaw,
+    $executeRaw:   vi.fn().mockResolvedValue(0),
     walletAccount: { update: mockWalletUpdate },
     ledgerEntry:   { create: mockLedgerCreate },
-    auditLog:      { create: mockAuditLogCreate },
+    auditLog:      { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
   };
-  return { prisma: { $transaction: mockTransaction, __tx: tx } };
+  return { IS_PERSISTENT: true, prisma: { $transaction: mockTransaction, __tx: tx } };
 });
 
 const { eventBus } = await import("../events-bus/event.bus.js");

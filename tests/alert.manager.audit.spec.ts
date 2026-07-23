@@ -14,12 +14,25 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockAuditLogCreate } = vi.hoisted(() => ({
-  mockAuditLogCreate: vi.fn().mockResolvedValue({}),
-}));
+const { mockAuditLogCreate, mockPrisma } = vi.hoisted(() => {
+  const mockAuditLogCreate = vi.fn().mockResolvedValue({});
+  // REALTIME_FREEZE.md Critical #2: alert.manager.ts now routes through
+  // immutableAudit.write() (real module, not mocked) instead of calling
+  // prisma.auditLog.create() directly -- it needs $transaction/$executeRaw/
+  // auditLog.findFirst on this mock to satisfy write()'s chain-head lock
+  // and lookup, in addition to the create() call these tests assert on.
+  // $executeRaw (not $queryRaw): pg_advisory_xact_lock() returns SQL type
+  // `void`, which $queryRaw cannot deserialize.
+  const mockPrisma: Record<string, unknown> = {
+    auditLog: { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    $executeRaw: vi.fn().mockResolvedValue(0),
+  };
+  mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
+  return { mockAuditLogCreate, mockPrisma };
+});
 vi.mock("../shared/db.js", () => ({
   IS_PERSISTENT: true,
-  prisma: { auditLog: { create: mockAuditLogCreate } },
+  prisma: mockPrisma,
 }));
 
 const { mockMetricsInc } = vi.hoisted(() => ({ mockMetricsInc: vi.fn() }));

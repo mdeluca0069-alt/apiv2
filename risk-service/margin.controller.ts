@@ -6,6 +6,7 @@ import { quoteCache } from "../market-data/quote.cache.js";
 import { pnlCalculator } from "../trading-service/pnl.calculator.js";
 import { eventBus } from "../events-bus/event.bus.js";
 import { metrics } from "../gateway/metrics.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import type { MarginState } from "../shared/contracts.js";
 
 /** See order.lifecycle.ts — same composability contract. */
@@ -194,15 +195,12 @@ export class MarginController {
       // had no Audit trail and no success Metrics at all -- only a failure
       // counter existed, and only if every retry AND the fire-and-forget
       // repair both failed.
-      await tx.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "SYSTEM_EXECUTION",
-          action:  "margin.released",
-          entity:  positionId,
-          payload: { userId, requested: amount, released: safeRelease } as object,
-        },
-      });
+      await immutableAudit.write({
+        actor:   "SYSTEM_EXECUTION",
+        action:  "margin.released",
+        entity:  positionId,
+        payload: { userId, requested: amount, released: safeRelease } as object,
+      }, tx);
 
       released = safeRelease;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 3000, timeout: 8000 });

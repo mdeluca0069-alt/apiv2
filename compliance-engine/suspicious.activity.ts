@@ -4,7 +4,8 @@
  * In production: submit to national FIU (FinCEN, UKFIU, UIF, etc.)
  */
 import { randomUUID } from "node:crypto";
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 export type SarReport = {
   id:          string;
@@ -38,13 +39,11 @@ export class SuspiciousActivityService {
     };
 
     if (IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id: sar.id, actor: "SAR_ENGINE",
-          action: `sar.${sar.reportType.toLowerCase()}.filed`,
-          entity: userId,
-          payload: sar as unknown as object,
-        },
+      await immutableAudit.write({
+        actor: "SAR_ENGINE",
+        action: `sar.${sar.reportType.toLowerCase()}.filed`,
+        entity: userId,
+        payload: sar as unknown as object,
       });
     }
 

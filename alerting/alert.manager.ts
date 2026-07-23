@@ -24,9 +24,9 @@
  * All alerts are also written to AuditLog for compliance.
  */
 
-import { randomUUID } from "node:crypto";
 import { metrics } from "../gateway/metrics.js";
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -197,16 +197,13 @@ class AlertManager {
   // header comment true instead of removing the claim, since alerting is
   // exactly the kind of event FASE 5's rule is about.
   private async _writeAuditLog(alert: AlertPayload): Promise<void> {
-    if (!IS_PERSISTENT || !prisma) return;
+    if (!IS_PERSISTENT) return;
     try {
-      await prisma.auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "ALERT_MANAGER",
-          action:  `alert.${alert.type.toLowerCase()}`,
-          entity:  alert.type,
-          payload: { severity: alert.severity, title: alert.title, message: alert.message, ...alert.metadata } as object,
-        },
+      await immutableAudit.write({
+        actor:   "ALERT_MANAGER",
+        action:  `alert.${alert.type.toLowerCase()}`,
+        entity:  alert.type,
+        payload: { severity: alert.severity, title: alert.title, message: alert.message, ...alert.metadata } as object,
       });
     } catch (err) {
       console.error("[alert] failed to write AuditLog:", (err as Error).message);

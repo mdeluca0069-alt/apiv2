@@ -3,8 +3,8 @@
  * Integrates with AmlEngine; called on every deposit/withdrawal and periodically
  * for batch review of ledger activity.
  */
-import { randomUUID } from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { amlEngine }  from "./aml.engine.js";
 import { eventBus }   from "../events-bus/event.bus.js";
 
@@ -36,14 +36,11 @@ export class TransactionMonitor {
     }
 
     if (IS_PERSISTENT && assessment.risk !== "LOW") {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id:      randomUUID(),
-          actor:   "TRANSACTION_MONITOR",
-          action:  `tx.monitor.${actionTaken.toLowerCase()}`,
-          entity:  userId,
-          payload: { amount, transactionType, reference, assessment, actionTaken } as object,
-        },
+      await immutableAudit.write({
+        actor:   "TRANSACTION_MONITOR",
+        action:  `tx.monitor.${actionTaken.toLowerCase()}`,
+        entity:  userId,
+        payload: { amount, transactionType, reference, assessment, actionTaken } as object,
       });
 
       if (assessment.risk === "CRITICAL") {

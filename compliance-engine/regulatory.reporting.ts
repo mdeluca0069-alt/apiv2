@@ -5,7 +5,8 @@
  * This implementation stores reports in AuditLog and prepares the RTS 22 format.
  */
 import { randomUUID } from "node:crypto";
-import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { mifidEngine } from "./mifid.engine.js";
 
 export type RegulatoryReport = {
@@ -46,13 +47,16 @@ export class RegulatoryReportingService {
     };
 
     if (IS_PERSISTENT) {
-      await (prisma as NonNullable<typeof prisma>).auditLog.create({
-        data: {
-          id: report.reportId, actor: "REGULATORY_REPORTING",
-          action: "regulatory.trade_report",
-          entity: params.orderId,
-          payload: report as unknown as object,
-        },
+      // Note: the AuditLog row's own id comes from immutableAudit.write(),
+      // not report.reportId -- nothing looks up an AuditLog row by
+      // reportId (it's referenced only as a payload/entity value
+      // elsewhere), so this is safe. report.reportId remains the
+      // identifier callers actually use.
+      await immutableAudit.write({
+        actor: "REGULATORY_REPORTING",
+        action: "regulatory.trade_report",
+        entity: params.orderId,
+        payload: report as unknown as object,
       });
     }
 
