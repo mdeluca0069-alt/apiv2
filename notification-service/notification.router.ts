@@ -26,7 +26,7 @@ export type NotifChannel  = "EMAIL" | "SMS" | "PUSH" | "IN_APP";
 export type NotifPriority = "LOW" | "NORMAL" | "HIGH" | "CRITICAL";
 export type NotifCategory =
   | "fill" | "rejection" | "margin" | "risk" | "kyc" | "wallet" | "signal" | "system" | "autopilot"
-  | "account" | "support";
+  | "account" | "support" | "compliance";
 
 export type NotifPayload = {
   userId:    string;
@@ -261,12 +261,24 @@ export class NotificationRouter {
       );
     });
 
-    // Risk warnings
+    // Risk warnings (margin/liquidation only, see FASE 7 CLOSURE M.6)
     eventBus.on("risk.warning", (e) => {
       void this.send({
         userId:   e.userId, channel: "IN_APP", category: "risk", priority: "HIGH",
         title:    "Risk alert",
         body:     String((e as Record<string, unknown>).message ?? "Risk threshold breached"),
+        payload:  e as unknown as Record<string, unknown>,
+      });
+    });
+
+    // Compliance alerts (AML/sanctions/transaction-monitoring) -- split out
+    // of risk.warning under FASE 7 CLOSURE M.6, own category/copy instead
+    // of the generic "Risk alert" every flavor previously shared.
+    eventBus.on("compliance.alert", (e) => {
+      void this.send({
+        userId:   e.userId, channel: "IN_APP", category: "compliance", priority: "HIGH",
+        title:    "Compliance alert",
+        body:     e.message,
         payload:  e as unknown as Record<string, unknown>,
       });
     });

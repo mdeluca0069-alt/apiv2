@@ -95,17 +95,43 @@ export type SignalGeneratedEvent = {
   timestamp: string;
 };
 
+/**
+ * FASE 7 CLOSURE, Phase A (M.6): margin/liquidation-risk flavor only, now
+ * that compliance alerts (AML/sanctions/transaction-monitoring) have their
+ * own `compliance.alert` event below. Never carries `type` -- the field
+ * (and the compliance-specific `payload`) moved to ComplianceAlertEvent.
+ * Sole remaining producer: settlement.engine.ts's post-liquidation summary
+ * (STOP_OUT/LIQUIDATION).
+ */
 export type RiskWarningEvent = {
   userId: string;
   severity: "INFO" | "WARNING" | "CRITICAL" | "LOW" | "MEDIUM" | "HIGH";
-  /** Optional: compliance alert type, e.g. "AML_FLAG", "PEP_HIT". */
-  type?: string;
   marginLevel?: number;
   riskScore?: number;
   message: string;
   timestamp?: string;
-  /** Optional: compliance-specific payload attached by compliance engine. */
-  payload?: unknown;
+};
+
+/**
+ * FASE 7 CLOSURE, Phase A (M.6): split out of RiskWarningEvent/"risk.warning".
+ * Previously all 4 compliance-engine producers (AML, sanctions, transaction
+ * monitoring, generic compliance alerts) emitted under the same event name
+ * as settlement.engine.ts's margin/liquidation risk summary, disambiguated
+ * only by the presence of an optional `type` field -- notification.router.ts
+ * and every frontend consumer (risk.store.ts, notification.store.ts) treated
+ * both flavors identically (generic "Risk alert" copy, a "/risk" actionPath
+ * even for an AML flag, and risk.store.ts's marginLevel/riskScore fields
+ * silently defaulting to 0 for a payload that never carried them). Always
+ * carries `type` (unlike RiskWarningEvent, which never does) -- the
+ * discriminator that used to be implicit and optional is now the reason
+ * this is a different, explicit event.
+ */
+export type ComplianceAlertEvent = {
+  userId:  string;
+  type:    string;   // e.g. "AML_FLAG", "SANCTIONS_HIT", "TRANSACTION_FLAGGED", "PEP_HIT"
+  severity: "INFO" | "WARNING" | "CRITICAL" | "LOW" | "MEDIUM" | "HIGH";
+  message: string;
+  payload: unknown;
 };
 
 export type WalletEvent = {
@@ -400,6 +426,7 @@ export interface BrokerEventMap {
   "signal.generated":       [SignalGeneratedEvent];
   // Risk
   "risk.warning":           [RiskWarningEvent];
+  "compliance.alert":       [ComplianceAlertEvent];
   "margin.warning":         [MarginWarningEvent];
   // Wallet
   "wallet.event":           [WalletEvent];

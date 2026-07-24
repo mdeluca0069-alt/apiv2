@@ -55,7 +55,8 @@ export class ComplianceAlertService {
     }
 
     if (severity === "HIGH" || severity === "CRITICAL") {
-      eventBus.emit("risk.warning", {
+      // FASE 7 CLOSURE, Phase A (M.6): was "risk.warning", see aml.engine.ts.
+      eventBus.emit("compliance.alert", {
         userId, type: alertType, severity, message, payload,
       });
     }

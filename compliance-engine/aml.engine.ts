@@ -173,7 +173,9 @@ export class AmlEngine {
     });
 
     if (assessment.risk !== "LOW") {
-      eventBus.emit("risk.warning", {
+      // FASE 7 CLOSURE, Phase A (M.6): was "risk.warning", conflated with
+      // settlement.engine.ts's unrelated margin/liquidation risk summary.
+      eventBus.emit("compliance.alert", {
         userId,
         type:     "AML_FLAG",
         severity: assessment.risk,

@@ -59,6 +59,10 @@ const ARCHIVED_EVENTS: Array<keyof import("../events-bus/event.bus.js").BrokerEv
   "position.closed",
   "signal.generated",
   "risk.warning",
+  // FASE 7 CLOSURE, Phase A (M.6): compliance alerts split out of
+  // risk.warning into their own event -- keep the same archive coverage
+  // AML/sanctions/transaction-monitoring alerts already had under the old name.
+  "compliance.alert",
   "wallet.event",
   // REALTIME_FREEZE.md Critical #1: "risk.stop_out"/"risk.margin_call" were
   // removed as event names entirely -- stopout.engine.ts now emits a single

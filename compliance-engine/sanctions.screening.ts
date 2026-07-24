@@ -62,7 +62,8 @@ export class SanctionsScreeningService {
       payload: { fullName, countryCode, ...result } as object,
     });
     if (result.action !== "ALLOW") {
-      eventBus.emit("risk.warning", {
+      // FASE 7 CLOSURE, Phase A (M.6): was "risk.warning", see aml.engine.ts.
+      eventBus.emit("compliance.alert", {
         userId, type: "SANCTIONS_HIT", severity: "CRITICAL",
         message: `Sanctions BLOCK: ${result.matchType} (${countryCode})`,
         payload: result,

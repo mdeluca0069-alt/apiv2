@@ -1180,13 +1180,24 @@ eventBus.on("signal.generated", (event) => {
     })();
   }
 });
+// FASE 7 CLOSURE, Phase A (M.6): risk.warning is now margin/liquidation-risk
+// only (settlement.engine.ts's post-liquidation summary) -- compliance
+// alerts moved to their own compliance.alert event below.
 eventBus.on("risk.warning", (event) => {
   enqueueAndPush(event.userId, "risk.warning", { warning: event });
-  // REALTIME_FREEZE.md H.2: compliance-engine/aml.engine.ts emits this with
-  // type "AML_FLAG" for HIGH/CRITICAL risk assessments -- previously only
-  // ever reached the flagged user themselves (above); compliance staff had
-  // no live signal and relied on AMLAlerts.tsx's 30s poll.
-  if (event.type === "AML_FLAG" && (event.severity === "HIGH" || event.severity === "CRITICAL")) {
+});
+// REALTIME_FREEZE.md H.2 (moved here under M.6's split, same logic):
+// compliance-engine's 4 producers (AML, sanctions, transaction monitoring,
+// generic compliance alerts) previously emitted under "risk.warning",
+// disambiguated only by an optional `type` field every consumer either
+// ignored or (risk.store.ts) would have rendered as a margin warning with
+// marginLevel/riskScore silently defaulting to 0. HIGH/CRITICAL alerts
+// reach staff live (compliance-engine's own producers already gate MEDIUM
+// and below before emitting, except aml.engine.ts's `!== "LOW"` -- this
+// filter still matters for that one case).
+eventBus.on("compliance.alert", (event) => {
+  enqueueAndPush(event.userId, "compliance.alert", event as unknown as Record<string, unknown>);
+  if (event.severity === "HIGH" || event.severity === "CRITICAL") {
     pushToStaff("admin.aml_alert", event, ["super_admin", "admin", "compliance"]);
   }
 });

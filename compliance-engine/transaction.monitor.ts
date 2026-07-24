@@ -44,7 +44,8 @@ export class TransactionMonitor {
       });
 
       if (assessment.risk === "CRITICAL") {
-        eventBus.emit("risk.warning", {
+        // FASE 7 CLOSURE, Phase A (M.6): was "risk.warning", see aml.engine.ts.
+        eventBus.emit("compliance.alert", {
           userId, type: "TRANSACTION_FLAGGED", severity: "CRITICAL",
           message: `Transaction of ${amount} USD flagged: ${assessment.flags.map((f) => f.code).join(", ")}`,
           payload: assessment,
