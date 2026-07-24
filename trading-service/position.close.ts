@@ -121,6 +121,10 @@ async function closePositionMemory(
     exitPrice: result.exitPrice,
     pnl:       result.pnl,
     timestamp: ts,
+    // This is the sandbox/in-memory close path for POST .../close -- always
+    // a manual user-initiated close, same as settlement.engine.ts's "ADMIN"
+    // vs "MANUAL" distinction (see REALTIME_FREEZE.md M.4).
+    reason:    "MANUAL",
   });
 
   return { ok: true, positionId, symbol: result.symbol, pnl: result.pnl, exitPrice: result.exitPrice, netCredit: result.pnl };

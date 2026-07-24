@@ -319,30 +319,22 @@ export class SignalTelemetryService {
       }
     });
 
-    // When a position closes — finalise the telemetry record
+    // When a position closes — finalise the telemetry record.
+    // REALTIME_FREEZE.md M.4: `reason` used to arrive on a separate
+    // "trade.closed" event that settlement.engine.ts never actually emitted
+    // -- exitReason was permanently stuck at "MANUAL" for every closed
+    // position regardless of the real reason (SL/TP/stop-out/admin).
+    // settlement.engine.ts now carries `reason` directly on position.closed.
     eventBus.on("position.closed", async (ev) => {
       await this.updateOutcome(ev.positionId, {
         pnl:        ev.pnl,
         exitPrice:  ev.exitPrice,
-        exitReason: "MANUAL",   // default; settlement engine overrides via trade.closed
+        exitReason: _mapReason(ev.reason),
         closedAt:   new Date(ev.timestamp),
         entryPrice: ev.entryPrice,
         side:       ev.side,
         quantity:   ev.quantity,
       });
-    });
-
-    // trade.closed carries the exit reason from SettlementEngine
-    eventBus.on("trade.closed", async (ev) => {
-      if (!IS_PERSISTENT || !prisma) return;
-
-      const db = prisma as NonNullable<typeof prisma>;
-      try {
-        await db.signalTelemetry.updateMany({
-          where:  { positionId: ev.positionId, outcome: { not: "PENDING" } },
-          data:   { exitReason: _mapReason(ev.reason) },
-        });
-      } catch { /* non-fatal */ }
     });
   }
 }

@@ -564,7 +564,10 @@ wss.on("connection", (rawSocket: WebSocket, req: IncomingMessage) => {
         for (const evt of pending) {
           if (socket.readyState !== socket.OPEN) break;
           if (!sendToSocket(socket, evt.eventType, evt.payload, { replayed: true })) break;
-          void outboxService.markPublished(evt.id);
+          // REALTIME_FREEZE.md M.2: awaited (not fire-and-forget) to shrink
+          // the window where a concurrent path (retryUnpublished sweep) could
+          // see this row as still-pending and redundantly re-deliver it.
+          await outboxService.markPublished(evt.id);
         }
         if (pending.length) {
           console.log(`[outbox] replayed ${pending.length} event(s) for user ${socket.userId}`);
@@ -1125,9 +1128,6 @@ eventBus.on("order.rejected", (event) => {
   const payload = { ...event, status: "REJECTED" } as Record<string, unknown>;
   enqueueAndPush(event.userId, "order.rejected", payload);
   enqueueAndPush(event.userId, "execution", payload);
-});
-eventBus.on("order.closed", (event) => {
-  enqueueAndPush(event.userId, "order.closed", event as unknown as Record<string, unknown>);
 });
 eventBus.on("signal.generated", (event) => {
   broadcast("signal.generated", event);

@@ -15,9 +15,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const { mockDb } = vi.hoisted(() => {
   const mockDb = {
     outboxEvent: {
-      create:    vi.fn(),
-      update:    vi.fn().mockResolvedValue({}),
-      findMany:  vi.fn(),
+      create:     vi.fn(),
+      update:     vi.fn().mockResolvedValue({}),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      findMany:   vi.fn(),
     },
   };
   return { mockDb };
@@ -29,6 +30,7 @@ const { outboxService } = await import("../realtime-infra/outbox.service.js");
 beforeEach(() => {
   vi.clearAllMocks();
   mockDb.outboxEvent.update.mockResolvedValue({});
+  mockDb.outboxEvent.updateMany.mockResolvedValue({ count: 1 });
 });
 
 describe("OutboxService.getPendingForUser()", () => {
@@ -66,9 +68,28 @@ describe("OutboxService.retryUnpublished()", () => {
     const delivered = await outboxService.retryUnpublished(new Date(0), pushFn);
 
     expect(delivered).toBe(1);
-    expect(mockDb.outboxEvent.update).toHaveBeenCalledWith({
-      where: { id: "evt-1" }, data: { published: true, publishedAt: expect.any(Date) },
+    // REALTIME_FREEZE.md M.2: markPublished is now a conditional
+    // updateMany (WHERE published: false), not a blind update — a
+    // compare-and-swap so a concurrent path racing to publish the same
+    // row can detect whether it actually won.
+    expect(mockDb.outboxEvent.updateMany).toHaveBeenCalledWith({
+      where: { id: "evt-1", published: false }, data: { published: true, publishedAt: expect.any(Date) },
     });
+  });
+
+  it("logs (but still counts as delivered) when another path already published the row first — M.2 race detection", async () => {
+    mockDb.outboxEvent.findMany.mockResolvedValue([
+      { id: "evt-1", eventType: "order.filled", payload: {}, userId: "user-1", retries: 0, createdAt: new Date() },
+    ]);
+    mockDb.outboxEvent.updateMany.mockResolvedValue({ count: 0 }); // someone else won the CAS
+    const pushFn = vi.fn().mockReturnValue(true);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const delivered = await outboxService.retryUnpublished(new Date(0), pushFn);
+
+    expect(delivered).toBe(1);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("already marked published by another path"));
+    warnSpy.mockRestore();
   });
 
   it("increments retries (not published) when pushFn returns false — a local miss is not proof the user is offline", async () => {

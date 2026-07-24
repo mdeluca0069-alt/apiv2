@@ -51,6 +51,17 @@ export type PositionClosedEvent = {
   timestamp: string;
   /** FASE 2.1: see OrderFilledEvent.outboxId. */
   outboxId?: string;
+  /**
+   * REALTIME_FREEZE.md M.4: settlement.engine.ts's SettleInput.reason,
+   * carried straight through -- previously only reached signal.telemetry.ts
+   * via a separate "trade.closed" event that settlement.engine.ts never
+   * actually emitted (dead producer, live consumer: every closed position's
+   * signalTelemetry row was permanently stuck at exitReason "MANUAL"
+   * regardless of the real reason). Same literal union as
+   * settlement/settlement.engine.ts's CloseReason -- not imported directly
+   * to avoid a circular import (that module imports eventBus from here).
+   */
+  reason: "MANUAL" | "STOP_LOSS" | "TAKE_PROFIT" | "STOP_OUT" | "LIQUIDATION" | "ADMIN";
 };
 
 export type MarketQuoteEvent = {
@@ -97,14 +108,6 @@ export type RiskWarningEvent = {
   payload?: unknown;
 };
 
-export type AdminAuditEvent = {
-  actor: string;
-  action: string;
-  entity: string;
-  payload: Record<string, unknown>;
-  timestamp: string;
-};
-
 export type WalletEvent = {
   userId: string;
   type: "CREDIT" | "DEBIT" | "MARGIN_LOCK" | "MARGIN_RELEASE";
@@ -137,15 +140,6 @@ export type OrderCancelledEvent = {
   previousStatus?: string;
   reason?:        string;
   timestamp:      string;
-};
-
-export type OrderClosedEvent = {
-  orderId?:   string;
-  positionId?: string;
-  userId:     string;
-  symbol?:    string;
-  pnl?:       number;
-  timestamp:  string;
 };
 
 export type OrderTriggeredEvent = {
@@ -317,15 +311,6 @@ export type PositionPnlUpdatedEvent = {
   timestamp:   string;
 };
 
-export type TradeClosedEvent = {
-  positionId: string;
-  userId:     string;
-  symbol:     string;
-  pnl:        number;
-  reason:     string;
-  closedAt:   string;
-};
-
 export type SwapAccruedEvent = {
   userId:      string;
   positionId:  string;
@@ -384,7 +369,6 @@ export interface BrokerEventMap {
   "order.status_changed":   [OrderStatusChangedEvent];
   "order.pending":          [OrderPendingEvent];
   "order.cancelled":        [OrderCancelledEvent];
-  "order.closed":           [OrderClosedEvent];
   "order.triggered":        [OrderTriggeredEvent];
   "order.trigger_failed":   [OrderTriggerFailedEvent];
   "order.stop_limit_armed": [OrderStopLimitArmedEvent];
@@ -401,8 +385,6 @@ export interface BrokerEventMap {
   // Risk
   "risk.warning":           [RiskWarningEvent];
   "margin.warning":         [MarginWarningEvent];
-  // Admin
-  "admin.audit":            [AdminAuditEvent];
   // Wallet
   "wallet.event":           [WalletEvent];
   // Account lifecycle
@@ -420,8 +402,6 @@ export interface BrokerEventMap {
   "autopilot.rejected":     [AutopilotRejectedEvent];
   "autopilot.config_changed": [AutopilotConfigChangedEvent];
   "autopilot.daily_loss_lock": [AutopilotDailyLossLockEvent];
-  // Trade lifecycle
-  "trade.closed":           [TradeClosedEvent];
   // Swap
   "swap.accrued":           [SwapAccruedEvent];
   // Partial fills

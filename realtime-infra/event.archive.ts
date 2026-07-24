@@ -55,7 +55,6 @@ export type ArchiveStats = {
 const ARCHIVED_EVENTS: Array<keyof import("../events-bus/event.bus.js").BrokerEventMap> = [
   "order.filled",
   "order.rejected",
-  "order.closed",
   "position.opened",
   "position.closed",
   "signal.generated",
@@ -67,7 +66,6 @@ const ARCHIVED_EVENTS: Array<keyof import("../events-bus/event.bus.js").BrokerEv
   // MARGIN_CALL/STOP_OUT, disambiguated by its own `threshold` field), so
   // this one archive subscription now covers what used to require three.
   "margin.warning",
-  "trade.closed",
   "swap.accrued",
 ];
 

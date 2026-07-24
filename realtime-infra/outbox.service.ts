@@ -39,16 +39,33 @@ export class OutboxService {
     }
   }
 
-  /** Mark an event as successfully delivered. */
-  async markPublished(id: string): Promise<void> {
-    if (!IS_PERSISTENT) return;
+  /**
+   * Mark an event as successfully delivered.
+   *
+   * REALTIME_FREEZE.md M.2: conditioned on `published: false` (compare-and-
+   * swap via `updateMany`, not a blind `update`) and returns whether THIS
+   * call was the one that actually flipped it. Three independent code paths
+   * can race to deliver + mark the same row (a live push via
+   * enqueueAndPush, the connection-handler's reconnect replay, and the 30s
+   * retryUnpublished sweep) -- this doesn't prevent a redundant duplicate
+   * *send* (the two paths can both call client.send() before either's
+   * markPublished lands; a schema change to claim rows before pushing would
+   * be needed to close that fully, which is a larger change than this
+   * already-documented-as-financially-harmless finding warrants), but it
+   * does make the race observable (see the `false` branch below) instead of
+   * silently corrupting/double-counting the outbox row's own bookkeeping.
+   */
+  async markPublished(id: string): Promise<boolean> {
+    if (!IS_PERSISTENT) return false;
     try {
-      await (prisma as NonNullable<typeof prisma>).outboxEvent.update({
-        where: { id },
+      const result = await (prisma as NonNullable<typeof prisma>).outboxEvent.updateMany({
+        where: { id, published: false },
         data:  { published: true, publishedAt: new Date() },
       });
+      return result.count === 1;
     } catch {
       // Non-fatal: worst case the event gets replayed once more.
+      return false;
     }
   }
 
@@ -121,7 +138,13 @@ export class OutboxService {
       for (const evt of events) {
         const userId = evt.userId!;
         if (pushFn(userId, evt.eventType, evt.payload, evt.id)) {
-          await this.markPublished(evt.id);
+          const wasFirst = await this.markPublished(evt.id);
+          if (!wasFirst) {
+            // REALTIME_FREEZE.md M.2: another path (a live push or the
+            // reconnect replay) already published this row -- the sweep
+            // still delivered a (harmless, but redundant) duplicate send.
+            console.warn(`[outbox] sweep delivered outbox row ${evt.id} that was already marked published by another path (duplicate send, no financial impact)`);
+          }
           delivered++;
         } else {
           await (prisma as NonNullable<typeof prisma>).outboxEvent.update({

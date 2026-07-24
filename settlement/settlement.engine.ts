@@ -432,6 +432,9 @@ export class SettlementEngine {
       pnl:        pnl.cappedPnl,
       timestamp:  ts,
       outboxId,
+      // REALTIME_FREEZE.md M.4: was previously only carried on a separate
+      // "trade.closed" event this engine never actually emitted.
+      reason:     input.reason,
     });
 
     eventBus.emit("wallet.event", {
