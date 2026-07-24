@@ -116,6 +116,22 @@ export type WalletEvent = {
   timestamp: string;
 };
 
+/**
+ * REALTIME_FREEZE.md L.6: DepositPanel.tsx polls GET /payments/deposit/:id
+ * every 3s while a deposit is non-terminal, self-terminating once it hits a
+ * terminal status. Emitted only for the transitions that happen
+ * asynchronously relative to that poll loop (a PSP webhook arriving) --
+ * not for PENDING, which is set synchronously during the same
+ * initiate-deposit request the frontend already gets a response from
+ * before it starts polling.
+ */
+export type DepositStatusChangedEvent = {
+  depositId: string;
+  userId:    string;
+  status:    "CONFIRMED" | "CREDITED" | "FAILED";
+  timestamp: string;
+};
+
 // ─── Order lifecycle events ───────────────────────────────────────────────────
 
 export type OrderPendingEvent = {
@@ -387,6 +403,7 @@ export interface BrokerEventMap {
   "margin.warning":         [MarginWarningEvent];
   // Wallet
   "wallet.event":           [WalletEvent];
+  "deposit.status_changed": [DepositStatusChangedEvent];
   // Account lifecycle
   "user.registered":        [UserRegisteredEvent];
   // Support

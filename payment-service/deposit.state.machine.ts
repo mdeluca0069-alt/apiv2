@@ -168,6 +168,13 @@ export class DepositStateMachine {
         userId: creditedUserId, type: "CREDIT", amount: creditedAmount,
         reference: `PSP:${params.pspRef}`, timestamp: new Date().toISOString(),
       });
+      // REALTIME_FREEZE.md L.6: see transitionToConfirmed -- gives
+      // DepositPanel.tsx a direct, unambiguous "your deposit specifically
+      // is now CREDITED" signal instead of only the general wallet.event
+      // (which the 3s poll already fell back to inferring from).
+      eventBus.emit("deposit.status_changed", {
+        depositId, userId: creditedUserId, status: "CREDITED", timestamp: new Date().toISOString(),
+      });
       metrics.inc("igfx_deposits_total");
       metrics.observe("igfx_deposit_amount_usd", creditedAmount);
     }
@@ -179,7 +186,7 @@ export class DepositStateMachine {
     pspRef:      string;
     webhookData: unknown;
   }): Promise<void> {
-    await this.db.depositTransaction.update({
+    const dep = await this.db.depositTransaction.update({
       where: { id: depositId },
       data:  {
         status:      "CONFIRMED",
@@ -187,23 +194,35 @@ export class DepositStateMachine {
         webhookData: (params.webhookData as object) ?? undefined,
         confirmedAt: new Date(),
       },
+      select: { userId: true },
+    });
+    // REALTIME_FREEZE.md L.6: DepositPanel.tsx's 3s poll previously only
+    // learned of this transition (payment collected, awaiting credit) at
+    // its next tick.
+    eventBus.emit("deposit.status_changed", {
+      depositId, userId: dep.userId, status: "CONFIRMED", timestamp: new Date().toISOString(),
     });
   }
 
   async transitionToFailed(depositId: string, reason: string, webhookData?: unknown): Promise<void> {
-    await this.db.depositTransaction.update({
+    const dep = await this.db.depositTransaction.update({
       where: { id: depositId },
       data:  {
         status:      "FAILED",
         failReason:  reason,
         webhookData: (webhookData as object) ?? undefined,
       },
+      select: { userId: true },
     });
     await immutableAudit.write({
       actor:   "PAYMENT_SERVICE",
       action:  "deposit.failed",
       entity:  depositId,
       payload: { depositId, reason } as object,
+    });
+    // REALTIME_FREEZE.md L.6: see transitionToConfirmed.
+    eventBus.emit("deposit.status_changed", {
+      depositId, userId: dep.userId, status: "FAILED", timestamp: new Date().toISOString(),
     });
   }
 

@@ -1220,6 +1220,12 @@ eventBus.on("wallet.event", (event) => {
   // Keep backward-compat alias
   enqueueAndPush(event.userId, "wallet.event", payload);
 });
+// REALTIME_FREEZE.md L.6: DepositPanel.tsx's 3s poll previously had no WS
+// alternative for the async PSP-webhook-driven transitions (CONFIRMED/
+// CREDITED/FAILED) it's watching for.
+eventBus.on("deposit.status_changed", (event) => {
+  enqueueAndPush(event.userId, "deposit.status_changed", event as unknown as Record<string, unknown>);
+});
 eventBus.on("margin.warning", (event) => {
   enqueueAndPush(event.userId, "margin.warning", event as unknown as Record<string, unknown>);
   // REALTIME_FREEZE.md H.2 (paired with Critical #1's margin.warning fix):
