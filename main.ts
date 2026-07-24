@@ -1129,6 +1129,28 @@ eventBus.on("order.rejected", (event) => {
   enqueueAndPush(event.userId, "order.rejected", payload);
   enqueueAndPush(event.userId, "execution", payload);
 });
+// REALTIME_FREEZE.md L.1: intermediate order lifecycle states -- all
+// actively emitted, all previously zero listener -- so the client only ever
+// saw terminal states (FILLED/PARTIAL/REJECTED/CLOSED), never the states
+// leading up to them. The frontend's trading.store.ts already had a
+// wsClient.on("order.pending", ...) listener waiting for a message type
+// this bridge never sent (dead frontend code, live-and-waiting -- see
+// trading.store.ts's own commit for the L.1 frontend half).
+eventBus.on("order.pending", (event) => {
+  enqueueAndPush(event.userId, "order.pending", event as unknown as Record<string, unknown>);
+});
+eventBus.on("order.cancelled", (event) => {
+  enqueueAndPush(event.userId, "order.cancelled", event as unknown as Record<string, unknown>);
+});
+eventBus.on("order.trigger_failed", (event) => {
+  enqueueAndPush(event.userId, "order.trigger_failed", event as unknown as Record<string, unknown>);
+});
+eventBus.on("order.stop_limit_armed", (event) => {
+  enqueueAndPush(event.userId, "order.stop_limit_armed", event as unknown as Record<string, unknown>);
+});
+eventBus.on("order.limit_expired", (event) => {
+  enqueueAndPush(event.userId, "order.limit_expired", event as unknown as Record<string, unknown>);
+});
 eventBus.on("signal.generated", (event) => {
   broadcast("signal.generated", event);
 
@@ -1210,6 +1232,19 @@ eventBus.on("margin.warning", (event) => {
   if (event.threshold === "MARGIN_CALL" || event.threshold === "STOP_OUT") {
     pushToStaff("admin.margin_alert", event, ["super_admin", "admin", "risk"]);
   }
+});
+// REALTIME_FREEZE.md M.5: both previously reached only NotificationRouter
+// (DB+email, itself poll-only per C.1's finding) / event.archive.ts --
+// zero live WS push, so a user only saw a nightly swap charge or an
+// autopilot-managed SL/TP change at their next positions refetch/poll, not
+// as a live update. Low-frequency, meaningful state changes (daily swap
+// job, autopilot sweep) -- durable via enqueueAndPush like position.updated
+// (H.6), not fire-and-forget like the high-frequency pnl tick stream above.
+eventBus.on("swap.accrued", (event) => {
+  enqueueAndPush(event.userId, "swap.accrued", event as unknown as Record<string, unknown>);
+});
+eventBus.on("autopilot.position_managed", (event) => {
+  enqueueAndPush(event.userId, "autopilot.position_managed", event as unknown as Record<string, unknown>);
 });
 
 // P6 — Background retry sweep: recover events for users who just came online.
