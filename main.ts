@@ -394,6 +394,11 @@ interface AuthenticatedSocket extends WebSocket {
   // replay for this socket finishes. While true, pushToUser() defers
   // instead of sending immediately -- see pushToUser's docstring for why.
   replaying?: boolean;
+  // REALTIME_FREEZE.md H.4: consecutive WS_KEEPALIVE_MS ticks (30s each)
+  // this socket has been found over WS_BACKPRESSURE_HIGH_WATER_MARK. Reset
+  // to 0 the moment it's found under the mark again. See the keepalive
+  // interval below for the terminate policy.
+  backpressureStrikes?: number;
 }
 
 // ─── HTTP + WebSocket server ──────────────────────────────────────────────────
@@ -440,6 +445,28 @@ wss.on("error", (err) => {
   console.error("[wss] server-level socket error (non-fatal):", err.message);
 });
 
+// REALTIME_FREEZE.md H.4: zero backpressure handling existed anywhere --
+// `ws` performs no automatic throttling, and a slow/backgrounded client
+// (poor network, laptop lid closed) accumulated sends without limit in the
+// underlying socket's write buffer as high-frequency events kept arriving
+// (market.quotes ~1/s to every client, position.pnl_updated per tick per
+// open position), unbounded by anything except the 30s ping/pong keepalive
+// -- which only catches a socket that stopped responding, not one that's
+// alive but draining slower than data arrives. 1MB is a conservative
+// high-water mark: `ws` buffers in Node Buffer chunks in RAM per socket, so
+// this bounds worst-case per-connection memory from this cause while being
+// far above the size of any single message this app ever sends.
+const WS_BACKPRESSURE_HIGH_WATER_MARK = 1_000_000;
+// Sockets found over the mark 3 keepalive ticks running (~90s of sustained,
+// non-transient backpressure) are terminated -- same recovery path as a
+// dead socket: the client's own reconnect logic (api/websocket.ts) takes
+// over, and outbox replay (H.3) repopulates anything that was missed.
+const WS_BACKPRESSURE_STRIKE_LIMIT = 3;
+
+function isBackpressured(client: AuthenticatedSocket): boolean {
+  return client.bufferedAmount > WS_BACKPRESSURE_HIGH_WATER_MARK;
+}
+
 // ─── Server-side WS keepalive ─────────────────────────────────────────────────
 // Pings every connected client every 30 s. Clients that don't respond within
 // one interval are terminated. This prevents Vite-proxy / firewall / NAT
@@ -452,6 +479,19 @@ setInterval(() => {
     if (client.isAlive === false) {
       client.terminate();
       continue;
+    }
+    // REALTIME_FREEZE.md H.4: forced-disconnect policy for a persistently
+    // backpressured (alive, but not draining) socket -- see the constants'
+    // docstring above.
+    if (isBackpressured(client)) {
+      client.backpressureStrikes = (client.backpressureStrikes ?? 0) + 1;
+      if (client.backpressureStrikes >= WS_BACKPRESSURE_STRIKE_LIMIT) {
+        console.warn(`[ws] terminating persistently backpressured socket (userId=${client.userId ?? "anon"}, bufferedAmount=${client.bufferedAmount})`);
+        client.terminate();
+        continue;
+      }
+    } else {
+      client.backpressureStrikes = 0;
     }
     client.isAlive = false;
     try { client.ping(); } catch { /* ignore stale sockets */ }
@@ -581,6 +621,14 @@ const liquidityCore = new InternalLiquidityCore({
       const client = rawClient as AuthenticatedSocket;
       if (client.readyState !== client.OPEN) continue;
       if (liveTradingEnabled && !client.authenticated) continue;
+      // REALTIME_FREEZE.md H.4: this is the highest-frequency broadcast in
+      // the app (~1/s to every connected client) and the finding's own
+      // primary example of unbounded backpressure -- skip a client that's
+      // already behind rather than piling another full quote batch onto its
+      // write buffer. Next tick (~1s) supersedes this one anyway (latest-
+      // value-wins), so dropping one batch for a backpressured client loses
+      // nothing a fresh tick won't immediately replace.
+      if (isBackpressured(client)) continue;
       try { client.send(payload); } catch { /* ignore closed sockets */ }
     }
   },
@@ -869,8 +917,17 @@ function nextSeq(userId: string): number {
   return next;
 }
 
-/** Returns false on a send failure (broken pipe) so callers can decide whether to stop/retry. */
+/**
+ * Returns false on a send failure (broken pipe) OR when the socket is
+ * currently backpressured (REALTIME_FREEZE.md H.4 -- see
+ * WS_BACKPRESSURE_HIGH_WATER_MARK's docstring), so callers can decide
+ * whether to stop/retry exactly as they already do for a broken pipe:
+ * pushToUser() falls back to durable outbox persistence for outbox-tracked
+ * events, and the connection-handler's replay loop stops sending further
+ * events to a socket that's already behind rather than piling on.
+ */
 function sendToSocket(client: AuthenticatedSocket, type: string, data: unknown, extra?: Record<string, unknown>): boolean {
+  if (isBackpressured(client)) return false;
   const msg = JSON.stringify({ type, payload: data, seq: nextSeq(client.userId!), ...extra });
   try { client.send(msg); return true; } catch { return false; }
 }
@@ -968,6 +1025,7 @@ function onBroadcastEvent(eventType: string, payload: Record<string, unknown>): 
     const client = rawClient as AuthenticatedSocket;
     if (client.readyState !== client.OPEN) continue;
     if (liveTradingEnabled && !client.authenticated) continue;
+    if (isBackpressured(client)) continue; // REALTIME_FREEZE.md H.4
     try { client.send(msg); } catch { /* ignore */ }
   }
 }
@@ -1029,6 +1087,7 @@ function broadcast(type: string, data: unknown): void {
   for (const rawClient of wss.clients) {
     const client = rawClient as AuthenticatedSocket;
     if (client.readyState !== client.OPEN) continue;
+    if (isBackpressured(client)) continue; // REALTIME_FREEZE.md H.4
     try { client.send(msg); } catch { /* ignore */ }
   }
   // Notify other nodes to broadcast to their locally-connected clients
