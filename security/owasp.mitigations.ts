@@ -36,6 +36,7 @@
  */
 
 import type { IncomingMessage } from "node:http";
+import { normalizeRole } from "./rbac.engine.js";
 
 // ─── A01: Broken Access Control ───────────────────────────────────────────────
 
@@ -49,8 +50,18 @@ export function assertOwnership(
   resourceOwnerId:  string,
   roles:            string[],
 ): void {
+  // FASE 7 CLOSURE, Phase D: currently unused anywhere (grep-confirmed, dead
+  // code) but had the same role-vocabulary mismatch as rbac.engine.ts's
+  // authorize() -- a hardcoded uppercase-only list checked with no
+  // normalization at all, so it would have matched NONE of the real
+  // lowercase JWT roles ("admin"/"risk"/"compliance"/etc.) the moment this
+  // helper is wired up, failing closed (denying legitimate admin/risk/
+  // compliance cross-user access) exactly like the rbacEngine bug. Fixed to
+  // reuse rbac.engine.ts's normalizeRole as the single source of truth
+  // instead of a second, independently-maintained role list.
+  const normalized = roles.map(normalizeRole) as string[];
   // Admins and risk managers can access all resources
-  if (roles.some((r) => ["SUPER_ADMIN", "ADMIN", "RISK_MANAGER", "COMPLIANCE_OFFICER"].includes(r))) return;
+  if (normalized.some((r) => ["SUPER_ADMIN", "ADMIN", "RISK_MANAGER", "COMPLIANCE_OFFICER"].includes(r))) return;
 
   if (requestingUserId !== resourceOwnerId) {
     throw Object.assign(

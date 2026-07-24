@@ -5719,7 +5719,7 @@ export const routes: Route[] = [
     handler: async ({ state, authHeader }) => {
       const principal = state.resolvePrincipal(authHeader);
       if (!principal) return { ok: false, reason: "unauthenticated" };
-      const perms = rbacEngine.getEffectivePermissions(principal.roles as never);
+      const perms = rbacEngine.getEffectivePermissions(principal.roles);
       return {
         ok:          true,
         userId:      principal.sub,

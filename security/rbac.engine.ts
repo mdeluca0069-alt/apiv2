@@ -217,6 +217,43 @@ function buildEffectivePermissions(): Map<RoleName, Set<Permission>> {
 
 const EFFECTIVE_PERMISSIONS = buildEffectivePermissions();
 
+// FASE 7 CLOSURE, Phase D: the real role vocabulary issued end-to-end (JWT
+// payload via auth-service/auth.service.ts, reconstructed in
+// shared/state.ts's resolvePrincipal against its own validRoles allowlist:
+// "trader"/"admin"/"super_admin"/"risk"/"compliance") is short-form and
+// lowercase. `.toUpperCase()` alone (below) correctly resolves 3 of the 5 --
+// "trader"->"TRADER", "admin"->"ADMIN", "super_admin"->"SUPER_ADMIN" -- but
+// "risk" and "compliance" uppercase to "RISK"/"COMPLIANCE", neither a valid
+// RoleName (this engine uses "RISK_MANAGER"/"COMPLIANCE_OFFICER"). Confirmed
+// via code read this is the ONLY enforcement layer for the ~30 registered
+// routes in permission.middleware.ts's ROUTE_PERMISSIONS (access.policy.ts's
+// parallel permission list is populated into the JWT but never actually
+// consulted anywhere -- see its own docstring). Confirmed NOT a privilege-
+// escalation or bypass vector: EFFECTIVE_PERMISSIONS.get("RISK"/"COMPLIANCE")
+// returns undefined, contributing zero permissions, so the failure mode is
+// fail-CLOSED (a risk- or compliance-only staff account, i.e. one without
+// also "admin", is incorrectly denied routes their real role should permit)
+// -- a real, live, non-exploitable correctness/availability bug, not a
+// security hole. Fixed at the single normalization point rather than
+// touching JWT issuance or seed data.
+const ROLE_ALIASES: Record<string, RoleName> = {
+  RISK:       "RISK_MANAGER",
+  COMPLIANCE: "COMPLIANCE_OFFICER",
+};
+
+/**
+ * Normalizes a raw role string (whatever case/short-form a JWT/caller
+ * happens to carry) to a canonical RoleName. Single source of truth for
+ * this mapping -- every entry point that accepts caller-supplied roles
+ * (not already-canonical values like `rbacEngine.allRoles`) must go
+ * through this, not just `authorize()`. See the FASE 7 CLOSURE comment
+ * above `ROLE_ALIASES` for why this exists.
+ */
+export function normalizeRole(role: string): RoleName {
+  const upper = role.toUpperCase();
+  return (ROLE_ALIASES[upper] ?? upper) as RoleName;
+}
+
 // ─── RBACEngine ───────────────────────────────────────────────────────────────
 
 export class RBACEngine {
@@ -227,8 +264,7 @@ export class RBACEngine {
    */
   authorize(ctx: AuthorizationContext): AuthorizationResult {
     const { userId, resource, action, resourceOwnerId } = ctx;
-    // Normalize roles to uppercase — JWT tokens may carry lowercase role names
-    const roles = ctx.roles.map((r) => (r as string).toUpperCase() as RoleName);
+    const roles = ctx.roles.map((r) => normalizeRole(r as string));
 
     // SYSTEM role has universal access (used by internal services)
     if (roles.includes("SYSTEM") || roles.includes("SUPER_ADMIN")) {
@@ -308,14 +344,23 @@ export class RBACEngine {
   /**
    * Returns all effective permissions for a set of roles (for JWT payload population
    * and client-side access control hints).
+   *
+   * FASE 7 CLOSURE, Phase D: accepts `string[]`, not `RoleName[]` -- its real
+   * caller (GET /api/v1/security/status) passes `principal.roles` straight
+   * through (previously via an unsafe `as never` cast masking the type
+   * mismatch), which are the raw lowercase/short-form values, not
+   * already-canonical RoleName. Normalizes the same way authorize() does.
+   * `rbacEngine.allRoles`-driven callers (already-canonical values) are
+   * unaffected -- normalizing an already-correct RoleName is a no-op.
    */
-  getEffectivePermissions(roles: RoleName[]): Permission[] {
-    if (roles.includes("SUPER_ADMIN") || roles.includes("SYSTEM")) {
+  getEffectivePermissions(roles: readonly string[]): Permission[] {
+    const normalized = roles.map(normalizeRole);
+    if (normalized.includes("SUPER_ADMIN") || normalized.includes("SYSTEM")) {
       return Object.values(ROLE_PERMISSIONS).flat() as Permission[];
     }
 
     const perms = new Set<Permission>();
-    for (const role of roles) {
+    for (const role of normalized) {
       const rolePerms = EFFECTIVE_PERMISSIONS.get(role);
       if (rolePerms) {
         for (const p of rolePerms) perms.add(p);
