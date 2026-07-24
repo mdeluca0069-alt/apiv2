@@ -390,6 +390,10 @@ interface AuthenticatedSocket extends WebSocket {
   // see shared/security.ts). Lets pushToStaff() target admin/compliance/risk
   // operators without a second auth round-trip.
   roles?: string[];
+  // REALTIME_FREEZE.md H.3: true from connection-open until the outbox
+  // replay for this socket finishes. While true, pushToUser() defers
+  // instead of sending immediately -- see pushToUser's docstring for why.
+  replaying?: boolean;
 }
 
 // ─── HTTP + WebSocket server ──────────────────────────────────────────────────
@@ -507,18 +511,26 @@ wss.on("connection", (rawSocket: WebSocket, req: IncomingMessage) => {
   }));
 
   // P6 — Replay any undelivered outbox events for this user.
+  // REALTIME_FREEZE.md H.3: `replaying` gates pushToUser() for this socket
+  // for the whole window below (including the initial DB round-trip) --
+  // see pushToUser's docstring. try/finally guarantees it's cleared even if
+  // the replay loop breaks early on a send error, so a socket that fails
+  // mid-replay doesn't stay permanently un-pushable.
   if (socket.userId) {
+    socket.replaying = true;
     void (async () => {
-      const pending = await outboxService.getPendingForUser(socket.userId!);
-      for (const evt of pending) {
-        if (socket.readyState !== socket.OPEN) break;
-        try {
-          socket.send(JSON.stringify({ type: evt.eventType, payload: evt.payload, replayed: true }));
+      try {
+        const pending = await outboxService.getPendingForUser(socket.userId!);
+        for (const evt of pending) {
+          if (socket.readyState !== socket.OPEN) break;
+          if (!sendToSocket(socket, evt.eventType, evt.payload, { replayed: true })) break;
           void outboxService.markPublished(evt.id);
-        } catch { break; }
-      }
-      if (pending.length) {
-        console.log(`[outbox] replayed ${pending.length} event(s) for user ${socket.userId}`);
+        }
+        if (pending.length) {
+          console.log(`[outbox] replayed ${pending.length} event(s) for user ${socket.userId}`);
+        }
+      } finally {
+        socket.replaying = false;
       }
     })();
   }
@@ -835,15 +847,65 @@ setInterval(async () => {
 
 // ─── Per-user event dispatch ──────────────────────────────────────────────────
 
+// REALTIME_FREEZE.md H.3: monotonic per-(node, user) counter attached to
+// every per-user WS message as `seq`, so a client can detect a gap or
+// out-of-order delivery on its current connection. Deliberately NOT a
+// Redis-backed cross-node counter -- pushToUser/sendToSocket are called from
+// hot synchronous paths (e.g. position.pnl_updated on every tick); awaiting
+// a Redis round-trip there would (a) hurt latency on the highest-frequency
+// push path and (b) risk two concurrent callers resolving their INCR out of
+// send order, which is a WORSE ordering bug than the one this fix removes.
+// Consequence: `seq` gives a real, gap-detectable total order for messages
+// delivered to a single connection (which is always exactly one node), but
+// does NOT provide a global cross-node order -- two nodes racing to deliver
+// to the same user's two open tabs via Redis pub/sub can still interleave
+// (per-tab order is still correct; cross-tab is not). A true distributed
+// sequencer is a larger, separate piece of work, flagged in
+// REALTIME_CERTIFICATION_REPORT.md.
+const wsSeqCounters = new Map<string, number>();
+function nextSeq(userId: string): number {
+  const next = (wsSeqCounters.get(userId) ?? 0) + 1;
+  wsSeqCounters.set(userId, next);
+  return next;
+}
+
+/** Returns false on a send failure (broken pipe) so callers can decide whether to stop/retry. */
+function sendToSocket(client: AuthenticatedSocket, type: string, data: unknown, extra?: Record<string, unknown>): boolean {
+  const msg = JSON.stringify({ type, payload: data, seq: nextSeq(client.userId!), ...extra });
+  try { client.send(msg); return true; } catch { return false; }
+}
+
+// REALTIME_FREEZE.md H.3: fixes the outbox-replay-vs-live race described in
+// the finding -- on reconnect, the connection handler below replays pending
+// outbox rows via an un-awaited async IIFE; a synchronous eventBus handler
+// (e.g. position.pnl_updated) could previously deliver a LIVE event on the
+// SAME socket before the (older) replay finished, so the client could see
+// new-then-old with no way to detect it. While `client.replaying` is true
+// (set for the whole replay window, see the connection handler), this
+// treats the socket as not-yet-reachable rather than buffering the message
+// in-process: `enqueueAndPush`'s existing "not delivered" branch then
+// persists it to the outbox (or reuses `existingOutboxId` for financial
+// events that already have one) and relays via Redis, so it's picked up by
+// the very same replay this connection is already running, or -- if the
+// row was created after this replay's query already ran -- by the
+// pre-existing "outbox-retry-sweep" job (30s interval) or the next
+// reconnect. Deliberately NOT an in-process buffer-then-flush: that would
+// mean `enqueueAndPush` marks a financial event's outbox row published (via
+// `existingOutboxId`) before it was actually sent, which is a real,
+// permanent-loss risk if the socket drops in the gap between buffering and
+// flush -- worse than the ordering bug this fix removes. Non-durable
+// pushes with no outbox row at all (e.g. position.pnl_updated) are simply
+// dropped for this narrow window, consistent with their already-documented
+// fire-and-forget, no-durability-guarantee nature (see M.7).
 /** Returns true if at least one socket for the user received the message. */
 function pushToUser(userId: string, type: string, data: unknown): boolean {
-  const msg = JSON.stringify({ type, payload: data });
   let delivered = false;
   for (const rawClient of wss.clients) {
     const client = rawClient as AuthenticatedSocket;
     if (client.readyState !== client.OPEN) continue;
     if (client.userId !== userId) continue;
-    try { client.send(msg); delivered = true; } catch { /* ignore broken pipe */ }
+    if (client.replaying) continue;
+    if (sendToSocket(client, type, data)) delivered = true;
   }
   return delivered;
 }
@@ -875,13 +937,12 @@ function pushToUser(userId: string, type: string, data: unknown): boolean {
 // RBAC case-sensitivity bug is real but outside REALTIME_FREEZE.md's scope;
 // flagged separately in REALTIME_CERTIFICATION_REPORT.md.
 function pushToStaff(type: string, data: unknown, allowedRoles: readonly string[]): void {
-  const msg = JSON.stringify({ type, payload: data });
   for (const rawClient of wss.clients) {
     const client = rawClient as AuthenticatedSocket;
     if (client.readyState !== client.OPEN) continue;
     if (!client.authenticated || !client.roles) continue;
     if (!client.roles.some((r) => allowedRoles.includes(r))) continue;
-    try { client.send(msg); } catch { /* ignore broken pipe */ }
+    sendToSocket(client, type, data);
   }
 }
 
