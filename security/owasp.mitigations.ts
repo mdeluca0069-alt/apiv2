@@ -161,7 +161,7 @@ export function validateId(id: string): boolean {
  */
 export function isAllowedOrigin(origin: string | undefined): boolean {
   if (!origin) return false;
-  const allowed = (process.env.CORS_ORIGIN ?? "https://app.igfxpro.com")
+  const allowed = (process.env.CORS_ORIGIN ?? "https://www.igfxpro.com")
     .split(",")
     .map((o) => o.trim());
   return allowed.includes(origin);

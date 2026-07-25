@@ -38,7 +38,7 @@ dotenvConfig({ path: new URL("../.env", import.meta.url).pathname });
     required.push({
       key: "CORS_ORIGIN",
       present: Boolean(process.env.CORS_ORIGIN),
-      hint: "https://app.igfxpro.com — must not default to a localhost dev URL in production",
+      hint: "https://www.igfxpro.com — must not default to a localhost dev URL in production",
     });
   }
 
