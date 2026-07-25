@@ -71,6 +71,8 @@ import { RateLimiter }          from "./gateway/rate-limiter.js";
 import { quoteCache }               from "./market-data/quote.cache.js";
 import { fetchLiveQuotes }          from "./market-data/feeds/twelvedata.rest.js";
 import { FeedManager }              from "./market-data/feed.manager.js";
+import { virtualOrderbook }         from "./liquidity-engine/virtual.orderbook.js";
+import { assetClassOf }             from "./liquidity-engine/liquidity.provider.js";
 
 // ─── P5 / Internal Liquidity Core ────────────────────────────────────────────
 // InternalLiquidityCore is the SINGLE canonical price source.
@@ -638,6 +640,60 @@ const liquidityCore = new InternalLiquidityCore({
 });
 
 liquidityCore.start();
+
+// REALTIME_FREEZE.md M.9 (FASE 7 CLOSURE, Phase A): DOMDepthPage.tsx's
+// "order book depth" was poll-only (10s) with no WS alternative -- reads as
+// if it'd need new order-book-depth production from the liquidity engine to
+// fix, which would be a genuine feature build. It doesn't: GET /dom/:symbol
+// already synthesizes the whole book on every call via
+// virtualOrderbook.build() (liquidity-engine/virtual.orderbook.ts), a pure,
+// cheap (10 levels, O(1) arithmetic, no I/O) function of the SAME
+// bid/ask/mid/spread/changePct that market.quotes already broadcasts live
+// every ~1s -- there's no new state to produce, only an existing
+// computation to also push instead of only serving on request. Matches the
+// frontend's own 10s cadence (DOM_DEPTH_REFRESH_MS) rather than the 1s
+// quote tick -- ladder structure genuinely is slower-moving than top-of-
+// book, per DOMDepthPage.tsx's own existing comment; broadcasting all books
+// every 1s would be pure waste. Broadcasts for the same SYMBOLS list
+// market.quotes already covers (not a frontend-specific DOM_SYMBOLS subset)
+// to avoid a second, independently-maintained symbol list drifting out of
+// sync with the one the UI actually offers.
+const DOM_BOOK_BROADCAST_MS = 10_000;
+setInterval(() => {
+  if (wss.clients.size === 0) return;
+  // Same enriched shape GET /dom/:symbol already returns (gateway/routes.ts)
+  // -- changePct/generatedAt aren't part of virtualOrderbook.build()'s own
+  // return type, added here the same way the REST handler adds them, so the
+  // frontend's DomBook shape (and its existing REST-populated cache entry)
+  // is a drop-in match either way.
+  const books: Record<string, unknown> = {};
+  for (const symbol of SYMBOLS) {
+    const quote = quoteCache.get(symbol);
+    if (!quote) continue;
+    const book = virtualOrderbook.build({
+      symbol,
+      bid:        quote.bid,
+      ask:        quote.ask,
+      mid:        quote.mid,
+      spread:     quote.spread,
+      changePct:  quote.changePct,
+      assetClass: assetClassOf(symbol),
+    });
+    books[symbol] = {
+      symbol:      book.symbol,
+      provider:    book.provider,
+      bid:         book.bid,
+      ask:         book.ask,
+      spread:      book.spread,
+      spreadBps:   book.spreadBps,
+      changePct:   quote.changePct,
+      bids:        book.bids,
+      asks:        book.asks,
+      generatedAt: new Date().toISOString(),
+    };
+  }
+  if (Object.keys(books).length > 0) broadcast("dom.book", books);
+}, DOM_BOOK_BROADCAST_MS);
 
 // ─── TwelveData: live price seed then historical candle seed ─────────────────
 //
