@@ -325,11 +325,23 @@ export class SignalTelemetryService {
     // -- exitReason was permanently stuck at "MANUAL" for every closed
     // position regardless of the real reason (SL/TP/stop-out/admin).
     // settlement.engine.ts now carries `reason` directly on position.closed.
+    //
+    // FASE 7 CLOSURE, Phase C: this used to pre-map `ev.reason` through a
+    // second, local `_mapReason()` before calling updateOutcome(), which
+    // ALSO maps `data.exitReason` via its own `exitReasonMap` (below).
+    // Passing an already-mapped value ("SL_HIT") back through a lookup
+    // table keyed by the raw enum ("STOP_LOSS") missed on every entry and
+    // silently fell through to `?? data.exitReason` -- happened to be a
+    // no-op for all 6 values today only because the map is a fixed point
+    // of itself, not because the double call was intentional. Now passes
+    // the raw `ev.reason` straight through (matches its declared type,
+    // PositionClosedEvent's own literal union) and lets updateOutcome()'s
+    // single exitReasonMap be the ONLY place this translation happens.
     eventBus.on("position.closed", async (ev) => {
       await this.updateOutcome(ev.positionId, {
         pnl:        ev.pnl,
         exitPrice:  ev.exitPrice,
-        exitReason: _mapReason(ev.reason),
+        exitReason: ev.reason,
         closedAt:   new Date(ev.timestamp),
         entryPrice: ev.entryPrice,
         side:       ev.side,
@@ -337,18 +349,6 @@ export class SignalTelemetryService {
       });
     });
   }
-}
-
-function _mapReason(reason: string): string {
-  const map: Record<string, string> = {
-    MANUAL:      "MANUAL",
-    STOP_LOSS:   "SL_HIT",
-    TAKE_PROFIT: "TP_HIT",
-    STOP_OUT:    "STOP_OUT",
-    LIQUIDATION: "STOP_OUT",
-    ADMIN:       "MANUAL",
-  };
-  return map[reason] ?? reason;
 }
 
 export const signalTelemetry = new SignalTelemetryService();
