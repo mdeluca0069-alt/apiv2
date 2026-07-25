@@ -8,6 +8,7 @@ import type { RetentionPolicyName } from "./retention.policy.js";
 import type { ScanCallbackPayload } from "./virus-scan.hook.js";
 import { loadStorageConfig, isStorageConfigured } from "./storage.config.js";
 import { eventBus }                 from "../events-bus/event.bus.js";
+import { immutableAudit }           from "../security/immutable.audit.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -343,6 +344,18 @@ export class DocumentStorageService {
 
       eventBus.emit("document.scan_infected", {
         documentId, userId: doc.userId, threats, scannedAt,
+      });
+
+      // FASE 7 CLOSURE, Phase A (L.3, re-evaluated): a malware-positive scan
+      // is genuinely security-relevant -- unlike the archive-only fix for
+      // the rest of this finding, this specific event deserves the
+      // tamper-evident hash chain, not just the append-only archive.
+      await immutableAudit.write({
+        actor:   "VIRUS_SCAN",
+        action:  "document.scan_infected",
+        entity:  documentId,
+        payload: { userId: doc.userId, threats, scannedAt } as object,
+        severity: "CRITICAL",
       });
 
       console.warn(`[document-storage] INFECTED file detected — deleted: ${documentId} threats:`, threats);

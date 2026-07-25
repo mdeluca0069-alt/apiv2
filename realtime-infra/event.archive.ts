@@ -71,6 +71,26 @@ const ARCHIVED_EVENTS: Array<keyof import("../events-bus/event.bus.js").BrokerEv
   // this one archive subscription now covers what used to require three.
   "margin.warning",
   "swap.accrued",
+  // FASE 7 CLOSURE, Phase A (L.3, re-evaluated): these 8 were emitted with
+  // zero consumer anywhere -- unlike a dead-both-ends event (L.2), the
+  // emit sites are real and fire in production, so nothing was actually
+  // broken, but nothing durably recorded these specific moments either
+  // (kyc.service.ts/crm/affiliate.service.ts have immutableAudit.write()
+  // calls for OTHER actions -- approval/rejection/commission-crediting --
+  // not necessarily these exact ones; document.storage.service.ts has none
+  // at all). Building live WS/UI consumers for these would be speculative
+  // feature work outside this fix's scope; archiving them (the same
+  // "produced but not durably recorded" gap this table already exists to
+  // close for every other category) is not -- it's the minimum viable fix
+  // that actually closes the gap rather than just documenting it.
+  "kyc.document_uploaded",
+  "kyc.docs_requested",
+  "document.scan_clean",
+  "document.scan_infected",
+  "document.deleted",
+  "affiliate.status_changed",
+  "affiliate.referral_recorded",
+  "affiliate.commission_accrued",
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
