@@ -93,8 +93,16 @@ const ROUTE_PERMISSIONS: Array<[string, RegExp, RoutePermission]> = [
 const PUBLIC_PATHS = [
   /^\/health/,
   /^\/metrics/,
-  /^\/api\/v1\/auth\/login/,   // covers /login, /login/db, future sub-paths
-  /^\/api\/v1\/auth\/register$/,
+  /^\/api\/v1\/auth\/login/,      // covers /login, /login/db, future sub-paths
+  // PRODUCTION CUTOVER Stage 2: found via live validation that this was
+  // anchored with `$`, matching ONLY the bare /register path -- but
+  // /register/db (gateway/routes.ts) is the actual endpoint used whenever
+  // IS_PERSISTENT is true (i.e. every real, database-backed deployment),
+  // exactly parallel to /login vs /login/db above. A brand new user has no
+  // JWT yet by definition, so this silently made registration entirely
+  // unreachable (403 FORBIDDEN "unauthenticated") in any persistent
+  // deployment -- unanchored the same way /login already correctly is.
+  /^\/api\/v1\/auth\/register/,  // covers /register, /register/db, future sub-paths
   /^\/api\/v1\/auth\/refresh$/,
   /^\/api\/v1\/auth\/forgot-password$/,
   /^\/api\/v1\/auth\/reset-password$/,
