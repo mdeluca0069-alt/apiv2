@@ -11,7 +11,8 @@
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:seed": "tsx prisma/seed.ts"
+    "prisma:seed": "tsx prisma/seed.ts",
+    "migrate:v1": "tsx migration/cli.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",
@@ -23,6 +24,7 @@
     "dotenv": "^17.4.2",
     "ioredis": "^5.4.2",
     "nodemailer": "^9.0.1",
+    "pg": "^8.13.1",
     "pino": "^10.3.1",
     "ws": "^8.18.0",
     "zod": "^3.24.1"
@@ -31,6 +33,7 @@
     "@types/bcryptjs": "^2.4.6",
     "@types/node": "^22.10.2",
     "@types/nodemailer": "^6.4.23",
+    "@types/pg": "^8.11.10",
     "@types/ws": "^8.5.13",
     "@vitest/coverage-v8": "^2.1.8",
     "pino-pretty": "^13.1.3",
