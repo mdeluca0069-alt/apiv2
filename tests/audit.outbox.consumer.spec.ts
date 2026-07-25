@@ -22,14 +22,17 @@ const { mockDb, mockTx } = vi.hoisted(() => {
       upsert:     vi.fn().mockResolvedValue({}),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
-    // findFirst backs immutableAudit.write()'s chain-head lookup;
-    // $executeRaw backs its advisory-lock acquisition (pg_advisory_xact_lock
-    // returns void, which $queryRaw cannot deserialize) -- audit.outbox.
-    // consumer.ts now routes its AuditLog write through immutableAudit.
-    // write(..., tx), passing this same mock transaction client.
-    auditLog:    { create: vi.fn().mockResolvedValue({}), findFirst: vi.fn().mockResolvedValue(null) },
+    // $queryRaw backs immutableAudit.write()'s chain-head lookup (FASE 7
+    // CLOSURE, Phase C: ordered by the _written_at JSON path, which
+    // Prisma's typed orderBy can't express); $executeRaw backs its
+    // advisory-lock acquisition (pg_advisory_xact_lock returns void,
+    // which $queryRaw cannot deserialize) -- audit.outbox.consumer.ts now
+    // routes its AuditLog write through immutableAudit.write(..., tx),
+    // passing this same mock transaction client.
+    auditLog:    { create: vi.fn().mockResolvedValue({}) },
     outboxEvent: { update: vi.fn().mockResolvedValue({}) },
     $executeRaw: vi.fn().mockResolvedValue(0),
+    $queryRaw:   vi.fn().mockResolvedValue([]),
   };
   const mockDb = {
     outboxEvent: {
@@ -104,7 +107,7 @@ beforeEach(() => {
   mockTx.tradeAudit.upsert.mockResolvedValue({});
   mockTx.tradeAudit.updateMany.mockResolvedValue({ count: 0 });
   mockTx.auditLog.create.mockResolvedValue({});
-  mockTx.auditLog.findFirst.mockResolvedValue(null);
+  mockTx.$queryRaw.mockResolvedValue([]);
   mockTx.$executeRaw.mockResolvedValue(0);
   mockTx.outboxEvent.update.mockResolvedValue({});
 });

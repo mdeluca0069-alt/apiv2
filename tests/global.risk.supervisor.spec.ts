@@ -43,11 +43,12 @@ const {
   const mockAlertSend    = vi.fn().mockResolvedValue(undefined);
   const mockPrisma: Record<string, unknown> = {
     brokerSetting: { findUnique: mockBSFindUnique, upsert: mockBSUpsert },
-    auditLog:      { create: mockAuditCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog:      { create: mockAuditCreate },
     position:      { findMany: mockPosFindMany, aggregate: mockPosAggregate },
     walletAccount: { aggregate: mockWalletAggregate },
     order:         { findMany: mockOrderFindMany },
     $executeRaw:   vi.fn().mockResolvedValue(0),
+    $queryRaw:     vi.fn().mockResolvedValue([]),
   };
   mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
   return {

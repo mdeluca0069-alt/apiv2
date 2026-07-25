@@ -19,13 +19,17 @@ const { mockAuditLogCreate, mockPrisma } = vi.hoisted(() => {
   // REALTIME_FREEZE.md Critical #2: alert.manager.ts now routes through
   // immutableAudit.write() (real module, not mocked) instead of calling
   // prisma.auditLog.create() directly -- it needs $transaction/$executeRaw/
-  // auditLog.findFirst on this mock to satisfy write()'s chain-head lock
-  // and lookup, in addition to the create() call these tests assert on.
-  // $executeRaw (not $queryRaw): pg_advisory_xact_lock() returns SQL type
-  // `void`, which $queryRaw cannot deserialize.
+  // $queryRaw on this mock to satisfy write()'s chain-head lock and
+  // lookup, in addition to the create() call these tests assert on.
+  // $executeRaw (not $queryRaw) backs the advisory lock itself
+  // (pg_advisory_xact_lock() returns SQL type `void`, which $queryRaw
+  // cannot deserialize). FASE 7 CLOSURE, Phase C: _getChainHead() now
+  // reads via $queryRaw (ordered by the _written_at JSON path, which
+  // Prisma's typed orderBy can't express) instead of auditLog.findFirst.
   const mockPrisma: Record<string, unknown> = {
-    auditLog: { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog: { create: mockAuditLogCreate },
     $executeRaw: vi.fn().mockResolvedValue(0),
+    $queryRaw: vi.fn().mockResolvedValue([]),
   };
   mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
   return { mockAuditLogCreate, mockPrisma };

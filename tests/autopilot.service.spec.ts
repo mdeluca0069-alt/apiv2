@@ -24,8 +24,9 @@ const {
   const mockGetConsentStatus = vi.fn();
   const mockPrisma: Record<string, unknown> = {
     autopilotConfig: { findUnique: mockFindUnique, upsert: mockUpsert, update: mockUpdate },
-    auditLog: { create: mockAuditCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog: { create: mockAuditCreate },
     $executeRaw: vi.fn().mockResolvedValue(0),
+    $queryRaw: vi.fn().mockResolvedValue([]),
   };
   mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
   return {

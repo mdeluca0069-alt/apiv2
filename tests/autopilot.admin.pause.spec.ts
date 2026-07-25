@@ -21,8 +21,9 @@ const { mockUpsert, mockAuditCreate, mockPrisma } = vi.hoisted(() => {
   const mockAuditCreate = vi.fn().mockResolvedValue({});
   const mockPrisma: Record<string, unknown> = {
     autopilotConfig: { upsert: mockUpsert },
-    auditLog: { create: mockAuditCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog: { create: mockAuditCreate },
     $executeRaw: vi.fn().mockResolvedValue(0),
+    $queryRaw: vi.fn().mockResolvedValue([]),
   };
   mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
   return { mockUpsert, mockAuditCreate, mockPrisma };

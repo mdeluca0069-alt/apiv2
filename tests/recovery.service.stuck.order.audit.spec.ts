@@ -56,15 +56,17 @@ vi.mock("../shared/db.js", () => {
   // now calls immutableAudit.write() with no tx -- which internally opens
   // its OWN prisma.$transaction(). Since this test's mockTransaction is a
   // single shared mock also used for recovery.service.ts's own internal
-  // margin-release transaction, `tx` needs $executeRaw/auditLog too so
-  // either transaction's callback can run against it. $executeRaw (not
-  // $queryRaw): pg_advisory_xact_lock() returns void, which $queryRaw
-  // cannot deserialize.
+  // margin-release transaction, `tx` needs $executeRaw/$queryRaw/auditLog
+  // too so either transaction's callback can run against it. $executeRaw
+  // (not $queryRaw) backs the advisory lock itself (pg_advisory_xact_lock
+  // returns void, which $queryRaw cannot deserialize); $queryRaw backs
+  // _getChainHead()'s chain-head lookup.
   const tx = {
     walletAccount: { findUnique: mockWalletFindUnique, update: mockWalletUpdate },
     ledgerEntry:   { create: mockLedgerCreate },
-    auditLog:      { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog:      { create: mockAuditLogCreate },
     $executeRaw:   vi.fn().mockResolvedValue(0),
+    $queryRaw:     vi.fn().mockResolvedValue([]),
   };
   return {
     IS_PERSISTENT: true,
@@ -72,8 +74,9 @@ vi.mock("../shared/db.js", () => {
       position:      { findMany: mockPositionFindMany, findFirst: mockPositionFindFirst, aggregate: vi.fn().mockResolvedValue({ _sum: { marginUsed: null } }), update: vi.fn() },
       walletAccount: { findMany: mockWalletFindMany },
       order:         { findMany: mockOrderFindMany, update: mockOrderUpdate },
-      auditLog:      { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+      auditLog:      { create: mockAuditLogCreate },
       $executeRaw:   vi.fn().mockResolvedValue(0),
+      $queryRaw:     vi.fn().mockResolvedValue([]),
       $transaction:  mockTransaction,
       __tx: tx,
     },

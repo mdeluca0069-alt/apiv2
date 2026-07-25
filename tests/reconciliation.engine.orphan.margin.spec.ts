@@ -40,19 +40,20 @@ const { mockWalletUpdate, mockLedgerCreate, mockAuditLogCreate, mockAggregate, m
 
 vi.mock("../shared/db.js", () => {
   const tx = {
+    // reconciliation.engine.ts's own lock query AND immutableAudit.write()'s
+    // _getChainHead() lookup both go through $queryRaw now -- routed by
+    // setLockedAmount()'s SQL-text-aware mockImplementation below.
     $queryRaw:            mockQueryRaw,
-    // reconciliation.engine.ts's own lock query uses $queryRaw (returns
-    // rows). REALTIME_FREEZE.md Critical #2's immutableAudit.write() uses
-    // $executeRaw for its advisory lock (pg_advisory_xact_lock returns
-    // void, which $queryRaw cannot deserialize) -- a distinct mock.
+    // $executeRaw backs immutableAudit.write()'s advisory lock
+    // (pg_advisory_xact_lock returns void, which $queryRaw cannot
+    // deserialize) -- a distinct mock.
     $executeRaw:          vi.fn().mockResolvedValue(0),
     walletAccount:        { update: mockWalletUpdate },
     position:             { aggregate: mockAggregate },
     ledgerEntry:           { create: mockLedgerCreate },
-    // findFirst backs immutableAudit.write()'s chain-head lookup --
     // reconciliation.engine.ts now routes its AuditLog write through
     // immutableAudit.write(..., tx).
-    auditLog:              { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog:              { create: mockAuditLogCreate },
   };
   return {
     IS_PERSISTENT: true,
@@ -66,6 +67,18 @@ const emitSpy = vi.spyOn(eventBus, "emit");
 const { reconciliationEngine } = await import("../settlement/reconciliation.engine.js");
 const { prisma } = await import("../shared/db.js");
 
+// FASE 7 CLOSURE, Phase C: mockQueryRaw is shared between two DISTINCT raw
+// queries -- reconciliation.engine.ts's own lock query (returns `{ locked }`
+// rows) and immutableAudit.write()'s _getChainHead() lookup (returns
+// `{ payload }` rows). A blanket mockResolvedValue would make
+// _getChainHead() receive `{ locked }` rows and crash reading `.payload`
+// off them. Routes by inspecting the tagged template's SQL text.
+function setLockedAmount(locked: string): void {
+  mockQueryRaw.mockImplementation((strings: TemplateStringsArray) =>
+    strings.join("").includes("AuditLog") ? Promise.resolve([]) : Promise.resolve([{ locked }]),
+  );
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   const tx = (prisma as unknown as { __tx: unknown }).__tx;
@@ -74,7 +87,7 @@ beforeEach(() => {
 
 describe("ReconciliationEngine.repairOrphanMargin — Bug #2 fix", () => {
   it("writes an AuditLog row inside the same transaction as the Ledger/Wallet mutation", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "150.00" }]);
+    setLockedAmount("150.00");
     mockAggregate.mockResolvedValue({ _sum: { marginUsed: new Decimal(100) } }); // orphan = 50
 
     const released = await reconciliationEngine.repairOrphanMargin("user-1");
@@ -93,7 +106,7 @@ describe("ReconciliationEngine.repairOrphanMargin — Bug #2 fix", () => {
   });
 
   it("emits a wallet.event (durable event archive) and notifies the user after a successful repair", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "150.00" }]);
+    setLockedAmount("150.00");
     mockAggregate.mockResolvedValue({ _sum: { marginUsed: new Decimal(100) } }); // orphan = 50
 
     await reconciliationEngine.repairOrphanMargin("user-1");
@@ -107,7 +120,7 @@ describe("ReconciliationEngine.repairOrphanMargin — Bug #2 fix", () => {
   });
 
   it("increments the existing repair metric (unchanged behavior)", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "150.00" }]);
+    setLockedAmount("150.00");
     mockAggregate.mockResolvedValue({ _sum: { marginUsed: new Decimal(100) } });
 
     await reconciliationEngine.repairOrphanMargin("user-1");
@@ -116,7 +129,7 @@ describe("ReconciliationEngine.repairOrphanMargin — Bug #2 fix", () => {
   });
 
   it("does nothing (no Audit/Notification/EventBus/Metrics) when there is no orphan margin to repair", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "100.00" }]);
+    setLockedAmount("100.00");
     mockAggregate.mockResolvedValue({ _sum: { marginUsed: new Decimal(100) } }); // orphan = 0
 
     const released = await reconciliationEngine.repairOrphanMargin("user-1");
@@ -131,7 +144,7 @@ describe("ReconciliationEngine.repairOrphanMargin — Bug #2 fix", () => {
   });
 
   it("does nothing when the wallet is a genuine deficit (negative orphan) -- never auto-repairs a deficit", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "50.00" }]);
+    setLockedAmount("50.00");
     mockAggregate.mockResolvedValue({ _sum: { marginUsed: new Decimal(100) } }); // orphan = -50
 
     const released = await reconciliationEngine.repairOrphanMargin("user-1");

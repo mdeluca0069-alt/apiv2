@@ -61,13 +61,14 @@ vi.mock("../shared/db.js", () => {
     swapAccrual:   { findFirst: mockSwapAccrualFindFirst, create: mockSwapAccrualCreate },
     ledgerEntry:   { create: mockLedgerCreate },
     walletAccount: { update: mockWalletUpdate },
-    // findFirst backs immutableAudit.write()'s chain-head lookup;
+    // $queryRaw backs immutableAudit.write()'s chain-head lookup;
     // $executeRaw backs its advisory-lock acquisition (pg_advisory_xact_lock
     // returns void, which $queryRaw cannot deserialize) -- swap.accrual.
     // service.ts now routes its AuditLog write through immutableAudit.
     // write(..., tx), passing this same mock transaction client.
-    auditLog:      { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog:      { create: mockAuditLogCreate },
     $executeRaw:   vi.fn().mockResolvedValue(0),
+    $queryRaw:     vi.fn().mockResolvedValue([]),
   };
   return {
     IS_PERSISTENT: true,

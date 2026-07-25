@@ -27,7 +27,8 @@
 
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
-import type { PrismaClient, Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import type { PrismaClient } from "@prisma/client";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 
 /** Same composability contract as wallet-service/ledger.engine.ts's `Db`. */
@@ -48,6 +49,64 @@ const GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000
 // low-frequency admin/compliance ones, where the race was improbable but
 // not impossible.
 const AUDIT_CHAIN_LOCK_KEY = 728_401_996_215n;
+
+// FASE 7 CLOSURE, Phase C: single source of truth for which payload keys
+// write() adds AFTER computing the hash (never part of what was actually
+// hashed). Discovered via a live-DB verifyChain() run: verifyChain() was
+// only stripping _chain_hash/_prev_hash before recomputing, but write()'s
+// enrichedPayload also adds _severity/_written_at -- meaning verifyChain()
+// recomputed the hash of a DIFFERENT (2-extra-field) payload than write()
+// ever hashed, and could never match ANY row written by the "fixed" write()
+// method, for the same reason (a hash/recompute mismatch) Critical #2 was
+// originally opened to fix. Centralized here so a future field added to
+// enrichedPayload can't silently reintroduce this exact bug -- there is
+// now exactly one place that needs to change, not two independently
+// maintained field lists.
+const CHAIN_META_KEYS = ["_chain_hash", "_prev_hash", "_severity", "_written_at", "_hash_algo"] as const;
+
+/** Only rows written under this algorithm version are verifiable -- see write()'s _hash_algo docstring. */
+// v2-canonical: canonicalStringify hash (fixes JSON.stringify key-order
+// instability across a jsonb round-trip). v3-lock-ordered-head: additionally
+// fixes _getChainHead() ordering by _written_at (captured under the lock)
+// instead of createdAt (captured before it) -- see _getChainHead's
+// docstring. Bumped again rather than reusing v2's marker so verifyChain()
+// cleanly excludes the narrow window of rows written between the two
+// fixes landing, which live-DB testing during FASE 7 CLOSURE proved could
+// still fork under heavy concurrency.
+const CURRENT_HASH_ALGO = "v3-lock-ordered-head";
+
+/**
+ * FASE 7 CLOSURE, Phase C: a live-DB verifyChain() run surfaced that plain
+ * `JSON.stringify()` (the original _computeHash implementation) is
+ * key-order-sensitive, but Postgres's `jsonb` column type does NOT
+ * guarantee the original insertion order is preserved on read-back --
+ * confirmed empirically (a payload written as
+ * `{...input.payload, _chain_hash, _prev_hash, _severity, _written_at}`
+ * came back from the DB with those keys interleaved in a different order
+ * entirely). That means the hash write() computes at write time and the
+ * hash verifyChain() recomputes from the DB-round-tripped payload could
+ * differ even when the DATA is byte-identical, purely because of key
+ * order -- a structural flaw in using JSON.stringify for a hash meant to
+ * survive a jsonb round-trip, not something a field-stripping fix alone
+ * (CHAIN_META_KEYS above) could ever fully resolve. This produces a
+ * canonical serialization (object keys sorted recursively, arrays
+ * preserved in order since array order IS semantically meaningful and IS
+ * preserved by jsonb) so the hash is reproducible regardless of key
+ * insertion order on either side of a DB round-trip.
+ */
+function canonicalStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalStringify).join(",")}]`;
+  }
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  const entries = keys.map(
+    (k) => `${JSON.stringify(k)}:${canonicalStringify((value as Record<string, unknown>)[k])}`,
+  );
+  return `{${entries.join(",")}}`;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -146,6 +205,14 @@ export class ImmutableAuditLog {
         _prev_hash:   prevHash,
         _severity:    input.severity ?? "INFO",
         _written_at:  new Date().toISOString(),
+        // FASE 7 CLOSURE, Phase C: explicit marker for the canonicalStringify
+        // hash algorithm (see its own docstring for why plain JSON.stringify
+        // was unsound across a jsonb round-trip). The ~3,216 rows written
+        // before this fix hashed with the OLD algorithm and can never verify
+        // under the new one for the same reason -- rather than have
+        // verifyChain() guess where the boundary is, every row explicitly
+        // declares which algorithm produced its hash.
+        _hash_algo:   CURRENT_HASH_ALGO,
       };
 
       await client.auditLog.create({
@@ -173,19 +240,68 @@ export class ImmutableAuditLog {
    * Verify the integrity of the audit chain.
    * Re-computes every hash and compares against stored values.
    * Called by daily integrity check job.
+   *
+   * FASE 7 CLOSURE, Phase C: re-running this against the live DB (164,206
+   * rows) surfaced two real, previously-undetected gaps:
+   *
+   * 1. This table contains ~161K legacy rows written before hash-chaining
+   *    existed at all (no `_chain_hash`/`_prev_hash`), predating even the
+   *    original 3 call sites. The old query (`orderBy: createdAt asc, take:
+   *    limit`) assumed the very first row by createdAt is the cryptographic
+   *    genesis -- false, chaining only ever covers the SUFFIX of the table
+   *    from the first hash-chained write forward -- and with the default
+   *    limit (10,000) would never even reach the actually-chained rows,
+   *    since 10,000 < 161,000.
+   * 2. `JSON.stringify` (the original _computeHash) is key-order-sensitive,
+   *    but Postgres jsonb does not preserve insertion order on read-back --
+   *    _computeHash now uses canonicalStringify (see its docstring), a
+   *    different algorithm whose output differs even for byte-identical
+   *    data. Rows written before that fix are marked with an older/absent
+   *    `_hash_algo` and can never verify under the new algorithm, for the
+   *    same reason old rows can't verify under the chaining fix at all.
+   *
+   * Rather than have verifyChain() guess where either boundary is, every
+   * row now explicitly declares its algorithm version -- only rows on
+   * CURRENT_HASH_ALGO are queried, and the first such row's own claimed
+   * `_prev_hash` is treated as the trusted boundary (unverifiable further
+   * back -- no earlier CURRENT_HASH_ALGO data exists to check it against,
+   * an honest, unavoidable limitation of retrofitting hash-chaining onto a
+   * table with pre-existing history and of migrating the hash algorithm
+   * itself, not a bug) -- every row from there forward is fully verified
+   * against the real, recomputed chain.
+   *
+   * 3. A live post-fix run against real concurrent traffic surfaced a THIRD
+   *    gap, the same defect class as _getChainHead()'s fix above but on the
+   *    read side: this query ordered `entries` by `createdAt` -- captured
+   *    at the top of write(), BEFORE the advisory lock -- while the actual
+   *    chain link order is governed by lock-acquisition order (see
+   *    _getChainHead's docstring). Under concurrency the two orders can
+   *    diverge, so walking rows by `createdAt` can visit them in a
+   *    different sequence than they were actually chained in, producing a
+   *    false "break" against a chain that is really intact. Now orders by
+   *    the same `_written_at` field _getChainHead() uses, via $queryRaw for
+   *    the same reason (Prisma's typed orderBy can't express a JSON path).
    */
   async verifyChain(limit = 10000): Promise<AuditChainVerification> {
     if (!IS_PERSISTENT || !prisma) {
       return { valid: true, totalChecked: 0 };
     }
 
-    const entries = await prisma.auditLog.findMany({
-      orderBy: { createdAt: "asc" },
-      take:    limit,
-      select:  { id: true, actor: true, action: true, entity: true, payload: true, createdAt: true },
-    });
+    const entries = await prisma.$queryRaw<
+      { id: string; actor: string; action: string; entity: string; payload: unknown; createdAt: Date }[]
+    >`
+      SELECT id, actor, action, entity, payload, "createdAt"
+      FROM "AuditLog"
+      WHERE payload->>'_hash_algo' = ${CURRENT_HASH_ALGO}
+      ORDER BY (payload->>'_written_at') ASC NULLS LAST
+      LIMIT ${limit}
+    `;
 
-    let prevHash = GENESIS_HASH;
+    if (entries.length === 0) {
+      return { valid: true, totalChecked: 0 };
+    }
+
+    let prevHash = ((entries[0].payload as Record<string, unknown>)["_prev_hash"] as string) ?? GENESIS_HASH;
     let position = 0;
 
     for (const entry of entries) {
@@ -208,10 +324,10 @@ export class ImmutableAuditLog {
         };
       }
 
-      // Re-compute expected hash
+      // Re-compute expected hash -- strip every key write() adds AFTER
+      // hashing (CHAIN_META_KEYS), not just the two chain-linkage fields.
       const cleanPayload = { ...payload };
-      delete cleanPayload["_chain_hash"];
-      delete cleanPayload["_prev_hash"];
+      for (const key of CHAIN_META_KEYS) delete cleanPayload[key];
 
       const expectedHash = this._computeHash(
         prevHash,
@@ -285,7 +401,7 @@ export class ImmutableAuditLog {
     ts:       string,
     payload:  object,
   ): string {
-    const content = JSON.stringify({ prevHash, id, actor, action, entity, ts, payload });
+    const content = canonicalStringify({ prevHash, id, actor, action, entity, ts, payload });
     return createHash("sha256").update(content).digest("hex");
   }
 
@@ -298,12 +414,42 @@ export class ImmutableAuditLog {
    * outdated head and producing exactly the kind of fork the advisory
    * lock exists to prevent. One extra SELECT per write is the correct
    * trade for a security control -- see the write() docstring.
+   *
+   * FASE 7 CLOSURE, Phase C: a live reproduction (20 concurrent write()
+   * calls) proved this used to fork under real concurrency, even with the
+   * advisory lock correctly held -- `ORDER BY "createdAt" DESC` used
+   * `createdAt`, which is `ts` captured at the very TOP of write(), BEFORE
+   * the advisory lock is even requested. Under concurrency, lock
+   * ACQUISITION order and `ts` CAPTURE order can diverge: writer A can
+   * capture an earlier ts, then acquire the lock (and insert) AFTER writer
+   * B, whose later-captured-but-larger ts makes B's row permanently look
+   * like "the latest" to any createdAt-ordered query -- so every
+   * subsequent writer keeps reading B's hash as head and forking off it,
+   * even after A (and others) have since committed. Now orders by
+   * `_written_at`, captured with `new Date()` INSIDE the locked critical
+   * section (right before the INSERT) -- since the lock guarantees only
+   * one writer's critical section executes at a time, `_written_at`
+   * values across different rows correctly reflect true lock-acquisition
+   * (and thus chain) order. Uses $queryRaw because Prisma's typed
+   * `orderBy` doesn't support ordering by a nested JSON path; ISO8601
+   * timestamps sort correctly with plain text comparison.
+   *
+   * Residual, documented risk: `_written_at`'s millisecond resolution
+   * means two writers whose critical sections both complete within the
+   * same millisecond (possible, though narrow, under very heavy
+   * concurrent load) could still tie -- fully eliminating that would need
+   * a monotonic sequence column (a schema migration against a live,
+   * ~164K-row table), out of scope for this pass. Flagged in
+   * REALTIME_CERTIFICATION_REPORT.md as a residual risk with a concrete
+   * recommended follow-up.
    */
   private async _getChainHead(client: Db): Promise<string> {
-    const latest = await client.auditLog.findFirst({
-      orderBy: { createdAt: "desc" },
-      select:  { payload: true },
-    }).catch(() => null);
+    const rows = await client.$queryRaw<{ payload: unknown }[]>`
+      SELECT payload FROM "AuditLog"
+      ORDER BY (payload->>'_written_at') DESC NULLS LAST
+      LIMIT 1
+    `.catch(() => []);
+    const latest = rows[0] ? { payload: rows[0].payload } : null;
 
     if (!latest) return GENESIS_HASH;
     return ((latest.payload as Record<string, unknown>)["_chain_hash"] as string) ?? GENESIS_HASH;

@@ -30,17 +30,18 @@ const { mockQueryRaw, mockWalletUpdate, mockLedgerCreate, mockAuditLogCreate, mo
 
 vi.mock("../shared/db.js", () => {
   const tx = {
-    // margin.controller.ts's own row-lock SELECT (returns rows -- $queryRaw
-    // is correct here). Separately, REALTIME_FREEZE.md Critical #2's
-    // immutableAudit.write() uses $executeRaw for its advisory lock
+    // margin.controller.ts's own row-lock SELECT AND immutableAudit.write()'s
+    // _getChainHead() lookup both go through $queryRaw now -- routed by
+    // setLockedAmount()'s SQL-text-aware mockImplementation below.
+    // $executeRaw backs immutableAudit.write()'s advisory lock
     // (pg_advisory_xact_lock returns void, which $queryRaw cannot
-    // deserialize) -- two distinct Prisma methods, neither asserted on by
-    // call count/args in these tests.
+    // deserialize) -- a distinct Prisma method, not asserted on by call
+    // count/args in these tests.
     $queryRaw:     mockQueryRaw,
     $executeRaw:   vi.fn().mockResolvedValue(0),
     walletAccount: { update: mockWalletUpdate },
     ledgerEntry:   { create: mockLedgerCreate },
-    auditLog:      { create: mockAuditLogCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog:      { create: mockAuditLogCreate },
   };
   return { IS_PERSISTENT: true, prisma: { $transaction: mockTransaction, __tx: tx } };
 });
@@ -51,6 +52,19 @@ const emitSpy = vi.spyOn(eventBus, "emit");
 const { marginController } = await import("../risk-service/margin.controller.js");
 const { prisma } = await import("../shared/db.js");
 
+// FASE 7 CLOSURE, Phase C: mockQueryRaw is shared between two DISTINCT raw
+// queries now -- margin.controller.ts's own row-lock SELECT (returns
+// `{ locked }` rows) and immutableAudit.write()'s _getChainHead() lookup
+// (returns `{ payload }` rows, ordered by the _written_at JSON path since
+// Prisma's typed orderBy can't express it). A blanket mockResolvedValue
+// would make _getChainHead() receive `{ locked }` rows and crash reading
+// `.payload` off them. Routes by inspecting the tagged template's SQL text.
+function setLockedAmount(locked: string): void {
+  mockQueryRaw.mockImplementation((strings: TemplateStringsArray) =>
+    strings.join("").includes("AuditLog") ? Promise.resolve([]) : Promise.resolve([{ locked }]),
+  );
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   const tx = (prisma as unknown as { __tx: unknown }).__tx;
@@ -59,7 +73,7 @@ beforeEach(() => {
 
 describe("MarginController.releaseMargin() — Bug #7 fix", () => {
   it("writes an AuditLog row inside the same transaction as the Ledger/Wallet mutation", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "500" }]);
+    setLockedAmount("500");
 
     await marginController.releaseMargin("user-1", "position-1", 120);
 
@@ -73,7 +87,7 @@ describe("MarginController.releaseMargin() — Bug #7 fix", () => {
   });
 
   it("emits a wallet.event (durable event archive) and increments the success metric", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "500" }]);
+    setLockedAmount("500");
 
     await marginController.releaseMargin("user-1", "position-1", 120);
 
@@ -84,7 +98,7 @@ describe("MarginController.releaseMargin() — Bug #7 fix", () => {
   });
 
   it("does nothing (no Audit/EventBus/Metrics) when locked is already zero -- a genuine no-op", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "0" }]);
+    setLockedAmount("0");
 
     await marginController.releaseMargin("user-1", "position-1", 120);
 
@@ -96,7 +110,7 @@ describe("MarginController.releaseMargin() — Bug #7 fix", () => {
   });
 
   it("floor-safe partial release still writes an accurate audit/metric for the amount actually released, not requested", async () => {
-    mockQueryRaw.mockResolvedValue([{ locked: "50" }]); // less than the 120 requested
+    setLockedAmount("50"); // less than the 120 requested
 
     await marginController.releaseMargin("user-1", "position-1", 120);
 

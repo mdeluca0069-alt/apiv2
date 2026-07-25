@@ -41,14 +41,15 @@ const { mockDb } = vi.hoisted(() => ({
   mockDb: {
     walletAccount:  { findUnique: vi.fn() },
     position:       { findMany: vi.fn() },
-    // findFirst backs immutableAudit.write()'s chain-head lookup;
+    // $queryRaw backs immutableAudit.write()'s chain-head lookup;
     // $executeRaw backs its advisory-lock acquisition (pg_advisory_xact_lock
     // returns void, which $queryRaw cannot deserialize); $transaction lets
     // it run standalone (no tx passed) by invoking the callback against
     // this same mock object, which also satisfies the `Db` shape it expects.
-    auditLog:       { create: vi.fn().mockResolvedValue({}), findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog:       { create: vi.fn().mockResolvedValue({}) },
     marginSnapshot: { create: vi.fn().mockResolvedValue({}) },
     $executeRaw:    vi.fn().mockResolvedValue(0),
+    $queryRaw:      vi.fn().mockResolvedValue([]),
     $transaction:   vi.fn((cb: (tx: unknown) => unknown) => cb(mockDb)),
   },
 }));

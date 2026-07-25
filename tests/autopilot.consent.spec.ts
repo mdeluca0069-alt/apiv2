@@ -19,8 +19,9 @@ const { mockConsentCreate, mockConfigUpsert, mockConfigFindUnique, mockAuditCrea
   const mockPrisma: Record<string, unknown> = {
     autopilotConsent: { create: mockConsentCreate },
     autopilotConfig:  { upsert: mockConfigUpsert, findUnique: mockConfigFindUnique },
-    auditLog:         { create: mockAuditCreate, findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog:         { create: mockAuditCreate },
     $executeRaw:      vi.fn().mockResolvedValue(0),
+    $queryRaw:        vi.fn().mockResolvedValue([]),
   };
   mockPrisma.$transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(mockPrisma));
   return { mockConsentCreate, mockConfigUpsert, mockConfigFindUnique, mockAuditCreate, mockPrisma };

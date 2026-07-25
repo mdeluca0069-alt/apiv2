@@ -23,13 +23,14 @@ function makeMockTx(entry: Record<string, unknown> | null) {
       findUnique: vi.fn(),
       update: vi.fn(),
     },
-    // findFirst (below, distinct from ledgerEntry.findFirst above) backs
+    // $queryRaw (distinct from ledgerEntry.findFirst above) backs
     // immutableAudit.write()'s chain-head lookup; $executeRaw backs its
     // advisory-lock acquisition (pg_advisory_xact_lock returns void, which
     // $queryRaw cannot deserialize) -- ledger.engine.ts now routes its
     // AuditLog write through immutableAudit.write(..., tx).
-    auditLog: { create: vi.fn().mockResolvedValue({}), findFirst: vi.fn().mockResolvedValue(null) },
+    auditLog: { create: vi.fn().mockResolvedValue({}) },
     $executeRaw: vi.fn().mockResolvedValue(0),
+    $queryRaw: vi.fn().mockResolvedValue([]),
   };
 }
 
