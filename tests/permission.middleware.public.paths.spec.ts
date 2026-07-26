@@ -47,3 +47,29 @@ describe("PermissionMiddleware.checkRoute() — auth PUBLIC_PATHS coverage", () 
     expect(result.allowed).toBe(false);
   });
 });
+
+describe("PermissionMiddleware.checkRoute() — real health-check endpoints must be reachable with no principal", () => {
+  // PRODUCTION CUTOVER Stage 3 — found via live shadow-environment testing:
+  // docker-compose.prod.yml's healthcheck was repointed at /api/health
+  // (real DB/Redis checks, shared/health.check.ts) instead of /health
+  // (process-alive only) earlier this same Stage -- but /^\/health/ only
+  // matches the bare path, not /api/health or /api/v1/health, so every
+  // healthcheck invocation (including Docker's own, confirmed live from
+  // inside the running container) got 403 FORBIDDEN "unauthenticated."
+  // An orchestrator's health probe never carries a JWT -- a health
+  // endpoint gated on authentication cannot function as a healthcheck.
+  it("allows GET /api/health with no principal", () => {
+    const result = permissionMiddleware.checkRoute("GET", "/api/health", null);
+    expect(result.allowed).toBe(true);
+    expect(result.reason).toBe("public path");
+  });
+
+  it("allows GET /api/v1/health with no principal", () => {
+    const result = permissionMiddleware.checkRoute("GET", "/api/v1/health", null);
+    expect(result.allowed).toBe(true);
+  });
+
+  it("still allows the original bare /health path with no principal (unchanged)", () => {
+    expect(permissionMiddleware.checkRoute("GET", "/health", null).allowed).toBe(true);
+  });
+});

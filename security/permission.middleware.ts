@@ -92,6 +92,21 @@ const ROUTE_PERMISSIONS: Array<[string, RegExp, RoutePermission]> = [
 // Paths that are always public (no auth required)
 const PUBLIC_PATHS = [
   /^\/health/,
+  // PRODUCTION CUTOVER Stage 3: /^\/health/ only matches the bare /health
+  // path -- it does NOT match /api/health or /api/v1/health, the two
+  // endpoints that actually check DB/Redis connectivity for real
+  // (shared/health.check.ts) rather than just confirming the process is
+  // alive. docker-compose.prod.yml's healthcheck was deliberately
+  // repointed at /api/health this same Stage specifically because /health
+  // doesn't verify dependencies -- but that immediately broke the
+  // healthcheck a second way, confirmed live: with no principal, every
+  // request to /api/health returned 403 FORBIDDEN "unauthenticated"
+  // (Docker's own wget healthcheck call, run from inside the container
+  // against localhost, included), because these two paths were never
+  // added to this allowlist at all. A health-check endpoint that requires
+  // authentication cannot be used by an orchestrator's health probe.
+  /^\/api\/health$/,
+  /^\/api\/v1\/health$/,
   /^\/metrics/,
   /^\/api\/v1\/auth\/login/,      // covers /login, /login/db, future sub-paths
   // PRODUCTION CUTOVER Stage 2: found via live validation that this was

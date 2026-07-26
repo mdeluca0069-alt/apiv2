@@ -35,7 +35,8 @@
     "prisma/**/*.ts",
     "tests/**/*.ts",
     "security/**/*.ts",
-    "scripts/**/*.ts"
+    "scripts/**/*.ts",
+    "migration/**/*.ts"
   ],
   "exclude": ["dist", "node_modules"]
 }
