@@ -79,17 +79,32 @@ export class RecoveryService {
       const qty       = pos.quantity.toNumber();
       const entry     = pos.entryPrice.toNumber();
       const pnl       = (markPrice - entry) * qty * direction;
-      const pnlPct    = entry > 0 ? ((markPrice - entry) / entry) * 100 * direction : 0;
+      const rawPnlPct = entry > 0 ? ((markPrice - entry) / entry) * 100 * direction : 0;
+      // PRODUCTION CUTOVER Stage 3 — pnlPercent is Decimal(10,4), max abs
+      // value ~999999.9999. A single corrupted/stale entryPrice (confirmed
+      // live via a shadow-environment seed-data defect: an FX-shaped price
+      // on a crypto position) produces a percentage far past that, and
+      // Prisma throws "numeric field overflow" -- clamped the same way
+      // margin.controller.ts's snapshotMargin() already clamps marginLevelPct.
+      const pnlPct = Number.isFinite(rawPnlPct) ? Math.max(-999_999, Math.min(999_999, rawPnlPct)) : 0;
 
-      await db.position.update({
-        where: { id: pos.id },
-        data: {
-          markPrice:  new Decimal(markPrice),
-          pnl:        new Decimal(pnl),
-          pnlPercent: new Decimal(pnlPct),
-        },
-      });
-      positionsRecomputed++;
+      try {
+        await db.position.update({
+          where: { id: pos.id },
+          data: {
+            markPrice:  new Decimal(markPrice),
+            pnl:        new Decimal(pnl),
+            pnlPercent: new Decimal(pnlPct),
+          },
+        });
+        positionsRecomputed++;
+      } catch (err) {
+        // One malformed position must not abort P&L recompute for every
+        // other open position, nor steps 2-5 (orphan margin release, stuck
+        // order rejection, orphan detection, reconciliation sweep) below --
+        // this loop used to have no per-row guard at all.
+        console.error(`[recovery] failed to recompute P&L for position ${pos.id}:`, (err as Error).message);
+      }
     }
 
     console.log(`[recovery] recomputed P&L for ${positionsRecomputed} open positions`);

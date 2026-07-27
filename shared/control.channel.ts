@@ -38,6 +38,16 @@ async function ensureSubscriber(): Promise<Redis | null> {
 
     const sub = redis.duplicate();
     sub.on("error", (err) => console.warn("[control-channel] subscriber error:", err.message));
+    // PRODUCTION CUTOVER Stage 3 — live-confirmed: duplicate() inherits the
+    // base client's lazyConnect:true, so without an explicit connect() the
+    // underlying socket is never opened and every subsequent subscribe()
+    // fails immediately ("Stream isn't writeable") with enableOfflineQueue
+    // false — deterministically, on every boot, not a transient race. This
+    // silently disabled cross-worker kill-switch/risk-supervisor/broker-spread
+    // propagation in every multi-instance deployment.
+    await sub.connect().catch((err) =>
+      console.warn("[control-channel] subscriber connect failed:", (err as Error).message),
+    );
     sub.on("message", (channel: string, raw: string) => {
       const list = handlers.get(channel);
       if (!list || list.length === 0) return;

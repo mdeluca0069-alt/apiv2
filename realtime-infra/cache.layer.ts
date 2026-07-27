@@ -71,6 +71,13 @@ class DistributedCache {
     // any other commands (GET, SET, PUBLISH, etc.).
     const sub = redis.duplicate();
     sub.on("error", () => { /* non-fatal */ });
+    // PRODUCTION CUTOVER Stage 3 — see control.channel.ts / redis.pubsub.ts:
+    // duplicate() inherits lazyConnect:true from the base client, so the
+    // socket must be explicitly connected before subscribe() can succeed
+    // (enableOfflineQueue is false, so a pre-connect subscribe fails
+    // instantly instead of queuing) -- this silently disabled cross-node L1
+    // cache invalidation on every boot.
+    await sub.connect().catch(() => {});
     await sub.subscribe(INVALIDATE_CHANNEL).catch(() => {});
 
     sub.on("message", (_ch: string, raw: string) => {

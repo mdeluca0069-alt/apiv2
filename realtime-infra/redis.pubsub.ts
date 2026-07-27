@@ -119,6 +119,14 @@ export class RedisPubSub {
       this.connected = false;
     });
 
+    // PRODUCTION CUTOVER Stage 3 — live-confirmed (docker-compose.prod.yml
+    // shadow deployment): duplicate() inherits the base client's
+    // lazyConnect:true, so without an explicit connect() the socket is never
+    // opened and subscribe() fails immediately with enableOfflineQueue false.
+    // The caller's try/catch mislabeled this as "single-node mode" -- it was
+    // never a deliberate fallback, it silently broke cross-node WS relay on
+    // every boot with a real Redis configured.
+    await this.subscriber.connect();
     await this.subscriber.subscribe(CH_USER, CH_BROADCAST, CH_TICK);
 
     this.subscriber.on("message", (channel, raw) => {

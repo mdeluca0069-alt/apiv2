@@ -1163,6 +1163,14 @@ function broadcast(type: string, data: unknown): void {
 // WebSocket event names are the canonical contract consumed by the frontend.
 // Use consistent names that match the frontend stream subscriptions.
 
+// PRODUCTION CUTOVER Stage 3 — see BrokerState.syncUserFromDatabase()'s
+// comment: without this, a client registered via the real, persistent
+// /auth/register/db path is invisible to the admin/CRM panel until the
+// next process restart (hydrateFromDatabase only runs at boot).
+eventBus.on("user.registered", (event) => {
+  void state.syncUserFromDatabase(event.userId);
+});
+
 eventBus.on("order.filled", (event) => {
   // FASE 2.1: outboxId (if present) points at the row already committed
   // atomically with the fill in execution.engine.ts — strip it from the

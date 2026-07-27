@@ -721,6 +721,43 @@ export class BrokerState {
     await this.hydrateFromDatabase();
   }
 
+  /**
+   * PRODUCTION CUTOVER Stage 3 — live shadow-environment testing found that a
+   * user created via the persistent DB registration path (auth-service's
+   * authService.register(), the only registration path a real deployment
+   * uses) never appeared in admin/client-accounts, admin/client/:email, or
+   * any other admin/CRM view backed by this.clientAccounts, because those
+   * maps are only populated by hydrateFromDatabase() at process boot. A
+   * freshly registered client was invisible to KYC review, deposit/
+   * withdrawal approval, and capital allocation until the next restart.
+   * Called from main.ts's "user.registered" event listener right after DB
+   * commit so admin views reflect new signups immediately, mirroring what
+   * the in-memory register() path already does synchronously at L952-953.
+   */
+  async syncUserFromDatabase(userId: string): Promise<void> {
+    if (!this.prisma) return;
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) return;
+
+    const roles = Array.isArray(user.roles) ? user.roles.map(String) : [user.role];
+    const permissions = Array.isArray(user.permissions) ? user.permissions.map(String) : ["trading:read"];
+    const record: UserRecord = {
+      id: user.id,
+      email: user.email,
+      password: user.password,
+      fullName: user.fullName,
+      tenantId: user.tenantId,
+      tier: user.tier as UserRecord["tier"],
+      roles: roles as UserRecord["roles"],
+      permissions,
+      kycStatus: user.kycStatus as UserRecord["kycStatus"],
+    };
+    this.users.set(record.email.toLowerCase(), record);
+    if (record.roles.includes("trader") && !this.clientAccounts.has(record.id)) {
+      this.clientAccounts.set(record.id, this.createClientAccount(record));
+    }
+  }
+
   private async hydrateFromDatabase(): Promise<void> {
     if (!this.prisma) return;
 
