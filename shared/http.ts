@@ -43,6 +43,10 @@ export type ApiServerOptions = {
 
 const BODY_SIZE_LIMIT = 1 * 1024 * 1024; // 1 MB
 
+// Health/readiness probe paths, exempted from rate limiting -- see the
+// PRODUCTION CUTOVER Stage 3 comment at the rate-limiter call site below.
+const HEALTH_CHECK_PATHS = new Set(["/health", "/api/health", "/api/v1/health"]);
+
 const isProd = process.env.NODE_ENV === "production";
 
 function resolveCorsOrigin(requestOrigin: string | undefined, configuredOrigin: string): string {
@@ -235,7 +239,21 @@ export function createApiServer(options: ApiServerOptions) {
         }
 
         // ── Rate limiting ─────────────────────────────────────────────────
-        if (options.rateLimiter) {
+        // PRODUCTION CUTOVER Stage 3 — live-confirmed in a Redis-failure
+        // simulation: the rate limiter fails CLOSED on Redis unavailability
+        // by design (gateway/rate-limiter.ts, to prevent bypassing limits by
+        // knocking Redis offline) -- but that check ran for every route
+        // including /health and /api/health, so a Redis outage returned 503
+        // for the orchestrator's own health/readiness probes too. That turns
+        // a recoverable Redis blip into every replica being marked unhealthy
+        // simultaneously (since they all share one Redis), which can cascade
+        // into restarts or full removal from the load balancer -- exactly
+        // when operators most need an accurate signal. A health endpoint
+        // gated on a dependency it isn't even checking cannot function as a
+        // health check (the same principle as the /api/health PUBLIC_PATHS
+        // fix earlier this Stage). Rate limiting still fails closed for
+        // every real application route.
+        if (options.rateLimiter && !HEALTH_CHECK_PATHS.has(url.pathname)) {
           const tier = extractClientTier(principal as { tier?: string } | null);
           const rl   = await options.rateLimiter.check(clientIp, tier, url.pathname);
 
