@@ -18,6 +18,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import type { TokenPayload } from "../shared/security.js";
+import { publishControlChannel, subscribeControlChannel } from "../shared/control.channel.js";
 
 // ── Key slot ───────────────────────────────────────────────────────────────────
 
@@ -33,6 +34,28 @@ export interface KeySlot {
 
 const GRACE_PERIOD_MS = 24 * 60 * 60 * 1_000;
 const TOKEN_TTL_S     = 7 * 24 * 60 * 60;
+
+// PRODUCTION CUTOVER Stage 3B — rotate() used to be purely in-process: each
+// api replica runs its own independent scheduleAutoRotation(24h) timer with
+// no coordination between replicas. generateHs256Slot()/generateRs256Slot()
+// are genuinely random, so 24h after a multi-replica boot every replica
+// would rotate to a DIFFERENT key with no shared source of truth -- a token
+// signed by replica A would fail verification on replica B the moment nginx
+// round-robins the next request there. This channel broadcasts the winning
+// rotation to every other replica (mirroring the same control.channel.ts
+// pattern already used for kill-switch/risk-supervisor/broker-spread sync,
+// and the same duplicate()-then-.connect() fix applied to it earlier this
+// Stage) so every replica converges on the identical primary key within
+// moments of any one of them rotating.
+const ROTATION_CHANNEL = "jwt-key-rotation";
+
+type RotationBroadcast = {
+  kid:        string;
+  signingKey: string;
+  verifyKey:  string;
+  algorithm:  "RS256" | "HS256";
+  createdAt:  number;
+};
 
 function computeKid(keyMaterial: string): string {
   return createHash("sha256").update(keyMaterial).digest("hex").slice(0, 16);
@@ -172,6 +195,46 @@ class JwtKeyManager {
       ? generateRs256Slot()
       : generateHs256Slot();
 
+    this._applyNewPrimary(newPrimary, previous);
+
+    // Tell every other replica to converge on this exact key instead of
+    // independently generating (and diverging to) their own.
+    void publishControlChannel(ROTATION_CHANNEL, {
+      kid:        newPrimary.kid,
+      signingKey: newPrimary.signingKey,
+      verifyKey:  newPrimary.verifyKey,
+      algorithm:  newPrimary.algorithm,
+      createdAt:  newPrimary.createdAt,
+    } satisfies RotationBroadcast);
+  }
+
+  /** Subscribes to other replicas' rotations. Call once, after Redis is available. */
+  async startClusterSync(): Promise<void> {
+    await subscribeControlChannel(ROTATION_CHANNEL, (payload) => {
+      this._applyRemoteRotation(payload);
+    });
+  }
+
+  private _applyRemoteRotation(payload: unknown): void {
+    if (!this.state) return;
+    const p = payload as Partial<RotationBroadcast> | null;
+    if (!p || typeof p.kid !== "string" || typeof p.signingKey !== "string" ||
+        typeof p.verifyKey !== "string" || (p.algorithm !== "RS256" && p.algorithm !== "HS256")) {
+      console.warn("[jwt-key-manager] ignored malformed rotation broadcast");
+      return;
+    }
+    if (p.kid === this.state.primary.kid) return; // echo of our own rotation, or already applied
+
+    const remotePrimary: KeySlot = {
+      kid: p.kid, signingKey: p.signingKey, verifyKey: p.verifyKey,
+      algorithm: p.algorithm, createdAt: p.createdAt ?? Date.now(),
+    };
+    const previous = this.state.primary;
+    this._applyNewPrimary(remotePrimary, previous);
+    console.log(`[jwt-key-manager] converged to remote rotation primary=${remotePrimary.kid} grace-secondary=${previous.kid}`);
+  }
+
+  private _applyNewPrimary(newPrimary: KeySlot, previous: KeySlot): void {
     this.state = { primary: newPrimary, secondary: previous };
     console.log(`[jwt-key-manager] rotated primary=${newPrimary.kid} grace-secondary=${previous.kid}`);
 

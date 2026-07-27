@@ -182,6 +182,12 @@ try {
   await wsCluster.register().catch((err) =>
     console.warn("[ws-cluster] register failed (single-node mode):", (err as Error).message),
   );
+  // PRODUCTION CUTOVER Stage 3B — without this, JWT key rotation diverges
+  // silently across replicas 24h after boot (see jwt-key-manager.ts's
+  // ROTATION_CHANNEL comment). Must start after Redis is confirmed up.
+  await jwtKeyManager.startClusterSync().catch((err) =>
+    console.warn("[jwt-key-manager] cluster sync failed (rotation stays single-node):", (err as Error).message),
+  );
 } catch (redisErr) {
   if (_isProduction) {
     console.error(

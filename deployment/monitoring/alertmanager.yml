@@ -1,10 +1,20 @@
 global:
   resolve_timeout: 5m
-  # SMTP for email alerts — configure via env vars at compose level
-  smtp_smarthost:   "${SMTP_HOST:-localhost}:${SMTP_PORT:-587}"
-  smtp_from:        "${SMTP_FROM:-alerts@igfxpro.com}"
-  smtp_auth_username: "${SMTP_USER:-}"
-  smtp_auth_password: "${SMTP_PASS:-}"
+  # SMTP for email alerts — configure via env vars at compose level.
+  # PRODUCTION CUTOVER Stage 3B: this file is rendered by `envsubst`
+  # (docker-compose.monitoring.yml's alertmanager-config service), which
+  # only does literal $VAR/${VAR} substitution -- it does NOT understand
+  # bash's ${VAR:-default} fallback syntax (confirmed live: alertmanager
+  # crash-looped with "too many colons in address" because the whole
+  # "${SMTP_HOST:-localhost}" string passed through unexpanded). Default
+  # values now live in docker-compose.monitoring.yml's own environment
+  # block instead, where Compose's interpolation engine resolves them
+  # correctly before envsubst ever runs -- this template only ever sees
+  # plain ${VAR} references to an already-resolved value.
+  smtp_smarthost:   "${SMTP_HOST}:${SMTP_PORT}"
+  smtp_from:        "${SMTP_FROM}"
+  smtp_auth_username: "${SMTP_USER}"
+  smtp_auth_password: "${SMTP_PASS}"
   smtp_require_tls: true
 
 # ── Routing ────────────────────────────────────────────────────────────────────
@@ -115,7 +125,7 @@ receivers:
 
   - name: compliance-email
     email_configs:
-      - to: "${COMPLIANCE_EMAIL:-compliance@igfxpro.com}"
+      - to: "${COMPLIANCE_EMAIL}"
         send_resolved: true
         html: |
           <h2>{{ .CommonAnnotations.summary }}</h2>
