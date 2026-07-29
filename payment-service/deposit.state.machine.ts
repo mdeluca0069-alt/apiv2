@@ -92,9 +92,25 @@ export class DepositStateMachine {
         throw new Error(`DEPOSIT_INVALID_TRANSITION:${dep.status}->CREDITED`);
       }
 
-      const creditAmount = new Decimal(params.amount).gt(0)
-        ? new Decimal(params.amount)
-        : dep.amount;
+      // CRITICAL_REMEDIATION (C4, second half): the amount actually credited
+      // must never be taken from the webhook payload alone. dep.amount was
+      // recorded server-side when the deposit was originally requested,
+      // before any PSP interaction -- it is the one value in this flow the
+      // client/PSP cannot influence after the fact. Praxis's webhook
+      // signature does not bind amount (see praxis.adapter.ts's
+      // verifyPraxisSignature() docstring), so a webhook -- forged or
+      // otherwise malformed -- claiming a materially different amount than
+      // what was requested is rejected outright rather than trusted,
+      // closing the amount-inflation half of the forgery exposure
+      // independently of any signature weakness.
+      const webhookAmount = new Decimal(params.amount);
+      if (webhookAmount.gt(0) && webhookAmount.minus(dep.amount).abs().gt(0.01)) {
+        throw Object.assign(
+          new Error(`DEPOSIT_AMOUNT_MISMATCH:requested=${dep.amount.toString()}:webhook=${webhookAmount.toString()}`),
+          { statusCode: 409 },
+        );
+      }
+      const creditAmount = dep.amount;
 
       // Credit wallet
       const wallet = await tx.walletAccount.findUniqueOrThrow({

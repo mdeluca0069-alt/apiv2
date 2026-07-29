@@ -167,16 +167,23 @@ export class PaymentService {
     const adapter    = getPsp(psp);
     const parsed     = await adapter.parseWebhook(rawBody, headers);
 
-    // Find the deposit by pspRef
-    const dep = await this.db.depositTransaction.findFirst({
-      where: { pspRef: parsed.pspRef },
-    });
+    // CRITICAL_REMEDIATION (C5): correlate by our own depositId first, when
+    // the PSP's webhook echoes it back (Nuvei: merchant_unique_id, Praxis:
+    // order_id -- see each adapter's parseWebhook()). pspRef alone is not
+    // reliable here: it's only ever populated by createSession()'s response,
+    // and for Nuvei that response never carries one at all (Nuvei doesn't
+    // assign a TransactionID until the payment attempt happens, out of
+    // band) -- every genuine Nuvei webhook previously failed this lookup
+    // with a 100% failure rate. Falls back to the pre-existing pspRef
+    // lookup for adapters/payloads that don't supply depositId, so Stripe
+    // and any already-correlated Praxis rows are unaffected.
+    const dep = parsed.depositId
+      ? await this.db.depositTransaction.findFirst({ where: { id: parsed.depositId } })
+      : await this.db.depositTransaction.findFirst({ where: { pspRef: parsed.pspRef } });
 
     if (!dep) {
-      // Praxis/Nuvei may call the webhook before the session response is received.
-      // Fall back to correlating by sessionId if present, or treat as unknown.
       throw Object.assign(
-        new Error(`WEBHOOK_NO_DEPOSIT_FOR_PSPREF:${parsed.pspRef}`),
+        new Error(`WEBHOOK_NO_DEPOSIT_FOR_PSPREF:${parsed.depositId ?? parsed.pspRef}`),
         { statusCode: 404 }
       );
     }

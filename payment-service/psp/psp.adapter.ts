@@ -21,6 +21,12 @@ export type WebhookParseResult = {
   amount?:   number;
   currency?: string;
   failReason?: string;
+  // CRITICAL_REMEDIATION (C5): our own DepositTransaction id, when the PSP's
+  // webhook echoes it back (Nuvei: merchant_unique_id, Praxis: order_id).
+  // processWebhookConfirmation() correlates on this first, falling back to
+  // pspRef -- see nuvei.adapter.ts's parseWebhook() docstring for why pspRef
+  // alone is not reliable for every PSP.
+  depositId?: string;
 };
 
 export interface PspAdapter {

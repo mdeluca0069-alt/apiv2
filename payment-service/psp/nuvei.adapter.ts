@@ -93,6 +93,29 @@ export class NuveiAdapter implements PspAdapter {
     };
   }
 
+  // CRITICAL_REMEDIATION (C5): createSession() (above) has no Nuvei-assigned
+  // transaction id to return as pspRef -- Nuvei's openOrder.do response only
+  // carries a sessionToken, and Nuvei doesn't allocate a TransactionID until
+  // the actual payment attempt happens later, out of band. Every
+  // DepositTransaction row created via this adapter therefore has
+  // pspRef === null in the DB from the moment it's requested.
+  //
+  // Live-reproduced via code trace 2026-07-30 (PSP disabled in shadow, no
+  // Nuvei credentials configured): payment.service.ts's
+  // processWebhookConfirmation() looked up the deposit exclusively by
+  // `where: { pspRef: parsed.pspRef }`. Since parsed.pspRef is Nuvei's real
+  // TransactionID and the stored row's pspRef is null, that lookup can NEVER
+  // match -- SQL `pspRef = 'TXN123'` never matches a NULL column. Every
+  // single genuine, correctly-signed Nuvei deposit webhook therefore threw
+  // WEBHOOK_NO_DEPOSIT_FOR_PSPREF and the deposit was never credited: a
+  // 100% failure rate for the Nuvei rail, not an edge case.
+  //
+  // Fix: Nuvei's webhook payload already echoes our own depositId back as
+  // merchant_unique_id (we send it as clientRequestId in createSession's
+  // openOrder.do call) -- this field was captured in the payload type but
+  // never read. Returning it as `depositId` lets processWebhookConfirmation
+  // correlate directly by our own primary key instead of depending on a
+  // pspRef that this adapter can never populate at session-creation time.
   async parseWebhook(rawBody: Buffer, _headers: Record<string, string | string[] | undefined>): Promise<WebhookParseResult> {
     const payload = Object.fromEntries(new URLSearchParams(rawBody.toString())) as unknown as NuveiWebhookPayload;
 
@@ -100,10 +123,12 @@ export class NuveiAdapter implements PspAdapter {
 
     const transactionId = payload.TransactionID;
     const status        = payload.Status?.toUpperCase();
+    const depositId      = payload.merchant_unique_id || undefined;
 
     if (status === "APPROVED") {
       return {
         pspRef:   transactionId,
+        depositId,
         status:   "CONFIRMED",
         amount:   parseFloat(payload.totalAmount),
         currency: payload.currency,
@@ -113,6 +138,7 @@ export class NuveiAdapter implements PspAdapter {
     if (status === "DECLINED" || status === "ERROR") {
       return {
         pspRef:     transactionId,
+        depositId,
         status:     "FAILED",
         failReason: `Nuvei status: ${status}`,
       };
