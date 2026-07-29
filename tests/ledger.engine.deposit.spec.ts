@@ -139,13 +139,17 @@ describe("LedgerEngine.approveDeposit() — audit trail (Bug #5, LEDGER_FREEZE.m
 
     expect(db.auditLog.create).toHaveBeenCalledTimes(1);
     const entry = db.auditLog.create.mock.calls[0][0].data as {
-      actor: string; action: string; entity: string; payload: { amount: number; reference: string };
+      actor: string; action: string; entity: string; payload: { amount: number; requestEntryId: string };
     };
     expect(entry.actor).toBe("admin-42");
     expect(entry.action).toBe("deposit.approved");
     expect(entry.entity).toBe("user-1");
     expect(entry.payload.amount).toBe(500);
-    expect(entry.payload.reference).toBe("ref-1");
+    // CRITICAL_REMEDIATION (C2): the audit payload now records the request's
+    // own immutable row id (requestEntryId), not a client-repeatable
+    // reference string -- this field rename is the direct consequence of
+    // the idempotency-key fix; see LedgerEngine.approveDeposit()'s docstring.
+    expect(entry.payload.requestEntryId).toBe("ref-1");
   });
 });
 
@@ -181,5 +185,64 @@ describe("LedgerEngine — Notification/Metrics (Bug #10, LEDGER_FREEZE.md §0.1
 
     expect(emitSpy).not.toHaveBeenCalled();
     expect(mockMetricsInc).not.toHaveBeenCalledWith("igfx_deposits_total");
+  });
+});
+
+describe("CRITICAL_REMEDIATION (C2) — idempotency guard keyed on the request's own id, not client-supplied `details`", () => {
+  // Live-reproduced 2026-07-29 (CRITICAL_REMEDIATION_REPORT.md, finding C2):
+  // approveDeposit() used to be called with entry.reference, which for a
+  // real request is the client-supplied `details` field (or a `DEP-<ms>`
+  // timestamp fallback) -- a second deposit sharing that value with an
+  // already-approved deposit matched the guard's findFirst and was silently
+  // no-op'd: {"ok":true} returned, wallet never credited. These tests prove
+  // the guard and status update now key strictly on the request row's own
+  // immutable id.
+
+  it("queries the idempotency guard by the request's own id, never by client-supplied `details`", async () => {
+    const db = makeDb({ balance: 1_000 });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveDeposit("user-1", 500, "deposit-request-id-AAA", "admin-1");
+
+    const guardCall = db.ledgerEntry.findFirst.mock.calls[0][0] as { where: Record<string, unknown> };
+    expect(guardCall.where.reference).toBe("APPROVED:deposit-request-id-AAA");
+    expect(guardCall.where.reference).not.toBe("APPROVED:Visa **** 4242");
+  });
+
+  it("two distinct deposits sharing the same client-supplied `details` string each independently credit the wallet -- the exact scenario that lost a $9,000 credit live", async () => {
+    const db = makeDb({ balance: 0 });
+    const engine = new LedgerEngine(db as never);
+
+    // Both deposits carry the same client-supplied `details` ("Visa **** 4242")
+    // as their business reference, but are distinct requests with distinct ids
+    // -- exactly the live-reproduced scenario from CRITICAL_REMEDIATION_REPORT.md.
+    await engine.approveDeposit("user-1", 500, "req-A", "admin-1");
+    await engine.approveDeposit("user-1", 9_000, "req-B", "admin-1");
+
+    expect(db.ledgerEntry.create).toHaveBeenCalledTimes(2);
+    expect(db.walletAccount.update).toHaveBeenCalledTimes(2);
+    const secondCreate = db.ledgerEntry.create.mock.calls[1][0] as { data: { reference: string } };
+    expect(secondCreate.data.reference).toBe("APPROVED:req-B");
+  });
+
+  it("a genuine retry of the SAME request id is still correctly idempotent (no double-credit)", async () => {
+    const db = makeDb({ balance: 1_000, existingApproval: { id: "already-approved-row" } });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveDeposit("user-1", 500, "req-A", "admin-1");
+
+    expect(db.ledgerEntry.create).not.toHaveBeenCalled();
+    expect(db.walletAccount.update).not.toHaveBeenCalled();
+  });
+
+  it("matches the PENDING_ADMIN → APPROVED status update by id, not by reference/details", async () => {
+    const db = makeDb({ balance: 1_000 });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveDeposit("user-1", 500, "req-A", "admin-1");
+
+    const updateCall = db.ledgerEntry.updateMany.mock.calls[0][0] as { where: Record<string, unknown> };
+    expect(updateCall.where.id).toBe("req-A");
+    expect(updateCall.where).not.toHaveProperty("reference");
   });
 });

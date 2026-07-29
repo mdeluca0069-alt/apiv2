@@ -22,13 +22,38 @@ import { STALE_THRESHOLD_MS } from "../liquidity-engine/internal.liquidity.core.
 
 const _quotes = new Map<string, Quote>();
 
+/**
+ * CRITICAL_REMEDIATION Phase 1 (C8): set() used to call _persist() on
+ * EVERY tick, from every replica independently, with no debounce -- live-
+ * measured (CRITICAL_REMEDIATION_REPORT.md, finding C8) at ~93 writes/sec
+ * against a BrokerSetting table holding 4 live rows, ~18M cumulative
+ * updates, individual upserts observed taking up to 7.7s, and Postgres
+ * connection-pool exhaustion severe enough to make ordinary API requests
+ * (registration, deposits) fail outright even with a single test user and
+ * no load-test traffic running. This is the persisted-for-restart-warmup
+ * path only (see warmUp()) -- it does not need tick-level freshness, only
+ * approximate freshness after a restart. Debouncing to once per symbol per
+ * PERSIST_DEBOUNCE_MS cuts write volume by roughly two orders of magnitude
+ * at typical multi-Hz tick rates, with no change to in-memory read/write
+ * behavior (the in-memory Map, which is what the entire hot path actually
+ * reads, is still updated on every single tick, unthrottled).
+ */
+const PERSIST_DEBOUNCE_MS = 10_000;
+const _lastPersistedAt = new Map<string, number>();
+
 export const quoteCache = {
   set(quote: Quote): void {
     const sym = quote.symbol.toUpperCase();
     _quotes.set(sym, { ...quote, symbol: sym });
 
-    // Fire-and-forget — do not block the quote ingestion path
-    void _persist(sym, quote);
+    // Fire-and-forget, debounced — do not block the quote ingestion path,
+    // and do not persist more often than PERSIST_DEBOUNCE_MS per symbol.
+    const now = Date.now();
+    const lastPersisted = _lastPersistedAt.get(sym) ?? 0;
+    if (now - lastPersisted >= PERSIST_DEBOUNCE_MS) {
+      _lastPersistedAt.set(sym, now);
+      void _persist(sym, quote);
+    }
 
     eventBus.emit("market.quote", {
       symbol:    sym,
@@ -84,7 +109,13 @@ async function _persist(symbol: string, quote: Quote): Promise<void> {
       create: { key: `quote:${symbol}`, value: quote as object },
       update: { value: quote as object },
     });
-  } catch {
-    // Non-fatal — in-memory cache is authoritative
+  } catch (err) {
+    // Non-fatal — in-memory cache is authoritative, this is only the
+    // restart-warmup snapshot. CRITICAL_REMEDIATION (C8): previously a
+    // silent empty catch, which meant a persistently-failing write path
+    // (e.g. the exact connection-pool exhaustion this same finding caused)
+    // had zero observability. Now debounced to at most one attempt per
+    // symbol per PERSIST_DEBOUNCE_MS, so this can no longer itself spam.
+    console.warn(`[quote-cache] persist failed for ${symbol}:`, (err as Error).message);
   }
 }

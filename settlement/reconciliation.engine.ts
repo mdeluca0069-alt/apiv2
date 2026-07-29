@@ -136,7 +136,7 @@ export class ReconciliationEngine {
         // represent a settled, balance-affecting entry; only PENDING_ADMIN/
         // PENDING/REJECTED should stay excluded.
         where:  { userId, status: { in: ["COMPLETED", "APPROVED"] } },
-        select: { amount: true, type: true },
+        select: { amount: true, type: true, status: true },
       }),
     ]);
 
@@ -173,8 +173,27 @@ export class ReconciliationEngine {
     };
 
     // ── 2. Ledger balance invariant ─────────────────────────────────────────
+    // CRITICAL_REMEDIATION (C3): a WITHDRAW_REQUEST row with status APPROVED
+    // is, in every real code path that writes it (LedgerEngine.
+    // approveWithdrawal(), BrokerState.adminReviewLedger()'s legacy admin
+    // path), the ORIGINAL request row with its status merely flipped to mark
+    // it processed -- never a second real debit. The actual money movement
+    // is always a SEPARATE row: approveWithdrawal() creates a distinct
+    // status=COMPLETED WITHDRAW_REQUEST row; adminReviewLedger() creates a
+    // distinct type=ADMIN_CAPITAL_ALLOCATION row. Counting the flipped
+    // marker row IN ADDITION TO its settlement row double-counted every
+    // approved withdrawal, undercounting ledgerSum by exactly the
+    // withdrawal amount -- live-reproduced 2026-07-29
+    // (CRITICAL_REMEDIATION_REPORT.md, finding C3): every account with an
+    // approved withdrawal was permanently reported MISMATCH with
+    // delta === that withdrawal's amount, masking the C1 idempotency bug
+    // this same reconciliation check should have caught. Verified this
+    // exclusion does not affect ADMIN_CAPITAL_ALLOCATION (a different type,
+    // still counted regardless of APPROVED/COMPLETED status) or any other
+    // BALANCE_TYPES member.
     const ledgerSum = ledgerEntries
       .filter((e) => BALANCE_TYPES.has(e.type))
+      .filter((e) => !(e.type === "WITHDRAW_REQUEST" && e.status === "APPROVED"))
       .reduce((sum, e) => sum + e.amount.toNumber(), 0);
     const balanceDelta = walletBalance - ledgerSum;
     const ledgerBalance: LedgerBalanceCheck = {

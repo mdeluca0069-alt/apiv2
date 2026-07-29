@@ -2719,7 +2719,10 @@ export const routes: Route[] = [
       }
 
       const engine = new LedgerEngine(db as NonNullable<typeof db>);
-      await engine.approveDeposit(entry.userId, Number(entry.amount), entry.reference, principal.sub);
+      // CRITICAL_REMEDIATION (C2): pass the request row's own immutable id,
+      // not entry.reference (client-controlled, non-unique) -- see
+      // LedgerEngine.approveDeposit()'s docstring for the full root cause.
+      await engine.approveDeposit(entry.userId, Number(entry.amount), entry.id, principal.sub);
       return { ok: true };
     },
   },
@@ -2798,7 +2801,11 @@ export const routes: Route[] = [
       // balance instead of subtracting it, and silently defeated both the
       // INSUFFICIENT_BALANCE and INSUFFICIENT_FREE_MARGIN checks (a negative
       // "amount" is never greater than a positive balance/freeMargin).
-      await engine.approveWithdrawal(entry.userId, Math.abs(Number(entry.amount)), entry.reference, principal.sub);
+      // CRITICAL_REMEDIATION (C1): pass the request row's own immutable id,
+      // not entry.reference (the destination string, which legitimately
+      // repeats across a client's withdrawals) -- see
+      // LedgerEngine.approveWithdrawal()'s docstring for the full root cause.
+      await engine.approveWithdrawal(entry.userId, Math.abs(Number(entry.amount)), entry.id, principal.sub);
       return { ok: true };
     },
   },

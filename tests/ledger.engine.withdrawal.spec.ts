@@ -206,7 +206,11 @@ describe("LedgerEngine.approveWithdrawal() — audit trail (Bug #4, LEDGER_FREEZ
     expect(entry.action).toBe("withdrawal.approved");
     expect(entry.entity).toBe("user-1");
     expect(entry.payload.amount).toBe(5_000);
-    expect(entry.payload.reference).toBe("ref-1");
+    // CRITICAL_REMEDIATION (C1): the audit payload now records the request's
+    // own immutable row id (requestEntryId), not the destination string --
+    // see LedgerEngine.approveWithdrawal()'s docstring for the root cause
+    // this field rename fixes.
+    expect(entry.payload.requestEntryId).toBe("ref-1");
   });
 });
 
@@ -308,5 +312,76 @@ describe("LedgerEngine — Notification/Metrics (Bug #10, LEDGER_FREEZE.md §0.1
 
     expect(emitSpy).not.toHaveBeenCalled();
     expect(mockMetricsInc).not.toHaveBeenCalledWith("igfx_withdrawals_total");
+  });
+});
+
+describe("CRITICAL_REMEDIATION (C1) — idempotency guard keyed on the request's own id, not the destination", () => {
+  // Live-reproduced 2026-07-29 (CRITICAL_REMEDIATION_REPORT.md, finding C1):
+  // approveWithdrawal() used to be called with entry.reference (== the
+  // client-supplied `destination`), so a second, genuinely distinct
+  // withdrawal request to a destination that had already been approved once
+  // matched the idempotency guard's findFirst on that shared destination
+  // string and was silently no-op'd -- {"ok":true} returned, the wallet
+  // never debited a second time. These tests prove the guard and the
+  // subsequent request-row update now query on `id`, never on `reference`/
+  // destination, so two distinct requests sharing a destination cannot
+  // collide with each other, while a genuine retry of the SAME request
+  // (same id) still correctly no-ops.
+
+  it("queries the idempotency guard by the request's own id, never by the destination/reference string", async () => {
+    const db = makeDb({ balance: 10_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveWithdrawal("user-1", 100, "withdrawal-request-id-AAA", "admin-1");
+
+    const guardCall = db.ledgerEntry.findFirst.mock.calls[0][0] as { where: Record<string, unknown> };
+    expect(guardCall.where.reference).toBe("APPROVED:withdrawal-request-id-AAA");
+    // The bug this replaces would have received the raw destination string
+    // (e.g. "IBAN-SAME-ACCOUNT-999") here instead of a request id -- assert
+    // the exact id round-trips unchanged, proving no destination-shaped
+    // value is substituted anywhere in the guard's key construction.
+    expect(guardCall.where.reference).not.toBe("APPROVED:IBAN-SAME-ACCOUNT-999");
+  });
+
+  it("two distinct withdrawal requests sharing the same destination each independently debit the wallet -- the exact scenario that lost $5,000 live", async () => {
+    const db = makeDb({ balance: 20_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+
+    // Request 1: id "req-A", destination "IBAN-SAME-ACCOUNT-999", $100.
+    await engine.approveWithdrawal("user-1", 100, "req-A", "admin-1");
+    // Request 2: id "req-B" (DIFFERENT request), SAME destination, $5,000 --
+    // this is exactly the live-reproduced scenario from CRITICAL_REMEDIATION_REPORT.md.
+    await engine.approveWithdrawal("user-1", 5_000, "req-B", "admin-1");
+
+    // Both must have actually debited -- two real ledgerEntry.create calls,
+    // not one real + one silently-skipped-by-the-guard.
+    expect(db.ledgerEntry.create).toHaveBeenCalledTimes(2);
+    expect(db.walletAccount.update).toHaveBeenCalledTimes(2);
+    const secondCreate = db.ledgerEntry.create.mock.calls[1][0] as { data: { reference: string; amount: unknown } };
+    expect(secondCreate.data.reference).toBe("APPROVED:req-B");
+  });
+
+  it("a genuine retry of the SAME request id is still correctly idempotent (no double-debit)", async () => {
+    const db = makeDb({
+      balance: 10_000, locked: 0, openPositions: [],
+      existingApproval: { id: "already-approved-row" },
+    });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveWithdrawal("user-1", 100, "req-A", "admin-1");
+
+    expect(db.ledgerEntry.create).not.toHaveBeenCalled();
+    expect(db.walletAccount.update).not.toHaveBeenCalled();
+  });
+
+  it("matches the PENDING_ADMIN → APPROVED status update by id, not by reference/destination", async () => {
+    const db = makeDb({ balance: 10_000, locked: 0, openPositions: [] });
+    const engine = new LedgerEngine(db as never);
+
+    await engine.approveWithdrawal("user-1", 100, "req-A", "admin-1");
+
+    const updateCall = db.ledgerEntry.updateMany.mock.calls[0][0] as { where: Record<string, unknown> };
+    expect(updateCall.where.id).toBe("req-A");
+    expect(updateCall.where).not.toHaveProperty("reference");
   });
 });

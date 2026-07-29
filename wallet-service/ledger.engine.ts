@@ -76,7 +76,29 @@ export class LedgerEngine {
     return { status: "PENDING_ADMIN", entryId: id, reference };
   }
 
-  async approveDeposit(userId: string, amount: number, depositReference: string, adminId: string): Promise<void> {
+  /**
+   * CRITICAL_REMEDIATION Phase 1 (C2): `requestEntryId` MUST be the immutable
+   * primary-key `id` of the PENDING_ADMIN DEPOSIT_REQUEST row being approved
+   * -- never a business-meaningful string (destination, client-supplied
+   * `details`, or any other value a client could cause to repeat).
+   *
+   * Root cause of the bug this replaces: the idempotency guard used to be
+   * keyed on the caller-supplied `reference`, which for a real request is
+   * `parsed.details` (arbitrary client-controlled text) or a `DEP-<ms>`
+   * timestamp fallback. Two deposits from the same user sharing that value
+   * -- trivially true whenever a frontend sends a stable label, e.g. a card
+   * mask -- made the guard's `findFirst` match the FIRST deposit's already-
+   * COMPLETED row and silently no-op the second approval: the API returned
+   * {"ok":true}, an admin believed they'd credited the client, and the
+   * wallet balance never moved. Live-reproduced 2026-07-29: a second $9,000
+   * deposit sharing a prior deposit's `details` string was "approved" with
+   * zero balance change (see CRITICAL_REMEDIATION_REPORT.md, finding C2).
+   *
+   * `id` is `uuid()`-generated (schema.prisma) and therefore globally
+   * unique by construction -- using it as the guard key is airtight
+   * regardless of what any client sends as a reference/details string.
+   */
+  async approveDeposit(userId: string, amount: number, requestEntryId: string, adminId: string): Promise<void> {
     await this.repo.getOrCreate(userId);
     let approved = false;
 
@@ -86,7 +108,7 @@ export class LedgerEngine {
     await this.db.$transaction(async (tx) => {
       // Idempotency guard: if already approved, bail out without double-crediting.
       const existing = await tx.ledgerEntry.findFirst({
-        where: { userId, reference: `APPROVED:${depositReference}`, type: "ADMIN_CAPITAL_ALLOCATION" },
+        where: { userId, reference: `APPROVED:${requestEntryId}`, type: "ADMIN_CAPITAL_ALLOCATION" },
       });
       if (existing) return; // already approved
 
@@ -105,17 +127,22 @@ export class LedgerEngine {
           userId, currency: "USD",
           amount,
           type: "ADMIN_CAPITAL_ALLOCATION",
-          reference: `APPROVED:${depositReference}`,
+          reference: `APPROVED:${requestEntryId}`,
           status: "COMPLETED",
-          note: `Capital credited from approved deposit ${depositReference}`,
+          note: `Capital credited from approved deposit request ${requestEntryId}`,
           runningBalance: newBalance,
           debitAccount: "BROKER_FLOAT",
           creditAccount: `CLIENT:${userId}`,
         },
       });
 
+      // CRITICAL_REMEDIATION (C2): match the PENDING_ADMIN request row by its
+      // own immutable id, not by its (possibly non-unique) business
+      // reference -- this is the same row `requestEntryId` was read from by
+      // the caller, so this is a strict narrowing, not a behavior change for
+      // any correctly-formed call.
       await tx.ledgerEntry.updateMany({
-        where: { userId, reference: depositReference, type: "DEPOSIT_REQUEST" },
+        where: { id: requestEntryId, userId, type: "DEPOSIT_REQUEST" },
         data:  { status: "APPROVED" },
       });
 
@@ -126,7 +153,7 @@ export class LedgerEngine {
         actor:   adminId,
         action:  "deposit.approved",
         entity:  userId,
-        payload: { amount, reference: depositReference, newBalance: newBalance.toNumber() } as object,
+        payload: { amount, requestEntryId, newBalance: newBalance.toNumber() } as object,
       }, tx);
 
       approved = true;
@@ -137,7 +164,7 @@ export class LedgerEngine {
     if (approved) {
       eventBus.emit("wallet.event", {
         userId, type: "CREDIT", amount,
-        reference: `APPROVED:${depositReference}`, timestamp: new Date().toISOString(),
+        reference: `APPROVED:${requestEntryId}`, timestamp: new Date().toISOString(),
       });
       metrics.inc("igfx_deposits_total");
       metrics.inc("deposit_approvals_total");
@@ -187,14 +214,28 @@ export class LedgerEngine {
     return { status: "PENDING_ADMIN", message: "Withdrawal request submitted for review." };
   }
 
-  async approveWithdrawal(userId: string, amount: number, withdrawalReference: string, adminId: string): Promise<void> {
+  /**
+   * CRITICAL_REMEDIATION Phase 1 (C1): `requestEntryId` MUST be the immutable
+   * primary-key `id` of the PENDING_ADMIN WITHDRAW_REQUEST row being
+   * approved -- never `destination` or any other business-meaningful,
+   * client-repeatable string. See approveDeposit()'s docstring for the full
+   * root-cause explanation; this is the identical bug on the withdrawal
+   * side, and is the more severe of the two because it lets a client extract
+   * funds rather than merely lose a credit. Live-reproduced 2026-07-29: a
+   * second $5,000 withdrawal to a destination that had already had one
+   * withdrawal approved was itself "approved" ({"ok":true}) with the
+   * client's wallet balance never debited -- see
+   * CRITICAL_REMEDIATION_REPORT.md, finding C1, for full before/after
+   * database evidence.
+   */
+  async approveWithdrawal(userId: string, amount: number, requestEntryId: string, adminId: string): Promise<void> {
     let approved = false;
 
     // Both the debit and the status update must succeed or fail together.
     // Idempotency guard: if already approved, bail out without double-debiting.
     await this.db.$transaction(async (tx) => {
       const existing = await tx.ledgerEntry.findFirst({
-        where: { userId, reference: `APPROVED:${withdrawalReference}`, type: "WITHDRAW_REQUEST", status: "COMPLETED" },
+        where: { userId, reference: `APPROVED:${requestEntryId}`, type: "WITHDRAW_REQUEST", status: "COMPLETED" },
       });
       if (existing) return;
 
@@ -227,17 +268,19 @@ export class LedgerEngine {
           currency:       "USD",
           amount:         new Decimal(-amount),
           type:           "WITHDRAW_REQUEST",
-          reference:      `APPROVED:${withdrawalReference}`,
+          reference:      `APPROVED:${requestEntryId}`,
           status:         "COMPLETED",
-          note:           `Capital debited from approved withdrawal ${withdrawalReference}`,
+          note:           `Capital debited from approved withdrawal request ${requestEntryId}`,
           runningBalance: newBalance,
           debitAccount:   `CLIENT:${userId}`,
           creditAccount:  "BROKER_FLOAT",
         },
       });
 
+      // CRITICAL_REMEDIATION (C1): match the PENDING_ADMIN request row by its
+      // own immutable id, not by its (repeatable) destination string.
       await tx.ledgerEntry.updateMany({
-        where: { userId, reference: withdrawalReference, type: "WITHDRAW_REQUEST", status: "PENDING_ADMIN" },
+        where: { id: requestEntryId, userId, type: "WITHDRAW_REQUEST", status: "PENDING_ADMIN" },
         data:  { status: "APPROVED" },
       });
 
@@ -249,7 +292,7 @@ export class LedgerEngine {
         actor:   adminId,
         action:  "withdrawal.approved",
         entity:  userId,
-        payload: { amount, reference: withdrawalReference, newBalance: newBalance.toNumber() } as object,
+        payload: { amount, requestEntryId, newBalance: newBalance.toNumber() } as object,
       }, tx);
 
       approved = true;
@@ -260,7 +303,7 @@ export class LedgerEngine {
     if (approved) {
       eventBus.emit("wallet.event", {
         userId, type: "DEBIT", amount,
-        reference: `APPROVED:${withdrawalReference}`, timestamp: new Date().toISOString(),
+        reference: `APPROVED:${requestEntryId}`, timestamp: new Date().toISOString(),
       });
       metrics.inc("igfx_withdrawals_total");
       metrics.inc("withdrawal_approvals_total");
