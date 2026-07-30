@@ -64,7 +64,12 @@ describe("RedisPubSub — market tick relay (MARKET_DATA_FREEZE.md §0.10)", () 
     const pubsub = new RedisPubSub();
     await pubsub.start(vi.fn(), vi.fn(), vi.fn());
 
-    expect(mockSubscribe).toHaveBeenCalledWith("igfx:ws:user", "igfx:ws:broadcast", "igfx:market:tick");
+    // CRITICAL_REMEDIATION (C11): also subscribes to igfx:spread:event now
+    // -- see tests/redis.pubsub.spread.event.relay.spec.ts for dedicated
+    // coverage of that channel.
+    expect(mockSubscribe).toHaveBeenCalledWith(
+      "igfx:ws:user", "igfx:ws:broadcast", "igfx:market:tick", "igfx:spread:event",
+    );
   });
 
   it("connects the duplicated subscriber before subscribing -- PRODUCTION CUTOVER Stage 3 regression guard: duplicate() inherits lazyConnect:true from the base client, so subscribe() must not be called before an explicit connect() resolves, or it fails immediately with enableOfflineQueue false", async () => {

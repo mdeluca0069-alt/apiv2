@@ -4072,13 +4072,24 @@ export const routes: Route[] = [
       if (!b.name || !b.scheduledAt || !b.multiplier)
         return { ok: false, reason: "name, scheduledAt and multiplier are required" };
       const { dynamicSpreadEngine } = await import("../liquidity-engine/dynamic.spread.engine.js");
-      dynamicSpreadEngine.addEvent({
+      const ev = {
         name:          String(b.name),
         assetClasses:  Array.isArray(b.assetClasses) ? b.assetClasses.map(String) : ["ALL"],
         windowMinutes: Number(b.windowMinutes ?? 15),
         multiplier:    Number(b.multiplier),
         scheduledAt:   new Date(String(b.scheduledAt)),
-      });
+      };
+      dynamicSpreadEngine.addEvent(ev);
+      // CRITICAL_REMEDIATION (C11): this admin call previously only reached
+      // whichever single replica handled the HTTP request -- the other
+      // replicas' event calendars never learned about it, so they applied
+      // no event-driven spread widening for the entire window while this
+      // one replica did (same symbol, same instant, deterministically
+      // different bid/ask depending on which replica served a given
+      // request). Relay it to every other replica the same way real market
+      // ticks already are.
+      const { redisPubSub } = await import("../realtime-infra/redis.pubsub.js");
+      void redisPubSub.publishSpreadEvent(ev);
       return { ok: true };
     },
   },

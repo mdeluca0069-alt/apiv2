@@ -45,6 +45,20 @@ const CH_BROADCAST = "igfx:ws:broadcast";
 // same relay class/pattern (workerId self-echo-skip, graceful degradation
 // when Redis is unavailable) rather than a new mechanism.
 const CH_TICK       = "igfx:market:tick";
+// CRITICAL_REMEDIATION (C11): dynamicSpreadEngine (liquidity-engine/dynamic.
+// spread.engine.ts) is, like quoteCache/InternalLiquidityCore above, a
+// per-process singleton with its own in-memory `events` array. POST /admin/
+// spread/event (gateway/routes.ts) previously called addEvent() only on
+// whichever single replica handled that HTTP request -- the other replicas'
+// event calendars never learned about it at all (not delayed, never
+// arriving), so for the entire event window they applied no event-driven
+// spread widening while the one replica that received the admin call did.
+// Same symbol, same instant, deterministically different bid/ask depending
+// on which replica served a given request -- confirmed via code trace, not
+// a race. Reuses this exact relay pattern (workerId self-echo-skip, one-hop
+// only, graceful no-op when Redis is unavailable) for the same reason the
+// tick relay above does.
+const CH_SPREAD_EVENT = "igfx:spread:event";
 
 // ── Worker identity ────────────────────────────────────────────────────────────
 // PM2 sets PM2_INSTANCE_ID or cluster ID. Fall back to a random UUID suffix.
@@ -69,10 +83,24 @@ export type TickEnvelope = {
   ask?:     number;
 };
 
+// CRITICAL_REMEDIATION (C11): mirrors dynamic.spread.engine.ts's SpreadEvent
+// shape, with scheduledAt serialized to an ISO string for JSON transport.
+export type SpreadEventEnvelope = {
+  workerId:      string;
+  name:          string;
+  assetClasses:  string[];
+  windowMinutes: number;
+  multiplier:    number;
+  scheduledAt:   string;
+};
+
 // ── Callbacks ─────────────────────────────────────────────────────────────────
 export type OnUserEvent      = (userId: string, eventType: string, payload: Record<string, unknown>) => void;
 export type OnBroadcastEvent = (eventType: string, payload: Record<string, unknown>) => void;
 export type OnTickEvent      = (symbol: string, mid: number, bid?: number, ask?: number) => void;
+export type OnSpreadEvent    = (ev: {
+  name: string; assetClasses: string[]; windowMinutes: number; multiplier: number; scheduledAt: Date;
+}) => void;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -83,6 +111,7 @@ export class RedisPubSub {
   private onUserEvent?:      OnUserEvent;
   private onBroadcastEvent?: OnBroadcastEvent;
   private onTickEvent?:      OnTickEvent;
+  private onSpreadEvent?:    OnSpreadEvent;
 
   /**
    * Start the subscriber connection and register delivery callbacks.
@@ -92,6 +121,7 @@ export class RedisPubSub {
     onUserEvent:      OnUserEvent,
     onBroadcastEvent: OnBroadcastEvent,
     onTickEvent?:     OnTickEvent,
+    onSpreadEvent?:   OnSpreadEvent,
   ): Promise<void> {
     const redis = getRedis();
     if (!redis) {
@@ -102,6 +132,7 @@ export class RedisPubSub {
     this.onUserEvent      = onUserEvent;
     this.onBroadcastEvent = onBroadcastEvent;
     this.onTickEvent      = onTickEvent;
+    this.onSpreadEvent    = onSpreadEvent;
 
     // Duplicate the shared client — subscriber connections cannot issue
     // non-subscribe commands (SET, GET, PUBLISH, etc.) on the same connection.
@@ -127,7 +158,7 @@ export class RedisPubSub {
     // never a deliberate fallback, it silently broke cross-node WS relay on
     // every boot with a real Redis configured.
     await this.subscriber.connect();
-    await this.subscriber.subscribe(CH_USER, CH_BROADCAST, CH_TICK);
+    await this.subscriber.subscribe(CH_USER, CH_BROADCAST, CH_TICK, CH_SPREAD_EVENT);
 
     this.subscriber.on("message", (channel, raw) => {
       if (channel === CH_TICK) {
@@ -139,6 +170,21 @@ export class RedisPubSub {
         }
         if (tick.workerId === WORKER_ID) return; // skip echo
         this.onTickEvent?.(tick.symbol, tick.mid, tick.bid, tick.ask);
+        return;
+      }
+
+      if (channel === CH_SPREAD_EVENT) {
+        let ev: SpreadEventEnvelope;
+        try {
+          ev = JSON.parse(raw) as SpreadEventEnvelope;
+        } catch {
+          return;
+        }
+        if (ev.workerId === WORKER_ID) return; // skip echo
+        this.onSpreadEvent?.({
+          name: ev.name, assetClasses: ev.assetClasses, windowMinutes: ev.windowMinutes,
+          multiplier: ev.multiplier, scheduledAt: new Date(ev.scheduledAt),
+        });
         return;
       }
 
@@ -160,7 +206,7 @@ export class RedisPubSub {
     });
 
     this.connected = true;
-    console.log(`[redis-pubsub] worker=${WORKER_ID} subscribed to ${CH_USER} + ${CH_BROADCAST} + ${CH_TICK}`);
+    console.log(`[redis-pubsub] worker=${WORKER_ID} subscribed to ${CH_USER} + ${CH_BROADCAST} + ${CH_TICK} + ${CH_SPREAD_EVENT}`);
   }
 
   /** Whether the subscriber connection is active. */
@@ -201,6 +247,24 @@ export class RedisPubSub {
    */
   async publishTick(symbol: string, mid: number, bid?: number, ask?: number): Promise<void> {
     await this._publish(CH_TICK, { workerId: WORKER_ID, symbol, mid, bid, ask });
+  }
+
+  /**
+   * CRITICAL_REMEDIATION (C11) — publish a spread-widening event this
+   * worker's admin route just added to its OWN dynamicSpreadEngine, so
+   * every other worker's engine schedules the identical event and applies
+   * the same multiplier for the same window. Only ever called from the
+   * admin route handler for a LOCALLY-added event (mirrors publishTick's
+   * one-hop-only invariant — never re-published from the receive callback).
+   */
+  async publishSpreadEvent(ev: {
+    name: string; assetClasses: string[]; windowMinutes: number; multiplier: number; scheduledAt: Date;
+  }): Promise<void> {
+    await this._publish(CH_SPREAD_EVENT, {
+      workerId: WORKER_ID, name: ev.name, assetClasses: ev.assetClasses,
+      windowMinutes: ev.windowMinutes, multiplier: ev.multiplier,
+      scheduledAt: ev.scheduledAt.toISOString(),
+    });
   }
 
   async stop(): Promise<void> {

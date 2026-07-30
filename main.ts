@@ -83,6 +83,7 @@ import {
   normaliseSymbol,
 } from "./liquidity-engine/internal.liquidity.core.js";
 import { brokerSpreadConfig } from "./liquidity-engine/broker.spread.config.js";
+import { dynamicSpreadEngine } from "./liquidity-engine/dynamic.spread.engine.js";
 import { exposureRegistry }   from "./risk-service/exposure.limits.js";
 import { logger }             from "./shared/logger.js";
 
@@ -1105,6 +1106,17 @@ function onTickEvent(symbol: string, mid: number, bid?: number, ask?: number): v
   liquidityCore.ingestExternalPrice(symbol, mid, bid, ask, "redis-relay");
 }
 
+// CRITICAL_REMEDIATION (C11): applies a spread-widening event relayed from
+// another worker's admin route call, so this worker's dynamicSpreadEngine
+// schedules the identical event and applies the same multiplier for the
+// same window instead of never learning about it at all. Never re-
+// published (see publishSpreadEvent's own doc comment) -- one-hop relay.
+function onSpreadEvent(ev: {
+  name: string; assetClasses: string[]; windowMinutes: number; multiplier: number; scheduledAt: Date;
+}): void {
+  dynamicSpreadEngine.addEvent(ev);
+}
+
 /**
  * P6 — Push via WebSocket first; only persist to DB outbox if offline.
  *
@@ -1662,7 +1674,7 @@ setTimeout(function retentionJob() {
 // ─── Redis Pub/Sub: cross-node WebSocket delivery ────────────────────────────
 // Start AFTER pushToUser / onUserEvent / onBroadcastEvent are defined above.
 // Gracefully degrades to single-node-only if Redis is unavailable.
-await redisPubSub.start(onUserEvent, onBroadcastEvent, onTickEvent).catch((err) => {
+await redisPubSub.start(onUserEvent, onBroadcastEvent, onTickEvent, onSpreadEvent).catch((err) => {
   console.warn("[redis-pubsub] start failed (single-node mode):", (err as Error).message);
 });
 
