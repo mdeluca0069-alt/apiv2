@@ -10,6 +10,7 @@ import { logger } from "./logger.js";
 import { wafEngine }    from "../security/waf.engine.js";
 import { botDetector }  from "../security/bot.detection.js";
 import { permissionMiddleware } from "../security/permission.middleware.js";
+import { mfaEnforcer } from "../security/mfa.enforcer.js";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
@@ -236,6 +237,40 @@ export function createApiServer(options: ApiServerOptions) {
         if (!permCheck.allowed) {
           sendJson(res, 403, { code: "FORBIDDEN", message: permCheck.reason ?? "Insufficient permissions", requestId });
           return;
+        }
+
+        // CRITICAL_REMEDIATION (C13): permCheck.requiresMFA was computed by
+        // checkRoute() (permission.middleware.ts's ROUTE_PERMISSIONS table
+        // marks every withdrawal/admin-critical/KYC-approval/capital/API-key/
+        // audit-export route requireMFA:true) but was never read by any
+        // caller -- this flag was calculated and then silently discarded on
+        // every request, for every route, always. mfa.enforcer.ts's
+        // checkStepUp()/validateFromHeader() (Redis-backed step-up tokens,
+        // issued by POST /api/v1/auth/mfa/step-up after a real TOTP
+        // verification) were themselves fully implemented but had exactly
+        // one caller anywhere in the codebase: issueStepUp() from that same
+        // issuance endpoint. Nothing ever verified a step-up token before
+        // letting a request through -- confirmed live: an authenticated,
+        // correctly-RBAC-authorized user could call POST /api/v1/withdraw
+        // (or any other requireMFA:true route) with zero MFA step-up ever
+        // performed. This wires the two already-built halves together.
+        if (permCheck.requiresMFA && permPrincipal) {
+          if (!permCheck.mfaOperationClass) {
+            // Route table inconsistency (requireMFA:true with no operation
+            // class) -- fail closed rather than silently skip the check.
+            logger.error({ requestId, method, path: url.pathname }, "requireMFA route missing mfaOperationClass");
+            sendJson(res, 403, { code: "MFA_CONFIG_ERROR", message: "MFA step-up misconfigured for this route", requestId });
+            return;
+          }
+          const stepUp = await mfaEnforcer.validateFromHeader(
+            req.headers as Record<string, string | string[] | undefined>,
+            permPrincipal.sub,
+            permCheck.mfaOperationClass,
+          );
+          if (!stepUp.valid) {
+            sendJson(res, 403, { code: "MFA_STEPUP_REQUIRED", message: stepUp.reason, requestId });
+            return;
+          }
         }
 
         // ── Rate limiting ─────────────────────────────────────────────────

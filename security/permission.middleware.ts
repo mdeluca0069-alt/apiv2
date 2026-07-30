@@ -10,6 +10,7 @@
 
 import { rbacEngine, type Resource, type Action, type RoleName } from "./rbac.engine.js";
 import type { TokenPayload } from "../shared/security.js";
+import type { MFAOperationClass } from "./mfa.enforcer.js";
 
 // ─── Route Permission Registry ────────────────────────────────────────────────
 
@@ -18,6 +19,10 @@ export type RoutePermission = {
   action:           Action;
   extractOwnerId?:  (path: string, body: unknown) => string | undefined;
   requireMFA?:      boolean;
+  // CRITICAL_REMEDIATION (C13): which mfa.enforcer.ts step-up bucket this
+  // route's requireMFA:true refers to. Required whenever requireMFA is
+  // true -- see checkRoute()'s dev-time assertion below.
+  mfaOperationClass?: MFAOperationClass;
   sensitivityLevel: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 };
 
@@ -33,14 +38,14 @@ const ROUTE_PERMISSIONS: Array<[string, RegExp, RoutePermission]> = [
 
   // ── Wallet ─────────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/wallet/,                             { resource: "wallet",   action: "read",       sensitivityLevel: "MEDIUM" }],
-  ["POST",   /^\/api\/v1\/withdraw/,                           { resource: "wallet",   action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true }],
+  ["POST",   /^\/api\/v1\/withdraw/,                           { resource: "wallet",   action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "WITHDRAWAL" }],
   ["POST",   /^\/api\/v1\/deposit/,                            { resource: "wallet",   action: "write",      sensitivityLevel: "HIGH" }],
   ["GET",    /^\/api\/v1\/ledger/,                             { resource: "wallet",   action: "read",       sensitivityLevel: "MEDIUM" }],
 
   // ── KYC ───────────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/kyc/,                                { resource: "kyc",      action: "read",       sensitivityLevel: "MEDIUM" }],
   ["POST",   /^\/api\/v1\/kyc/,                                { resource: "kyc",      action: "write",      sensitivityLevel: "HIGH" }],
-  ["POST",   /^\/api\/v1\/admin\/kyc/,                         { resource: "kyc",      action: "approve",    sensitivityLevel: "CRITICAL", requireMFA: true }],
+  ["POST",   /^\/api\/v1\/admin\/kyc/,                         { resource: "kyc",      action: "approve",    sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "KYC_APPROVAL" }],
 
   // ── Signals ────────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/signals/,                            { resource: "signals",  action: "read",       sensitivityLevel: "LOW" }],
@@ -52,37 +57,37 @@ const ROUTE_PERMISSIONS: Array<[string, RegExp, RoutePermission]> = [
   ["POST",   /^\/api\/v1\/autopilot\/consent/,                 { resource: "autopilot", action: "write",     sensitivityLevel: "HIGH" }],
 
   // ── Admin: Risk ────────────────────────────────────────────────────────────
-  ["POST",   /^\/api\/v1\/trading\/kill-switch/,               { resource: "risk",     action: "override",   sensitivityLevel: "CRITICAL", requireMFA: true }],
-  ["POST",   /^\/api\/v1\/admin\/risk/,                        { resource: "risk",     action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true }],
+  ["POST",   /^\/api\/v1\/trading\/kill-switch/,               { resource: "risk",     action: "override",   sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
+  ["POST",   /^\/api\/v1\/admin\/risk/,                        { resource: "risk",     action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
   ["GET",    /^\/api\/v1\/admin\/risk/,                        { resource: "risk",     action: "read",       sensitivityLevel: "HIGH" }],
 
   // ── Admin: Users ───────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/admin\/users/,                       { resource: "users",    action: "read",       sensitivityLevel: "HIGH" }],
-  ["POST",   /^\/api\/v1\/admin\/users/,                       { resource: "users",    action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true }],
-  ["DELETE", /^\/api\/v1\/admin\/users/,                       { resource: "users",    action: "delete",     sensitivityLevel: "CRITICAL", requireMFA: true }],
-  ["POST",   /^\/api\/v1\/admin\/trading\/pause/,              { resource: "trading",  action: "override",   sensitivityLevel: "CRITICAL", requireMFA: true }],
+  ["POST",   /^\/api\/v1\/admin\/users/,                       { resource: "users",    action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
+  ["DELETE", /^\/api\/v1\/admin\/users/,                       { resource: "users",    action: "delete",     sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
+  ["POST",   /^\/api\/v1\/admin\/trading\/pause/,              { resource: "trading",  action: "override",   sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
 
   // ── Admin: Compliance ──────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/admin\/compliance/,                  { resource: "compliance", action: "read",     sensitivityLevel: "HIGH" }],
-  ["POST",   /^\/api\/v1\/admin\/compliance/,                  { resource: "compliance", action: "write",    sensitivityLevel: "CRITICAL", requireMFA: true }],
+  ["POST",   /^\/api\/v1\/admin\/compliance/,                  { resource: "compliance", action: "write",    sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
 
   // ── Audit ──────────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/admin\/audit/,                       { resource: "audit",    action: "read",       sensitivityLevel: "HIGH" }],
-  ["GET",    /^\/api\/v1\/admin\/audit.*export/,               { resource: "audit",    action: "export",     sensitivityLevel: "CRITICAL", requireMFA: true }],
+  ["GET",    /^\/api\/v1\/admin\/audit.*export/,               { resource: "audit",    action: "export",     sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "AUDIT_EXPORT" }],
 
   // ── Capital ────────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/admin\/capital/,                     { resource: "capital",  action: "read",       sensitivityLevel: "HIGH" }],
-  ["POST",   /^\/api\/v1\/admin\/capital/,                     { resource: "capital",  action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true }],
+  ["POST",   /^\/api\/v1\/admin\/capital/,                     { resource: "capital",  action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "CAPITAL_OPERATION" }],
 
   // ── Settings ───────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/settings/,                           { resource: "settings", action: "read",       sensitivityLevel: "LOW" }],
   ["POST",   /^\/api\/v1\/settings/,                           { resource: "settings", action: "write",      sensitivityLevel: "HIGH" }],
-  ["POST",   /^\/api\/v1\/admin\/settings/,                    { resource: "settings", action: "configure",  sensitivityLevel: "CRITICAL", requireMFA: true }],
+  ["POST",   /^\/api\/v1\/admin\/settings/,                    { resource: "settings", action: "configure",  sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
 
   // ── API Keys ───────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/api-keys/,                           { resource: "api_keys", action: "read",       sensitivityLevel: "MEDIUM" }],
-  ["POST",   /^\/api\/v1\/api-keys/,                           { resource: "api_keys", action: "write",      sensitivityLevel: "HIGH",     requireMFA: true }],
-  ["DELETE", /^\/api\/v1\/api-keys/,                           { resource: "api_keys", action: "delete",     sensitivityLevel: "HIGH",     requireMFA: true }],
+  ["POST",   /^\/api\/v1\/api-keys/,                           { resource: "api_keys", action: "write",      sensitivityLevel: "HIGH",     requireMFA: true, mfaOperationClass: "API_KEY_MANAGEMENT" }],
+  ["DELETE", /^\/api\/v1\/api-keys/,                           { resource: "api_keys", action: "delete",     sensitivityLevel: "HIGH",     requireMFA: true, mfaOperationClass: "API_KEY_MANAGEMENT" }],
 
   // ── Reports ────────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/reports/,                            { resource: "reports",  action: "read",       sensitivityLevel: "MEDIUM" }],
@@ -135,6 +140,7 @@ export type PermissionCheckResult = {
   reason:           string;
   permission?:      RoutePermission;
   requiresMFA?:     boolean;
+  mfaOperationClass?: MFAOperationClass;
 };
 
 // ─── Permission Middleware ────────────────────────────────────────────────────
@@ -190,6 +196,7 @@ export class PermissionMiddleware {
       reason:       authResult.reason,
       permission:   match,
       requiresMFA:  match.requireMFA === true,
+      mfaOperationClass: match.mfaOperationClass,
     };
   }
 
