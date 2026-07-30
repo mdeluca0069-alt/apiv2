@@ -1272,6 +1272,18 @@ export const routes: Route[] = [
       const parsed = ClientWithdrawRequestSchema.parse(body);
 
       if (process.env.DATABASE_URL) {
+        // CRITICAL_REMEDIATION (C15): withdrawals were never AML-screened
+        // at all -- transactionMonitor.monitor() had exactly one call site
+        // in the whole codebase, on the deposit route above. AmlEngine's
+        // own RAPID_DEPOSIT_WITHDRAWAL detection (compliance-engine/aml.
+        // engine.ts) exists specifically for transactionType==="WITHDRAWAL"
+        // but could never fire, since nothing ever called assess() with
+        // that type. Mirrors the deposit route's screening exactly.
+        const aml = await transactionMonitor.monitor(principal.sub, parsed.amount, "WITHDRAWAL");
+        if (aml.riskLevel === "CRITICAL") {
+          return { ok: false, reason: "COMPLIANCE_HOLD", amlFlags: aml.flags };
+        }
+
         // Persistent: real LedgerEngine — writes to DB, produces AuditLog
         const db = (await import("../shared/db.js")).prisma;
         const engine = new LedgerEngine(db as NonNullable<typeof db>);

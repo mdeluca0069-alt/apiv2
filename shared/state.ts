@@ -1076,8 +1076,77 @@ export class BrokerState {
     void this.persistBrokerSetting("featureFlagsOverride", this._featureFlagsOverride);
   }
 
-  getAmlAlerts(): AmlAlert[] {
-    // Seed from ledger: high-value deposits/withdrawals that were flagged
+  /**
+   * CRITICAL_REMEDIATION (C14): this used to derive alerts ENTIRELY from a
+   * crude re-scan of legacy in-memory clientAccounts ledgers (amount >=
+   * 10000 only) -- structurally disconnected from AmlEngine (compliance-
+   * engine/aml.engine.ts), which runs real structuring/frequency/rapid-
+   * cycle-detection heuristics on every screened transaction and persists
+   * its findings to AuditLog (actor="AML_ENGINE"). Confirmed via code
+   * trace: nothing ever read those AML_ENGINE audit rows anywhere --
+   * GET /admin/aml-alerts (the actual compliance dashboard endpoint) only
+   * ever called this method, which never queried them. A compliance
+   * officer using this dashboard could never see a STRUCTURING_PATTERN,
+   * HIGH_FREQUENCY_DEPOSITS, or RAPID_DEPOSIT_WITHDRAWAL flag -- the
+   * findings AmlEngine actually exists to produce -- only a much weaker,
+   * independently-reinvented "amount >= 10000" rule.
+   *
+   * Fix: in persistent mode, source alerts from AmlEngine's own audit
+   * trail (the real, canonical record of every non-LOW assessment) instead
+   * of re-deriving a separate, weaker signal. Review status (PENDING/
+   * REVIEWED/CLEARED) is still tracked via the existing in-memory
+   * _amlAlerts overlay -- reviewAmlAlert() is unchanged -- so an alert
+   * already reviewed keeps its status across repeated calls within this
+   * process's lifetime. The legacy ledger-derived seeding remains the
+   * sandbox/non-persistent fallback, unchanged, preserving demo-mode
+   * behavior.
+   */
+  async getAmlAlerts(): Promise<AmlAlert[]> {
+    if (IS_PERSISTENT && this.prisma) {
+      const rows = await this.prisma.auditLog.findMany({
+        where: {
+          actor:  "AML_ENGINE",
+          action: { in: ["aml.assessment.medium", "aml.assessment.high", "aml.assessment.critical"] },
+        },
+        orderBy: { createdAt: "desc" },
+        take: 500,
+      });
+
+      const userIds = [...new Set(rows.map((r) => r.entity))];
+      const users = userIds.length
+        ? await this.prisma.user.findMany({
+            where:  { id: { in: userIds } },
+            select: { id: true, fullName: true, email: true },
+          })
+        : [];
+      const userById = new Map(users.map((u) => [u.id, u]));
+
+      for (const row of rows) {
+        const id = `AML-${row.id.slice(0, 8).toUpperCase()}`;
+        if (this._amlAlerts.has(id)) continue; // preserve any existing review status
+        const payload = row.payload as { amount?: number; risk?: string; flags?: { code: string }[] };
+        const user = userById.get(row.entity);
+        this._amlAlerts.set(id, {
+          id,
+          userId:   row.entity,
+          userName: user?.fullName ?? "Unknown",
+          email:    user?.email ?? "unknown",
+          type:     payload.risk === "CRITICAL" ? "HIGH_VALUE"
+            : payload.flags?.some((f) => f.code === "STRUCTURING_PATTERN" || f.code === "RAPID_DEPOSIT_WITHDRAWAL") ? "SUSPICIOUS"
+            : "FREQUENT",
+          amount:    payload.amount ?? 0,
+          timestamp: row.createdAt.toISOString(),
+          status:    "PENDING",
+        });
+      }
+
+      return [...this._amlAlerts.values()]
+        .filter((a) => rows.some((r) => `AML-${r.id.slice(0, 8).toUpperCase()}` === a.id))
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    }
+
+    // Sandbox fallback: seed from ledger, high-value deposits/withdrawals only
+    // (unchanged legacy behavior -- no AmlEngine/DB available in this mode).
     if (this._amlAlerts.size === 0) {
       for (const account of this.clientAccounts.values()) {
         for (const entry of account.ledger) {
