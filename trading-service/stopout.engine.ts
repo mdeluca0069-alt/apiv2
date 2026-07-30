@@ -55,6 +55,13 @@ export type StopOutResult = {
   /** FASE 4.2 (Bug #5): positions skipped because their symbol's quote is
    *  stale or missing -- only meaningful for action="STOP_OUT". */
   skippedStale?: number;
+  /** CRITICAL_REMEDIATION (C7): number of OPEN positions (any action) whose
+   *  quote was stale/missing when this check ran -- their true P&L is
+   *  unknown and contributed 0 to marginLevel below, meaning this result's
+   *  action/marginLevel cannot be trusted as a complete risk picture while
+   *  this is nonzero. Present regardless of `action`, unlike skippedStale
+   *  (which only exists for the STOP_OUT branch's liquidation loop). */
+  staleDataPositions?: number;
 };
 
 export type StopOutScanReport = {
@@ -190,10 +197,49 @@ export class StopOutEngine {
     const marginUsed  = locked;
     const marginLevel = marginUsed > 0 ? (equity / marginUsed) * 100 : Infinity;
 
+    // CRITICAL_REMEDIATION (C7): stale-quote positions contribute pnl=0 to
+    // marginLevel above (Bug #5's fix, correctly preventing a fabricated
+    // exit price) -- but that same fallback also makes marginLevel BLIND to
+    // that position's real risk. A position genuinely deep underwater on a
+    // symbol whose feed died is reported identically to a flat position:
+    // marginLevel looks healthy, WARNING/MARGIN_CALL/STOP_OUT never fire,
+    // and this account's true exposure grows unchecked for as long as the
+    // outage lasts -- confirmed via code trace, and directly demonstrated
+    // by the new stale-data-risk test below (a position that would be
+    // -80,000 at its real cached price reports action="NONE" today).
+    //
+    // Fix: never claim to have verified this account's margin safety while
+    // any open position's quote is stale/missing. This does NOT change the
+    // marginLevel number itself (still no fabricated price) and does NOT
+    // change liquidation behaviour (a stale position is still never settled
+    // -- see the skippedStale loop below) -- it only ensures a human (risk
+    // desk) is alerted that automated monitoring is degraded for this
+    // account, rather than the system silently reporting "NONE" and moving
+    // on. alertManager.send() already dedupes identical (type, severity)
+    // alerts for 5 minutes, so a sustained outage does not spam.
+    const staleDataPositions = positionsWithPnl.filter((p) => p.staleOrMissing).length;
+    if (staleDataPositions > 0) {
+      metrics.inc("stop_out_stale_data_risk_total", staleDataPositions);
+      const staleSymbols = [...new Set(
+        positionsWithPnl.filter((p) => p.staleOrMissing).map((p) => p.symbol),
+      )];
+      void alertManager.send({
+        type:     "STOP_OUT",
+        severity: "CRITICAL",
+        title:    "Margin Health Unverifiable — Stale Market Data",
+        message:  `User ${userId} has ${staleDataPositions} open position(s) on stale/missing-quote ` +
+          `symbol(s) [${staleSymbols.join(", ")}]. Their real unrealized P&L is unknown and is being ` +
+          `treated as 0 in this account's margin-level calculation (reported marginLevel=` +
+          `${Number.isFinite(marginLevel) ? marginLevel.toFixed(1) + "%" : "n/a"}) -- this account's ` +
+          `true risk level cannot be automatically verified until the feed recovers. Manual review recommended.`,
+        metadata: { userId, staleSymbols, reportedMarginLevel: Number.isFinite(marginLevel) ? marginLevel.toFixed(2) : "n/a" },
+      });
+    }
+
     // ── Action resolution ─────────────────────────────────────────────────────
 
     if (!Number.isFinite(marginLevel) || marginLevel >= WARNING_PCT) {
-      return { userId, marginLevel, action: "NONE", liquidated: 0, totalPnl: 0, triggeredAt };
+      return { userId, marginLevel, action: "NONE", liquidated: 0, totalPnl: 0, triggeredAt, staleDataPositions };
     }
 
     // Emit warning notification at 150%
@@ -208,7 +254,7 @@ export class StopOutEngine {
         userId, marginLevelPct: marginLevel, freeMargin: Math.max(0, equity - marginUsed),
         equity, marginUsed, threshold: "WARNING", timestamp: triggeredAt,
       });
-      return { userId, marginLevel, action: "WARNING", liquidated: 0, totalPnl: 0, triggeredAt };
+      return { userId, marginLevel, action: "WARNING", liquidated: 0, totalPnl: 0, triggeredAt, staleDataPositions };
     }
 
     // Restrict new orders at 100% (margin call level)
@@ -231,7 +277,7 @@ export class StopOutEngine {
         userId, marginLevelPct: marginLevel, freeMargin: Math.max(0, equity - marginUsed),
         equity, marginUsed, threshold: "MARGIN_CALL", timestamp: triggeredAt,
       });
-      return { userId, marginLevel, action: "MARGIN_CALL", liquidated: 0, totalPnl: 0, triggeredAt };
+      return { userId, marginLevel, action: "MARGIN_CALL", liquidated: 0, totalPnl: 0, triggeredAt, staleDataPositions };
     }
 
     // ── STOP-OUT: liquidate the minimal necessary positions ───────────────────
@@ -408,7 +454,7 @@ export class StopOutEngine {
       metadata: { userId, marginLevel: marginLevel.toFixed(2), positions: liquidated, totalPnl: totalPnl.toFixed(2) },
     });
 
-    return { userId, marginLevel, action: "STOP_OUT", liquidated, totalPnl, triggeredAt, skippedHalted, skippedStale };
+    return { userId, marginLevel, action: "STOP_OUT", liquidated, totalPnl, triggeredAt, skippedHalted, skippedStale, staleDataPositions };
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
