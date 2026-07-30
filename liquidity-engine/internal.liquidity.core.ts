@@ -450,11 +450,42 @@ export class InternalLiquidityCore {
     // Apply dynamic spread widening (volatility or event-driven).
     // Only applied when the feed did NOT provide real bid/ask (i.e. free-plan mid-only).
     // When real bid/ask are provided we widen only if there's actual volatility (mult > 1.05).
+    //
+    // CRITICAL_REMEDIATION (C10): dynMult used to be computed as
+    // `applySpread(...) / getEffectiveSpread(...)`. applySpread() computes
+    // AND STORES the effective spread as its very last step before
+    // returning it, so the immediately-following getEffectiveSpread() call
+    // reads back that exact same value it was just set to -- the division
+    // is mathematically guaranteed to equal 1.0 on every single call,
+    // regardless of actual volatility or event state. Confirmed via code
+    // trace (dynamic.spread.engine.ts's applySpread()/getEffectiveSpread())
+    // and directly demonstrated by the new test below: a >1% price jump
+    // that should trigger FX_MAJOR's volatility widening (threshold 0.15%)
+    // left the real bid/ask spread completely unchanged on pristine code.
+    // Net effect: the `hasRealBA && dynMult > 1.05` branch below -- the
+    // path used whenever the feed provides real bid/ask, i.e. the common,
+    // paid-plan case -- could never fire. Spread widening during genuine
+    // volatility or scheduled high-impact events silently never happened
+    // for any symbol with real market bid/ask data.
+    //
+    // Fix: applySpread() is still called every tick (its side effects --
+    // storing state, audit-logging significant changes -- must still run),
+    // but dynMult now comes from getMultiplier(), the API this engine
+    // already exposes for exactly this purpose ("current multiplier, 1.0 =
+    // no widening") instead of a self-cancelling division.
+    //
+    // NOTE (staged rollout): this activates real spread-widening behavior
+    // for real-bid/ask symbols for the first time -- see
+    // CRITICAL_REMEDIATION_REPORT.md for the recommended monitored rollout
+    // given this path has never executed in production. The existing
+    // per-asset-class maxSpreadMultiplier caps in dynamic.spread.engine.ts
+    // (unchanged by this fix) already bound how far any single tick can
+    // widen a spread.
     const preChangePct = state.prevCloseMid > 0
       ? (externalMid - state.prevCloseMid) / state.prevCloseMid * 100
       : 0;
-    const dynMult   = dynamicSpreadEngine.applySpread(key, preChangePct, ac) /
-                      Math.max(dynamicSpreadEngine.getEffectiveSpread(key), 0.000001);
+    dynamicSpreadEngine.applySpread(key, preChangePct, ac);
+    const dynMult   = dynamicSpreadEngine.getMultiplier(key);
     const hasRealBA = externalBid !== undefined && externalAsk !== undefined;
     if (!hasRealBA && dynMult > 0) {
       const bs = dynamicSpreadEngine.getEffectiveSpread(key);

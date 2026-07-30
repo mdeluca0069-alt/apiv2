@@ -194,9 +194,17 @@ describe("InternalLiquidityCore — source-of-truth chain", () => {
   // ── 7. External price anchor propagates through the core ─────────────────
 
   it("ingestExternalPrice immediately sets mid to the real price", () => {
-    const externalMid = 1.09000;
-    const externalBid = 1.08990;
-    const externalAsk = 1.09010;
+    // CRITICAL_REMEDIATION (C10): kept close to EURUSD's synthetic
+    // construction-time seed (1.1504, this module's own basePrices table)
+    // so this tick's price move relative to prevCloseMid stays under
+    // FX_MAJOR's volatility threshold and dynamic spread widening does not
+    // engage -- this test's purpose is proving a direct, unblended
+    // pass-through of the real price, not spread-widening behavior (which
+    // has its own dedicated coverage in
+    // internal.liquidity.core.dynamic.spread.spec.ts).
+    const externalMid = 1.15040;
+    const externalBid = 1.15030;
+    const externalAsk = 1.15050;
 
     core.ingestExternalPrice("EURUSD", externalMid, externalBid, externalAsk);
 
