@@ -99,4 +99,51 @@ describe("BrokerState — single source of truth for quotes (MARKET_DATA_FREEZE.
     expect(state.getQuote("NOT_A_REAL_SYMBOL")).toBeNull();
     expect(state.getLiquidityBook("NOT_A_REAL_SYMBOL")).toBeNull();
   });
+
+  describe("CRITICAL_REMEDIATION (C9): getQuote()/getQuotes() never forge a fresh ts onto a stale cached price", () => {
+    it("getQuote() returns the quote's REAL ts, not the current time, when the underlying feed is old", () => {
+      const state = new BrokerState({ secret: "test", liveTradingEnabled: false });
+      const realTs = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(); // 6h old
+      quoteCache.set({ ...liveQuote(SYMBOL, 1.2345), ts: realTs, isStale: true });
+
+      const quote = state.getQuote(SYMBOL);
+
+      expect(quote!.ts).toBe(realTs);
+      expect(quote!.ts).not.toBe(new Date().toISOString().slice(0, 10)); // sanity: not today's fresh stamp either
+    });
+
+    it("getQuotes() likewise preserves the real ts for every symbol, not just getQuote()", () => {
+      const state = new BrokerState({ secret: "test", liveTradingEnabled: false });
+      const realTs = new Date(Date.now() - 45 * 60 * 1000).toISOString(); // 45min old
+      quoteCache.set({ ...liveQuote(SYMBOL, 1.3000), ts: realTs, isStale: true });
+
+      const fromList = state.getQuotes().find((q) => q.symbol === SYMBOL)!;
+
+      expect(fromList.ts).toBe(realTs);
+    });
+
+    it("does not silently contradict isStale: a stale-flagged quote's ts must actually be old, not 'now'", () => {
+      const state = new BrokerState({ secret: "test", liveTradingEnabled: false });
+      const realTs = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      quoteCache.set({ ...liveQuote(SYMBOL, 1.5000), ts: realTs, isStale: true });
+
+      const quote = state.getQuote(SYMBOL)!;
+
+      expect(quote.isStale).toBe(true);
+      // The whole point: isStale:true alongside a ts claiming "just now" is
+      // self-contradictory and defeats any consumer that judges freshness
+      // from ts directly -- this is exactly what used to happen.
+      expect(Date.now() - new Date(quote.ts).getTime()).toBeGreaterThan(59 * 60 * 1000);
+    });
+
+    it("a genuinely fresh quote's ts is still passed through unmodified (not just 'not overwritten to now')", () => {
+      const state = new BrokerState({ secret: "test", liveTradingEnabled: false });
+      const q = liveQuote(SYMBOL, 1.1000);
+      quoteCache.set(q);
+
+      const quote = state.getQuote(SYMBOL)!;
+
+      expect(quote.ts).toBe(q.ts);
+    });
+  });
 });

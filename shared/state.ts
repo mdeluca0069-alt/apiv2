@@ -2034,8 +2034,23 @@ export class BrokerState {
     const precision = instrument?.precision ?? 2;
     // Prefer the live price from the liquidity core (via quoteCache) over the
     // hardcoded base price so the REST API reflects real market levels.
+    //
+    // CRITICAL_REMEDIATION (C9): this used to return `{ ...liveQuote, ts:
+    // new Date().toISOString() }` -- stamping "now" onto a price that may
+    // be arbitrarily old (the underlying feed can die silently; quoteCache
+    // keeps serving its last-known entry indefinitely, see quoteCache.
+    // isStale()). Confirmed via code trace: liveQuote.isStale is already
+    // kept live-accurate by internal.liquidity.core.ts's periodic re-
+    // broadcast (see tests/quote.isstale.propagation.spec.ts), so the price
+    // and staleness flag returned here were never wrong -- only ts was
+    // fabricated, which is self-contradictory (isStale:true alongside a
+    // timestamp claiming the price was just observed) and silently defeats
+    // any consumer that judges freshness from ts directly instead of/in
+    // addition to isStale. The synthetic branch below legitimately sets
+    // ts=now, because that price genuinely is computed fresh right now;
+    // this is not that case. Fix: pass the real, unmodified quote through.
     const liveQuote = quoteCache.get(symbol);
-    if (liveQuote) return { ...liveQuote, ts: new Date().toISOString() };
+    if (liveQuote) return { ...liveQuote };
     const base = basePrices[symbol] ?? 100;
     const wave = Math.sin((tick + symbol.length * 7) / 12) * 0.0015;
     const jitter = Math.cos((tick + symbol.charCodeAt(0)) / 8) * 0.0008;
