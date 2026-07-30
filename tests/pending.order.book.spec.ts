@@ -32,11 +32,27 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // ── Mock declarations (vi.hoisted ensures they exist before vi.mock factory runs) ──
 
-const { mockUpsert, mockFindMany, emitSpy } = vi.hoisted(() => ({
-  mockUpsert:  vi.fn().mockResolvedValue({ key: "", value: {} }),
-  mockFindMany: vi.fn().mockResolvedValue([]),
-  emitSpy:     vi.fn(),
-}));
+const { mockUpsert, mockFindMany, mockExecuteRaw, claimedKeys, emitSpy } = vi.hoisted(() => {
+  const claimedKeys = new Set<string>();
+  return {
+    mockUpsert:  vi.fn().mockResolvedValue({ key: "", value: {} }),
+    mockFindMany: vi.fn().mockResolvedValue([]),
+    // CRITICAL_REMEDIATION (C6): markTriggered() now atomically claims the
+    // persisted row via $executeRaw before committing TRIGGERED locally.
+    // A real Postgres UPDATE ... WHERE value->>'status'='PENDING' only
+    // ever lets ONE caller affect the row per key -- this mock reproduces
+    // that same one-claim-per-key semantics (rather than always
+    // succeeding) so tests can genuinely exercise "another replica/call
+    // already claimed this order" without relying on real Postgres.
+    mockExecuteRaw: vi.fn(async (_strings: TemplateStringsArray, key: string) => {
+      if (claimedKeys.has(key)) return 0;
+      claimedKeys.add(key);
+      return 1;
+    }),
+    claimedKeys,
+    emitSpy: vi.fn(),
+  };
+});
 
 vi.mock("../shared/db.js", () => ({
   IS_PERSISTENT: true,
@@ -45,6 +61,7 @@ vi.mock("../shared/db.js", () => ({
       upsert:   mockUpsert,
       findMany: mockFindMany,
     },
+    $executeRaw: mockExecuteRaw,
   },
 }));
 
@@ -58,9 +75,9 @@ import { pendingOrderBook } from "../trading-service/pending.order.book.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function cleanBook(): void {
+async function cleanBook(): Promise<void> {
   for (const order of pendingOrderBook.getAll()) {
-    pendingOrderBook.markTriggered(order.id);
+    await pendingOrderBook.markTriggered(order.id);
   }
 }
 
@@ -99,15 +116,16 @@ function makeOrder(
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   mockUpsert.mockResolvedValue({ key: "", value: {} });
   mockFindMany.mockResolvedValue([]);
-  cleanBook();
+  claimedKeys.clear();
+  await cleanBook();
 });
 
-afterEach(() => {
-  cleanBook();
+afterEach(async () => {
+  await cleanBook();
 });
 
 // ─── 1. add() — basic fields ──────────────────────────────────────────────────
@@ -269,7 +287,7 @@ describe("getAll() / getBySymbol() / getForUser()", () => {
     const b = await pendingOrderBook.add(makeOrder({ symbol: "GBPUSD" }));
 
     // Mark one as triggered (remove from PENDING)
-    pendingOrderBook.markTriggered(a.id);
+    await pendingOrderBook.markTriggered(a.id);
 
     const all = pendingOrderBook.getAll();
     expect(all.some((o) => o.id === b.id)).toBe(true);
@@ -349,7 +367,7 @@ describe("cancel()", () => {
 
   it("returns false if order already triggered (status not PENDING)", async () => {
     const order = await pendingOrderBook.add(makeOrder({ userId: "user-Z" }));
-    pendingOrderBook.markTriggered(order.id); // status → TRIGGERED, deleted from map
+    await pendingOrderBook.markTriggered(order.id); // status → TRIGGERED, deleted from map
 
     const result = await pendingOrderBook.cancel(order.id, "user-Z");
     expect(result).toBe(false);
@@ -362,7 +380,7 @@ describe("markTriggered()", () => {
 
   it("returns the removed PendingOrder on first call", async () => {
     const order = await pendingOrderBook.add(makeOrder());
-    const removed = pendingOrderBook.markTriggered(order.id);
+    const removed = await pendingOrderBook.markTriggered(order.id);
 
     expect(removed).not.toBeNull();
     expect(removed!.id).toBe(order.id);
@@ -370,34 +388,46 @@ describe("markTriggered()", () => {
 
   it("removes order from in-memory book", async () => {
     const order = await pendingOrderBook.add(makeOrder());
-    pendingOrderBook.markTriggered(order.id);
+    await pendingOrderBook.markTriggered(order.id);
 
     expect(pendingOrderBook.getAll().some((o) => o.id === order.id)).toBe(false);
   });
 
-  it("is idempotent: second call returns null (duplicate trigger prevention)", async () => {
+  it("is idempotent: a second, later call for the same (now-removed) order returns null", async () => {
     const order = await pendingOrderBook.add(makeOrder());
-    const first  = pendingOrderBook.markTriggered(order.id);
-    const second = pendingOrderBook.markTriggered(order.id);
+    const first  = await pendingOrderBook.markTriggered(order.id);
+    const second = await pendingOrderBook.markTriggered(order.id);
 
     expect(first).not.toBeNull();
     expect(second).toBeNull();
   });
 
-  it("concurrent trigger simulation: only first caller wins", async () => {
+  // CRITICAL_REMEDIATION (C6): this is the direct regression test for the
+  // cross-replica duplicate-fill bug. It fires three concurrent (not
+  // sequentially awaited) markTriggered() calls for the SAME order id --
+  // simulating three replicas whose watchers all observed the same price
+  // tick and all still see the order as PENDING in their own local memory,
+  // exactly as described in markTriggered()'s docstring. The stateful
+  // mockExecuteRaw above reproduces Postgres's real row-level locking
+  // semantics (only one UPDATE ... WHERE status='PENDING' can ever affect
+  // the row), so this proves the claim -- not JS's single-threadedness --
+  // is what makes exactly one caller win.
+  it("CRITICAL_REMEDIATION (C6): three concurrent callers racing the same order -- exactly one wins, not JS execution order", async () => {
     const order = await pendingOrderBook.add(makeOrder());
 
-    // In JS, these execute synchronously so the first wins
-    const r1 = pendingOrderBook.markTriggered(order.id);
-    const r2 = pendingOrderBook.markTriggered(order.id);
-    const r3 = pendingOrderBook.markTriggered(order.id);
+    const [r1, r2, r3] = await Promise.all([
+      pendingOrderBook.markTriggered(order.id),
+      pendingOrderBook.markTriggered(order.id),
+      pendingOrderBook.markTriggered(order.id),
+    ]);
 
-    const successes = [r1, r2, r3].filter(Boolean);
+    const successes = [r1, r2, r3].filter((r) => r !== null);
     expect(successes.length).toBe(1);
+    expect(mockExecuteRaw).toHaveBeenCalledTimes(3);
   });
 
-  it("returns null for non-existent id", () => {
-    expect(pendingOrderBook.markTriggered("ghost")).toBeNull();
+  it("returns null for non-existent id", async () => {
+    expect(await pendingOrderBook.markTriggered("ghost")).toBeNull();
   });
 });
 
@@ -504,7 +534,7 @@ describe("updateTrailingStops()", () => {
     expect(callCountAfter).toBe(callCount);
 
     // Clean up
-    pendingOrderBook.markTriggered(order.id);
+    await pendingOrderBook.markTriggered(order.id);
   });
 });
 
@@ -562,7 +592,7 @@ describe("OCO cascade", () => {
 
     // legA "triggers" — caller (order.trigger.watcher.ts) removes it via
     // markTriggered() first, then asks the book to cancel legA's sibling(s).
-    pendingOrderBook.markTriggered(legA.id);
+    await pendingOrderBook.markTriggered(legA.id);
     await pendingOrderBook.cancelOcoSiblingsOnTrigger(legA.id, groupId);
 
     expect(pendingOrderBook.getAll().some((o) => o.id === legB.id)).toBe(false);
@@ -590,7 +620,7 @@ describe("OCO cascade", () => {
     await pendingOrderBook.cancel(legB.id, "user-1");
     vi.clearAllMocks();
 
-    pendingOrderBook.markTriggered(legA.id);
+    await pendingOrderBook.markTriggered(legA.id);
     await expect(pendingOrderBook.cancelOcoSiblingsOnTrigger(legA.id, groupId)).resolves.toBeUndefined();
 
     // No spurious second cancellation emitted for legB.

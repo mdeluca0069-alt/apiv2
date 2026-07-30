@@ -190,14 +190,90 @@ class PendingOrderBook {
     });
   }
 
-  markTriggered(pendingId: string): PendingOrder | null {
+  /**
+   * CRITICAL_REMEDIATION (C6): cross-replica duplicate order fill.
+   *
+   * Root cause, confirmed via code trace (this codebase runs 3 API
+   * replicas): `orders` is a private, per-process Map. Every replica loads
+   * the SAME set of PENDING orders from the DB independently at startup
+   * (initialize(), above) and every replica runs its own
+   * OrderTriggerWatcher subscribed to the cluster-wide `market.quote`
+   * event (see Task 9's Redis Pub/Sub WS fan-out). When a price tick
+   * crosses a resting order's trigger level, EVERY replica's watcher
+   * observes the same tick and independently finds that order still
+   * status="PENDING" in its own local Map -- there was no coordination
+   * step between "detect trigger" and "commit to executing it", only this
+   * method's local, in-process mutation. Nor does the downstream layer
+   * help: OrderLifecycle.transition()'s `UPDATE "Order" SET status = ...
+   * WHERE id = orderId` (order.lifecycle.ts) has no `AND status =
+   * <expected-from-state>` guard, so it does not reject a second,
+   * concurrent transition either. Net effect: N replicas racing on the
+   * same tick can each call orderController.executePendingOrder() for the
+   * SAME pending order, producing N real fills -- N positions opened, N
+   * margin holds, N ledger entries -- for what was submitted, and should
+   * execute, as a single order.
+   *
+   * Fix: before committing to TRIGGERED locally, atomically claim the
+   * order's PERSISTED row via a single conditional UPDATE (`WHERE
+   * value->>'status' = 'PENDING'`) -- Postgres's own row-level locking
+   * guarantees that when two replicas race this statement against the
+   * same key, exactly one affects a row and the other affects zero. No
+   * new coordination infrastructure needed: pending orders are already
+   * persisted to BrokerSetting as the source of truth used to survive
+   * restarts (see _persist()/initialize() above); this reuses that same
+   * row as the cross-replica arbitration point instead of introducing a
+   * dependency on Redis (a Redis-based lock would itself reopen this gap
+   * during a Redis outage -- see DistributedJobLock's documented
+   * degraded-mode fallback, which is correct for idempotent periodic jobs
+   * but not safe here, where there was no other idempotency guard).
+   *
+   * In non-persistent (sandbox/dev/test) mode there is only ever one
+   * process and no DB-backed row to arbitrate over, so the pre-existing
+   * in-memory-only behavior is preserved unchanged.
+   */
+  async markTriggered(pendingId: string): Promise<PendingOrder | null> {
     const order = this.orders.get(pendingId);
     if (!order || order.status !== "PENDING") return null;
 
+    if (IS_PERSISTENT) {
+      const claimed = await this._claimPersisted(pendingId);
+      if (!claimed) {
+        // Another replica won the race and already claimed this order --
+        // drop our now-stale local copy too, so this replica stops
+        // re-evaluating it on every subsequent tick.
+        this.orders.delete(pendingId);
+        return null;
+      }
+    }
+
     order.status = "TRIGGERED";
     this.orders.delete(pendingId);
-    void this._cancelPersisted(pendingId, "TRIGGERED");
     return order;
+  }
+
+  /**
+   * Atomically flips the persisted row's status PENDING -> TRIGGERED and
+   * reports whether THIS call is the one that made the change. Returns
+   * false (without throwing) if the row was already claimed by another
+   * replica, already in a non-PENDING state, or doesn't exist -- all of
+   * which mean this caller must not proceed to execute the order.
+   */
+  private async _claimPersisted(id: string): Promise<boolean> {
+    try {
+      const db = prisma as NonNullable<typeof prisma>;
+      const affected = await db.$executeRaw`
+        UPDATE "BrokerSetting"
+        SET value = jsonb_set(value, '{status}', '"TRIGGERED"'::jsonb)
+        WHERE key = ${`pending_order:${id}`} AND value->>'status' = 'PENDING'
+      `;
+      return affected > 0;
+    } catch (err) {
+      // Fail closed: if we can't confirm the claim, do not execute --
+      // a missed trigger this tick is re-evaluated on the next one (the
+      // order remains PENDING); a duplicate fill is not recoverable.
+      console.error(`[order-book] claim failed for pending order ${id}:`, (err as Error).message);
+      return false;
+    }
   }
 
   /** Called by order.trigger.watcher.ts on every price tick. */

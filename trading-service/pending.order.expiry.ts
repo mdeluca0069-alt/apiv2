@@ -97,7 +97,7 @@ export class PendingOrderExpiryService {
     // markTriggered is the correct "remove from book" call — it removes the
     // order from the in-memory set and marks it TRIGGERED in DB.
     // If it returns null the order was already processed (filled or cancelled).
-    const removed = pendingOrderBook.markTriggered(order.id);
+    const removed = await pendingOrderBook.markTriggered(order.id);
     if (!removed) return;
 
     const terminalStatus = order.armedByStopLimit ? "LIMIT_EXPIRED" : "CANCELLED";

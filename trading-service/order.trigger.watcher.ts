@@ -55,7 +55,10 @@ class OrderTriggerWatcher {
       const triggered = this._isTriggered(order, bid, ask);
       if (!triggered) continue;
 
-      const pending = pendingOrderBook.markTriggered(order.id);
+      // CRITICAL_REMEDIATION (C6): markTriggered() now atomically claims the
+      // order across replicas -- returns null if another replica already
+      // won this trigger, so only one replica ever proceeds past this line.
+      const pending = await pendingOrderBook.markTriggered(order.id);
       if (!pending) continue;
 
       // FASE 3.6: OCO — this leg just triggered, so cancel its sibling now
