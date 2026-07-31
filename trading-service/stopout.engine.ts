@@ -167,7 +167,6 @@ export class StopOutEngine {
     }
 
     const balance   = wallet.balance.toNumber();
-    const locked    = wallet.locked.toNumber();
 
     // Compute live unrealised P&L for each position
     // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #5): a stale quote is exactly as
@@ -193,8 +192,26 @@ export class StopOutEngine {
       return { ...pos, pnl, markPrice, staleOrMissing };
     });
 
-    const equity      = balance + totalUnrealized;
-    const marginUsed  = locked;
+    const equity = balance + totalUnrealized;
+    // PHASE2_REMEDIATION (H5): this used to read WalletAccount.locked --
+    // a SEPARATE number from the sum(Position.marginUsed) that margin.
+    // controller.ts's getMarginState() (the pre-trade risk gate and client
+    // dashboard's source of truth) uses, tracked independently via
+    // checkAndLockMargin()/releaseMargin()'s own wallet-column increments/
+    // decrements. The two are supposed to always be numerically equal but
+    // are never cross-checked at decision time (only reconciled
+    // asynchronously every 5 minutes by settlement/reconciliation.engine.ts,
+    // and only in the direction of decreasing `locked` toward the position
+    // sum -- a deficit where `locked` UNDERSTATES real margin usage is
+    // never auto-corrected). That's the dangerous direction here
+    // specifically: understated marginUsed makes marginLevel = equity /
+    // marginUsed look HEALTHIER than reality, silently weakening the ESMA
+    // 50% mandatory stop-out floor for exactly the accounts most at risk.
+    // `positions` (fetched above, already carrying each row's own
+    // marginUsed) is the same aggregate getMarginState() sums -- reading it
+    // here means stop-out/margin-call/warning decisions can never diverge
+    // from what the pre-trade gate and client already see for this account.
+    const marginUsed  = positions.reduce((sum, p) => sum + p.marginUsed.toNumber(), 0);
     const marginLevel = marginUsed > 0 ? (equity / marginUsed) * 100 : Infinity;
 
     // CRITICAL_REMEDIATION (C7): stale-quote positions contribute pnl=0 to

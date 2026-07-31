@@ -138,10 +138,22 @@ export class VarEngine {
     ]);
 
     const balance   = Number(wallet?.balance ?? 0);
-    const locked    = Number(wallet?.locked  ?? 0);
     const unrealized = openPositions.reduce((s, p) => s + p.pnl.toNumber(), 0);
     const equity    = balance + unrealized;
-    const marginUsed = locked;
+    // PHASE2_REMEDIATION (H5): this used to read WalletAccount.locked --
+    // a SEPARATE number from the sum(Position.marginUsed) that margin.
+    // controller.ts's getMarginState() (the pre-trade/UI source of truth)
+    // uses, tracked independently via checkAndLockMargin()/releaseMargin()'s
+    // own wallet-column increments/decrements. The two are supposed to
+    // always be numerically equal but are never cross-checked at decision
+    // time (only reconciled asynchronously, every 5 minutes, and only in
+    // the direction of decreasing `locked` toward the position sum -- a
+    // deficit where `locked` UNDERSTATES real margin usage is never auto-
+    // corrected). Reading the same sum(Position.marginUsed) getMarginState()
+    // uses here means VaR-based margin-level projections can never diverge
+    // from what the pre-trade gate and client dashboard already report for
+    // the same account.
+    const marginUsed = openPositions.reduce((s, p) => s + p.marginUsed.toNumber(), 0);
 
     // Aggregate daily PnL from trade history
     const dayMap = new Map<string, number>();
