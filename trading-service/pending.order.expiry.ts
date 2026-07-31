@@ -64,11 +64,13 @@ export class PendingOrderExpiryService {
     let errors  = 0;
 
     try {
-      const now      = new Date();
-      const pending  = pendingOrderBook.getAll();
-      const toExpire = pending.filter(
-        (o) => o.expiresAt != null && o.expiresAt <= now,
-      );
+      const now = new Date();
+      // PHASE2_REMEDIATION (H1/H3): source candidates from the DB, not the
+      // local Map -- see getExpiredFromSource()'s docstring. The leader
+      // elected for this scan may not be the worker that originally
+      // created a given order, so its local Map alone is not a reliable
+      // source of the true, cluster-wide expired set.
+      const toExpire = await pendingOrderBook.getExpiredFromSource(now);
 
       for (const order of toExpire) {
         try {

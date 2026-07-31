@@ -1,6 +1,9 @@
 import { randomUUID }   from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { eventBus }      from "../events-bus/event.bus.js";
+import { publishControlChannel, subscribeControlChannel } from "../shared/control.channel.js";
+
+const CHANNEL = "pending-order";
 
 export type PendingOrderType = "LIMIT" | "STOP" | "STOP_LIMIT" | "TRAILING_STOP";
 export type PendingOrderSide = "BUY" | "SELL";
@@ -47,10 +50,88 @@ export type PendingOrder = {
  *
  * The book is loaded from DB on startup. All mutations are persisted immediately
  * via BrokerSetting with key=`pending_order:{id}` so the book survives restarts.
+ *
+ * PHASE2_REMEDIATION (H1/H3): `orders` is a private, per-process Map, and
+ * initialize() only loads the DB's PENDING set ONCE at boot -- an order
+ * added on worker A after every worker has already started is persisted
+ * to the DB but never pushed into worker B/C's local Map. Three
+ * consequences, all now fixed:
+ *   (a) VISIBILITY: cancel()/getForUser() did a local-Map-only lookup, so
+ *       a cancel request or order-list read landing on a worker that never
+ *       saw the order (originally created elsewhere) silently reported
+ *       "not found" / omitted it, even though the order was genuinely
+ *       still live. Fixed with startSync() (broadcasts add()/cancel() over
+ *       the same control-channel pattern kill.switch.ts/broker.spread.
+ *       config.ts already use) PLUS a DB-backed fallback claim in cancel()
+ *       itself, so cancellation is correct even if a broadcast was missed
+ *       (Redis pub/sub is best-effort, no replay/persistence).
+ *   (b) EXPIRY: pending.order.expiry.ts's leader-elected sweep called
+ *       getAll() (local Map only) -- an order invisible to the elected
+ *       leader's own Map could never expire, no matter how long past its
+ *       expiresAt, until that worker happened to restart. Fixed by adding
+ *       getExpiredFromSource(), which the sweep now uses instead --
+ *       queries the DB directly so the leader's view is complete
+ *       regardless of which worker originally created each order.
+ *   (c) TRIGGER SINGLE-POINT-OF-FAILURE: only the worker holding an order
+ *       locally could ever act on a price tick crossing its level (every
+ *       worker's OrderTriggerWatcher sees every tick, but each only
+ *       evaluates its OWN local Map). startSync() fixes this as a side
+ *       effect -- once broadcast, every worker's watcher can act on it,
+ *       safely, because markTriggered()'s C6 atomic DB claim already
+ *       guarantees exactly one replica wins regardless of how many have
+ *       the order locally.
+ * markTriggered() itself also gained a DB-fallback claim path (mirroring
+ * cancel()'s) so the expiry sweep's DB-sourced candidates can be claimed
+ * even when the elected leader never had them in its local Map at all.
  */
 class PendingOrderBook {
   private orders: Map<string, PendingOrder> = new Map();
   private initialized = false;
+
+  // PHASE2_REMEDIATION (H1/H3): tracks ids this worker has itself removed
+  // (triggered/cancelled) recently, so a late/out-of-order "add" broadcast
+  // for the same id (Redis pub/sub gives no ordering guarantee across
+  // network hiccups) can't resurrect an order this worker already knows
+  // reached a terminal state. Bounded so long-running processes don't leak
+  // memory — old entries fall off in insertion order once the cap is hit,
+  // which is safe: the resurrection window this guards against is a race
+  // measured in seconds/minutes, not the process lifetime.
+  private recentlyTerminal: Set<string> = new Set();
+  private static readonly TERMINAL_TRACK_LIMIT = 5000;
+
+  private _markTerminalLocally(id: string): void {
+    this.recentlyTerminal.add(id);
+    if (this.recentlyTerminal.size > PendingOrderBook.TERMINAL_TRACK_LIMIT) {
+      const oldest = this.recentlyTerminal.values().next().value;
+      if (oldest !== undefined) this.recentlyTerminal.delete(oldest);
+    }
+  }
+
+  /**
+   * PHASE2_REMEDIATION (H1/H3): subscribes to cross-worker add()/cancel()
+   * broadcasts so this worker's local Map converges with every other
+   * worker's, close to real-time, instead of only at boot. No-op (single-
+   * worker-safe) with no Redis configured — mirrors kill.switch.ts's
+   * startSync(). Call once at startup, after initialize().
+   */
+  async startSync(): Promise<void> {
+    await subscribeControlChannel(CHANNEL, (payload) => {
+      const msg = payload as { type: "add" | "remove"; order?: PendingOrder; id?: string };
+      if (msg.type === "add" && msg.order) {
+        const order = msg.order;
+        // Don't resurrect an order this worker already has locally, or
+        // already knows is terminal (e.g. it triggered/cancelled locally
+        // and this add-broadcast is a late/out-of-order echo).
+        if (this.orders.has(order.id) || this.recentlyTerminal.has(order.id)) return;
+        order.createdAt = new Date(order.createdAt);
+        if (order.expiresAt) order.expiresAt = new Date(order.expiresAt);
+        this.orders.set(order.id, order);
+      } else if (msg.type === "remove" && msg.id) {
+        this.orders.delete(msg.id);
+        this._markTerminalLocally(msg.id);
+      }
+    });
+  }
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
@@ -119,6 +200,11 @@ class PendingOrderBook {
       timestamp:    pending.createdAt.toISOString(),
     });
 
+    // PHASE2_REMEDIATION (H1/H3): converge every other worker's local Map
+    // so this order is visible/cancellable/triggerable cluster-wide, not
+    // just on the worker that happened to handle this placement request.
+    void publishControlChannel(CHANNEL, { type: "add", order: pending });
+
     return pending;
   }
 
@@ -136,16 +222,84 @@ class PendingOrderBook {
     );
   }
 
+  /**
+   * PHASE2_REMEDIATION (H1/H3): used by pending.order.expiry.ts's leader-
+   * elected sweep INSTEAD OF getAll() — getAll() only reflects orders this
+   * particular worker happens to have locally, which could permanently
+   * exclude orders created on a different replica (they would then never
+   * expire, no matter how long past their expiresAt). Reads the true,
+   * cluster-wide PENDING set straight from the DB. In non-persistent
+   * (sandbox/test) mode there is only ever one process, so the local Map
+   * already IS the complete set.
+   */
+  async getExpiredFromSource(now: Date): Promise<PendingOrder[]> {
+    if (!IS_PERSISTENT) {
+      return this.getAll().filter((o) => o.expiresAt != null && o.expiresAt <= now);
+    }
+    try {
+      const db   = prisma as NonNullable<typeof prisma>;
+      const rows = await db.brokerSetting.findMany({ where: { key: { startsWith: "pending_order:" } } });
+      const expired: PendingOrder[] = [];
+      for (const row of rows) {
+        const o = row.value as unknown as PendingOrder;
+        if (o?.status !== "PENDING" || !o.expiresAt) continue;
+        const expiresAt = new Date(o.expiresAt);
+        if (expiresAt <= now) {
+          o.createdAt = new Date(o.createdAt);
+          o.expiresAt = expiresAt;
+          expired.push(o);
+        }
+      }
+      return expired;
+    } catch (err) {
+      console.error("[order-book] getExpiredFromSource DB scan failed:", (err as Error).message);
+      return [];
+    }
+  }
+
   async cancel(pendingId: string, userId: string): Promise<boolean> {
     const order = this.orders.get(pendingId);
-    if (!order || order.userId !== userId || order.status !== "PENDING") return false;
+    if (order) {
+      if (order.userId !== userId || order.status !== "PENDING") return false;
 
-    await this._cancelOne(order, "CLIENT_CANCEL");
+      await this._cancelOne(order, "CLIENT_CANCEL");
 
-    // FASE 3.6: cancelling one OCO leg cancels its sibling too — an OCO pair
-    // resolves together, whichever leg the client acts on first.
-    if (order.ocoGroupId) {
-      await this._cancelGroupSiblings(order.ocoGroupId, order.id, "OCO_SIBLING_CANCELLED");
+      // FASE 3.6: cancelling one OCO leg cancels its sibling too — an OCO pair
+      // resolves together, whichever leg the client acts on first.
+      if (order.ocoGroupId) {
+        await this._cancelGroupSiblings(order.ocoGroupId, order.id, "OCO_SIBLING_CANCELLED");
+      }
+
+      return true;
+    }
+
+    // PHASE2_REMEDIATION (H1/H3): not in this worker's local Map -- it may
+    // genuinely be resting on a different replica (created there, or this
+    // worker hasn't received the add() broadcast yet — best-effort pub/sub
+    // has no delivery guarantee). Fall back to an atomic, ownership-checked
+    // claim against the persisted row: the same conditional-UPDATE pattern
+    // C6 already uses for trigger-claiming, so cancellation is correct
+    // regardless of which worker created the order or whether any
+    // broadcast was ever received.
+    if (!IS_PERSISTENT) return false;
+
+    const claimed = await this._claimStatusChange(pendingId, "CANCELLED", userId);
+    if (!claimed) return false;
+
+    this.orders.delete(pendingId); // clear any stale local copy, if one existed
+    this._markTerminalLocally(pendingId);
+    eventBus.emit("order.cancelled", {
+      orderId:   claimed.orderId,
+      pendingId: claimed.id,
+      userId:    claimed.userId,
+      symbol:    claimed.symbol,
+      reason:    "CLIENT_CANCEL",
+      timestamp: new Date().toISOString(),
+    });
+    void publishControlChannel(CHANNEL, { type: "remove", id: pendingId });
+
+    if (claimed.ocoGroupId) {
+      await this._cancelGroupSiblings(claimed.ocoGroupId, claimed.id, "OCO_SIBLING_CANCELLED");
     }
 
     return true;
@@ -173,11 +327,41 @@ class PendingOrderBook {
     for (const sibling of siblings) {
       await this._cancelOne(sibling, reason);
     }
+
+    // PHASE2_REMEDIATION (H1/H3): an OCO sibling resting on a DIFFERENT
+    // replica isn't in this worker's local Map at all, so the loop above
+    // would silently miss it, leaving the pair with one leg cancelled and
+    // the other still live indefinitely. Scan the DB for any PENDING
+    // sibling not already handled above and claim it the same way
+    // cancel()'s DB fallback does.
+    if (!IS_PERSISTENT) return;
+    try {
+      const db   = prisma as NonNullable<typeof prisma>;
+      const rows = await db.brokerSetting.findMany({ where: { key: { startsWith: "pending_order:" } } });
+      for (const row of rows) {
+        const o = row.value as unknown as PendingOrder;
+        if (o?.ocoGroupId !== ocoGroupId || o.id === excludeId || o.status !== "PENDING") continue;
+        if (siblings.some((s) => s.id === o.id)) continue; // already handled locally above
+
+        const claimed = await this._claimStatusChange(o.id, "CANCELLED");
+        if (!claimed) continue;
+        this.orders.delete(o.id);
+        this._markTerminalLocally(o.id);
+        eventBus.emit("order.cancelled", {
+          orderId: claimed.orderId, pendingId: claimed.id, userId: claimed.userId,
+          symbol: claimed.symbol, reason, timestamp: new Date().toISOString(),
+        });
+        void publishControlChannel(CHANNEL, { type: "remove", id: o.id });
+      }
+    } catch (err) {
+      console.error(`[order-book] OCO sibling DB scan failed for group ${ocoGroupId}:`, (err as Error).message);
+    }
   }
 
   private async _cancelOne(order: PendingOrder, reason: string): Promise<void> {
     order.status = "CANCELLED";
     this.orders.delete(order.id);
+    this._markTerminalLocally(order.id);
     await this._cancelPersisted(order.id, "CANCELLED");
 
     eventBus.emit("order.cancelled", {
@@ -188,6 +372,8 @@ class PendingOrderBook {
       reason,
       timestamp: new Date().toISOString(),
     });
+
+    void publishControlChannel(CHANNEL, { type: "remove", id: order.id });
   }
 
   /**
@@ -233,46 +419,83 @@ class PendingOrderBook {
    */
   async markTriggered(pendingId: string): Promise<PendingOrder | null> {
     const order = this.orders.get(pendingId);
-    if (!order || order.status !== "PENDING") return null;
 
-    if (IS_PERSISTENT) {
-      const claimed = await this._claimPersisted(pendingId);
-      if (!claimed) {
-        // Another replica won the race and already claimed this order --
-        // drop our now-stale local copy too, so this replica stops
-        // re-evaluating it on every subsequent tick.
-        this.orders.delete(pendingId);
-        return null;
+    if (order) {
+      if (order.status !== "PENDING") return null;
+
+      if (IS_PERSISTENT) {
+        const claimed = await this._claimStatusChange(pendingId, "TRIGGERED");
+        if (!claimed) {
+          // Another replica won the race and already claimed this order --
+          // drop our now-stale local copy too, so this replica stops
+          // re-evaluating it on every subsequent tick.
+          this.orders.delete(pendingId);
+          this._markTerminalLocally(pendingId);
+          return null;
+        }
       }
+
+      order.status = "TRIGGERED";
+      this.orders.delete(pendingId);
+      this._markTerminalLocally(pendingId);
+      return order;
     }
 
-    order.status = "TRIGGERED";
-    this.orders.delete(pendingId);
-    return order;
+    // PHASE2_REMEDIATION (H1/H3): not in this worker's local Map -- this is
+    // now expected for the expiry sweep's leader, which sources expiry
+    // candidates straight from the DB (getExpiredFromSource()) rather than
+    // its own possibly-incomplete local Map. Claim + return the persisted
+    // row directly; same atomic conditional UPDATE as the local path above.
+    if (!IS_PERSISTENT) return null;
+    const claimed = await this._claimStatusChange(pendingId, "TRIGGERED");
+    if (claimed) this._markTerminalLocally(pendingId);
+    return claimed;
   }
 
   /**
-   * Atomically flips the persisted row's status PENDING -> TRIGGERED and
-   * reports whether THIS call is the one that made the change. Returns
-   * false (without throwing) if the row was already claimed by another
-   * replica, already in a non-PENDING state, or doesn't exist -- all of
-   * which mean this caller must not proceed to execute the order.
+   * Atomically flips the persisted row's status PENDING -> `toStatus`
+   * (optionally scoped to a specific owning user for cancel()'s ownership
+   * check) and returns the full, updated order if THIS call is the one
+   * that made the change — Postgres's row-level locking guarantees that
+   * when multiple replicas race this statement against the same key,
+   * exactly one affects a row and every other one affects zero. Returns
+   * null (without throwing) if the row was already claimed by another
+   * replica, already in a non-PENDING state, owned by a different user
+   * (when expectedUserId is given), or doesn't exist.
    */
-  private async _claimPersisted(id: string): Promise<boolean> {
+  private async _claimStatusChange(
+    id: string,
+    toStatus: "TRIGGERED" | "CANCELLED",
+    expectedUserId?: string,
+  ): Promise<PendingOrder | null> {
     try {
       const db = prisma as NonNullable<typeof prisma>;
-      const affected = await db.$executeRaw`
-        UPDATE "BrokerSetting"
-        SET value = jsonb_set(value, '{status}', '"TRIGGERED"'::jsonb)
-        WHERE key = ${`pending_order:${id}`} AND value->>'status' = 'PENDING'
-      `;
-      return affected > 0;
+      const jsonStatus = JSON.stringify(toStatus);
+      const rows = expectedUserId
+        ? await db.$queryRaw<{ value: PendingOrder }[]>`
+            UPDATE "BrokerSetting"
+            SET value = jsonb_set(value, '{status}', ${jsonStatus}::jsonb)
+            WHERE key = ${`pending_order:${id}`}
+              AND value->>'status' = 'PENDING'
+              AND value->>'userId' = ${expectedUserId}
+            RETURNING value`
+        : await db.$queryRaw<{ value: PendingOrder }[]>`
+            UPDATE "BrokerSetting"
+            SET value = jsonb_set(value, '{status}', ${jsonStatus}::jsonb)
+            WHERE key = ${`pending_order:${id}`}
+              AND value->>'status' = 'PENDING'
+            RETURNING value`;
+      if (rows.length === 0) return null;
+      const claimed = rows[0]!.value;
+      claimed.createdAt = new Date(claimed.createdAt);
+      if (claimed.expiresAt) claimed.expiresAt = new Date(claimed.expiresAt as unknown as string);
+      return claimed;
     } catch (err) {
-      // Fail closed: if we can't confirm the claim, do not execute --
-      // a missed trigger this tick is re-evaluated on the next one (the
-      // order remains PENDING); a duplicate fill is not recoverable.
-      console.error(`[order-book] claim failed for pending order ${id}:`, (err as Error).message);
-      return false;
+      // Fail closed: if we can't confirm the claim, do not proceed -- a
+      // missed trigger/cancel this cycle is re-evaluated on the next one
+      // (the order remains PENDING); a duplicate fill is not recoverable.
+      console.error(`[order-book] claim(${toStatus}) failed for ${id}:`, (err as Error).message);
+      return null;
     }
   }
 

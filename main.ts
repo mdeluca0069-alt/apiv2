@@ -364,6 +364,11 @@ if (prisma) {
 await pendingOrderBook.initialize().catch((err) =>
   console.error("[pending-order-book] init failed:", (err as Error).message),
 );
+// PHASE2_REMEDIATION (H1/H3): cross-worker sync so orders created on one
+// replica become visible/cancellable/triggerable on every other replica.
+await pendingOrderBook.startSync().catch((err) =>
+  console.error("[pending-order-book] startSync failed:", (err as Error).message),
+);
 orderTriggerWatcher.start();
 // Scan for expired pending orders every 30s; also runs startup catch-up scan
 pendingOrderExpiryService.start(30_000);

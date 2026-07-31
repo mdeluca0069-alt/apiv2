@@ -32,12 +32,27 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // ── Mock declarations (vi.hoisted ensures they exist before vi.mock factory runs) ──
 
-const { mockUpsert, mockFindMany, mockExecuteRaw, claimedKeys, emitSpy } = vi.hoisted(() => {
+const { mockUpsert, defaultUpsertImpl, mockFindMany, mockExecuteRaw, mockQueryRaw, claimedKeys, persistedByKey, emitSpy } = vi.hoisted(() => {
   const claimedKeys = new Set<string>();
+  // PHASE2_REMEDIATION (H1/H3): _claimStatusChange() mirrors any order
+  // add()/persist() call so a DB-fallback claim (cancel()/markTriggered()
+  // when the order isn't in this test's single in-memory Map either,
+  // exactly like a different replica would see it) has a real row to
+  // claim against, the same way live Postgres would.
+  const persistedByKey = new Map<string, Record<string, unknown>>();
+  const defaultUpsertImpl = async (args: { where: { key: string }; create: { value: Record<string, unknown> } }) => {
+    persistedByKey.set(args.where.key, args.create.value);
+    return { key: args.where.key, value: args.create.value };
+  };
   return {
-    mockUpsert:  vi.fn().mockResolvedValue({ key: "", value: {} }),
+    // beforeEach re-applies defaultUpsertImpl every test — clearAllMocks()
+    // does NOT reset a mock's implementation, so a test-local override
+    // (e.g. the persistence-retry-failure tests below, which reject on
+    // purpose) would otherwise leak into every later test.
+    mockUpsert: vi.fn(defaultUpsertImpl),
+    defaultUpsertImpl,
     mockFindMany: vi.fn().mockResolvedValue([]),
-    // CRITICAL_REMEDIATION (C6): markTriggered() now atomically claims the
+    // CRITICAL_REMEDIATION (C6): markTriggered() atomically claims the
     // persisted row via $executeRaw before committing TRIGGERED locally.
     // A real Postgres UPDATE ... WHERE value->>'status'='PENDING' only
     // ever lets ONE caller affect the row per key -- this mock reproduces
@@ -49,7 +64,25 @@ const { mockUpsert, mockFindMany, mockExecuteRaw, claimedKeys, emitSpy } = vi.ho
       claimedKeys.add(key);
       return 1;
     }),
+    // PHASE2_REMEDIATION (H1/H3): _claimStatusChange() uses $queryRaw (not
+    // $executeRaw) so it can RETURNING the claimed row's full value --
+    // same one-claim-per-key semantics as mockExecuteRaw above, plus
+    // returning the (status-updated) persisted value on success. Param
+    // order mirrors the SQL template literally: jsonStatus (a JSON string
+    // like `"TRIGGERED"`), then key, then an optional expectedUserId.
+    mockQueryRaw: vi.fn(async (_strings: TemplateStringsArray, jsonStatus: string, key: string, userId?: string) => {
+      if (claimedKeys.has(key)) return [];
+      const row = persistedByKey.get(key);
+      if (!row || row.status !== "PENDING") return [];
+      if (userId !== undefined && row.userId !== userId) return [];
+      claimedKeys.add(key);
+      const toStatus = JSON.parse(jsonStatus) as string;
+      const updated = { ...row, status: toStatus };
+      persistedByKey.set(key, updated);
+      return [{ value: updated }];
+    }),
     claimedKeys,
+    persistedByKey,
     emitSpy: vi.fn(),
   };
 });
@@ -62,11 +95,25 @@ vi.mock("../shared/db.js", () => ({
       findMany: mockFindMany,
     },
     $executeRaw: mockExecuteRaw,
+    $queryRaw:   mockQueryRaw,
   },
 }));
 
 vi.mock("../events-bus/event.bus.js", () => ({
   eventBus: { emit: emitSpy, on: vi.fn() },
+}));
+
+const { mockPublish, mockSubscribe, syncHandlerBox } = vi.hoisted(() => ({
+  mockPublish: vi.fn().mockResolvedValue(undefined),
+  mockSubscribe: vi.fn().mockResolvedValue(undefined),
+  syncHandlerBox: { current: null as ((payload: unknown) => void) | null },
+}));
+vi.mock("../shared/control.channel.js", () => ({
+  publishControlChannel: mockPublish,
+  subscribeControlChannel: vi.fn(async (_name: string, handler: (payload: unknown) => void) => {
+    syncHandlerBox.current = handler;
+    await mockSubscribe();
+  }),
 }));
 
 // ── Import under test (after mocks are registered) ───────────────────────────
@@ -118,9 +165,10 @@ function makeOrder(
 
 beforeEach(async () => {
   vi.clearAllMocks();
-  mockUpsert.mockResolvedValue({ key: "", value: {} });
+  mockUpsert.mockImplementation(defaultUpsertImpl);
   mockFindMany.mockResolvedValue([]);
   claimedKeys.clear();
+  persistedByKey.clear();
   await cleanBook();
 });
 
@@ -408,10 +456,15 @@ describe("markTriggered()", () => {
   // simulating three replicas whose watchers all observed the same price
   // tick and all still see the order as PENDING in their own local memory,
   // exactly as described in markTriggered()'s docstring. The stateful
-  // mockExecuteRaw above reproduces Postgres's real row-level locking
+  // mockQueryRaw above reproduces Postgres's real row-level locking
   // semantics (only one UPDATE ... WHERE status='PENDING' can ever affect
   // the row), so this proves the claim -- not JS's single-threadedness --
   // is what makes exactly one caller win.
+  //
+  // PHASE2_REMEDIATION (H1/H3): _claimStatusChange() now uses $queryRaw
+  // (RETURNING the claimed row) instead of the old boolean-only
+  // $executeRaw, since cancel()'s DB-fallback path and markTriggered()'s
+  // DB-fallback path both need the full order back, not just a count.
   it("CRITICAL_REMEDIATION (C6): three concurrent callers racing the same order -- exactly one wins, not JS execution order", async () => {
     const order = await pendingOrderBook.add(makeOrder());
 
@@ -423,7 +476,7 @@ describe("markTriggered()", () => {
 
     const successes = [r1, r2, r3].filter((r) => r !== null);
     expect(successes.length).toBe(1);
-    expect(mockExecuteRaw).toHaveBeenCalledTimes(3);
+    expect(mockQueryRaw).toHaveBeenCalledTimes(3);
   });
 
   it("returns null for non-existent id", async () => {
@@ -649,5 +702,199 @@ describe("initialize()", () => {
     // Second call should return early — findMany NOT called again
     await pendingOrderBook.initialize();
     expect(mockFindMany).not.toHaveBeenCalled();
+  });
+});
+
+// ─── 8. PHASE2_REMEDIATION (H1/H3) — cross-replica visibility/cancel/expiry ──
+
+describe("PHASE2_REMEDIATION (H1/H3): cross-replica gaps", () => {
+  /**
+   * Simulates an order that was created and persisted by a DIFFERENT
+   * replica — its row exists in the DB (persistedByKey) but this worker's
+   * local Map never learned about it. This is the exact scenario the
+   * finding describes: cancel()/markTriggered() previously did a
+   * local-Map-only lookup and would incorrectly report "not found" for a
+   * genuinely live order.
+   */
+  function seedRemoteOrder(overrides: Partial<{ id: string; userId: string; status: string; expiresAt: string }> = {}) {
+    const id = overrides.id ?? "remote-" + Math.random().toString(36).slice(2);
+    const order = {
+      id, orderId: "ord-" + id, userId: overrides.userId ?? "user-1",
+      symbol: "EURUSD", side: "BUY", type: "LIMIT", quantity: 1,
+      triggerPrice: 1.09, leverage: 30, marginRequired: 100, notional: 3000,
+      status: overrides.status ?? "PENDING",
+      createdAt: new Date().toISOString(),
+      ...(overrides.expiresAt ? { expiresAt: overrides.expiresAt } : {}),
+    };
+    persistedByKey.set(`pending_order:${id}`, order);
+    return order;
+  }
+
+  describe("add() — broadcasts to other workers", () => {
+    it("publishes the new order on the control channel after a successful add()", async () => {
+      const order = await pendingOrderBook.add(makeOrder({ userId: "user-1" }));
+
+      expect(mockPublish).toHaveBeenCalledWith("pending-order", { type: "add", order });
+    });
+  });
+
+  describe("cancel() — DB fallback when not in this worker's local Map", () => {
+    it("cancels an order that exists only in the DB (created on a different replica)", async () => {
+      const remote = seedRemoteOrder({ userId: "user-9" });
+
+      const result = await pendingOrderBook.cancel(remote.id, "user-9");
+
+      expect(result).toBe(true);
+      expect(persistedByKey.get(`pending_order:${remote.id}`)?.status).toBe("CANCELLED");
+      expect(emitSpy).toHaveBeenCalledWith(
+        "order.cancelled",
+        expect.objectContaining({ pendingId: remote.id, userId: "user-9", reason: "CLIENT_CANCEL" }),
+      );
+    });
+
+    it("broadcasts the cancellation so other workers' local Maps converge", async () => {
+      const remote = seedRemoteOrder({ userId: "user-9" });
+
+      await pendingOrderBook.cancel(remote.id, "user-9");
+
+      expect(mockPublish).toHaveBeenCalledWith("pending-order", { type: "remove", id: remote.id });
+    });
+
+    it("rejects a DB-fallback cancel from a non-owning user (ownership check applies to the fallback path too)", async () => {
+      const remote = seedRemoteOrder({ userId: "owner" });
+
+      const result = await pendingOrderBook.cancel(remote.id, "attacker");
+
+      expect(result).toBe(false);
+      expect(persistedByKey.get(`pending_order:${remote.id}`)?.status).toBe("PENDING");
+    });
+
+    it("returns false for a DB row that is no longer PENDING (already triggered/cancelled elsewhere)", async () => {
+      const remote = seedRemoteOrder({ userId: "user-9", status: "TRIGGERED" });
+
+      const result = await pendingOrderBook.cancel(remote.id, "user-9");
+
+      expect(result).toBe(false);
+    });
+
+    it("cancels a remote OCO sibling too, even though it was never in this worker's local Map", async () => {
+      const groupId = "remote-oco-" + Math.random().toString(36).slice(2);
+      const legA = seedRemoteOrder({ userId: "user-1" });
+      (persistedByKey.get(`pending_order:${legA.id}`) as Record<string, unknown>).ocoGroupId = groupId;
+      const legB = seedRemoteOrder({ userId: "user-1" });
+      (persistedByKey.get(`pending_order:${legB.id}`) as Record<string, unknown>).ocoGroupId = groupId;
+      // _cancelGroupSiblings' DB-fallback scan uses findMany, not
+      // persistedByKey directly — reflect the seeded rows there too.
+      mockFindMany.mockResolvedValueOnce(
+        [...persistedByKey.entries()].map(([key, value]) => ({ key, value })),
+      );
+
+      const result = await pendingOrderBook.cancel(legA.id, "user-1");
+
+      expect(result).toBe(true);
+      expect(persistedByKey.get(`pending_order:${legB.id}`)?.status).toBe("CANCELLED");
+    });
+  });
+
+  describe("markTriggered() — DB fallback when not in this worker's local Map", () => {
+    it("claims and returns an order that exists only in the DB (the expiry sweep's leader scenario)", async () => {
+      const remote = seedRemoteOrder({ userId: "user-9" });
+
+      const claimed = await pendingOrderBook.markTriggered(remote.id);
+
+      expect(claimed).not.toBeNull();
+      expect(claimed!.id).toBe(remote.id);
+      expect(persistedByKey.get(`pending_order:${remote.id}`)?.status).toBe("TRIGGERED");
+    });
+
+    it("returns null when the DB row is already claimed (no duplicate trigger across replicas)", async () => {
+      const remote = seedRemoteOrder({ userId: "user-9" });
+      claimedKeys.add(`pending_order:${remote.id}`); // another replica already won the race
+
+      const claimed = await pendingOrderBook.markTriggered(remote.id);
+
+      expect(claimed).toBeNull();
+    });
+
+    it("returns null for a pendingId that exists in neither the local Map nor the DB", async () => {
+      const claimed = await pendingOrderBook.markTriggered("totally-unknown-id");
+      expect(claimed).toBeNull();
+    });
+  });
+
+  describe("getExpiredFromSource() — sources the true cluster-wide expired set from the DB, not the local Map", () => {
+    it("finds an expired order that was never in this worker's local Map", async () => {
+      const past = new Date(Date.now() - 60_000).toISOString();
+      const remote = seedRemoteOrder({ userId: "user-9", expiresAt: past });
+      mockFindMany.mockResolvedValueOnce(
+        [...persistedByKey.entries()].map(([key, value]) => ({ key, value })),
+      );
+
+      const expired = await pendingOrderBook.getExpiredFromSource(new Date());
+
+      expect(expired.some((o) => o.id === remote.id)).toBe(true);
+      expect(expired[0]!.expiresAt).toBeInstanceOf(Date);
+    });
+
+    it("excludes an order whose expiresAt is still in the future", async () => {
+      const future = new Date(Date.now() + 60_000).toISOString();
+      const remote = seedRemoteOrder({ userId: "user-9", expiresAt: future });
+      mockFindMany.mockResolvedValueOnce(
+        [...persistedByKey.entries()].map(([key, value]) => ({ key, value })),
+      );
+
+      const expired = await pendingOrderBook.getExpiredFromSource(new Date());
+
+      expect(expired.some((o) => o.id === remote.id)).toBe(false);
+    });
+
+    it("excludes a non-PENDING order even if its expiresAt is in the past", async () => {
+      const past = new Date(Date.now() - 60_000).toISOString();
+      const remote = seedRemoteOrder({ userId: "user-9", status: "CANCELLED", expiresAt: past });
+      mockFindMany.mockResolvedValueOnce(
+        [...persistedByKey.entries()].map(([key, value]) => ({ key, value })),
+      );
+
+      const expired = await pendingOrderBook.getExpiredFromSource(new Date());
+
+      expect(expired.some((o) => o.id === remote.id)).toBe(false);
+    });
+  });
+
+  describe("startSync() — converges this worker's local Map with cross-worker add()/cancel() broadcasts", () => {
+    it("applies a remote add() broadcast into the local Map", async () => {
+      await pendingOrderBook.startSync();
+      expect(mockSubscribe).toHaveBeenCalledTimes(1);
+      expect(syncHandlerBox.current).toBeTruthy();
+
+      const remoteOrder = {
+        id: "sync-add-1", orderId: "ord-sync-1", userId: "user-5", symbol: "GBPUSD",
+        side: "SELL", type: "LIMIT", quantity: 1, triggerPrice: 1.25, leverage: 10,
+        marginRequired: 50, notional: 1000, status: "PENDING", createdAt: new Date().toISOString(),
+      };
+      syncHandlerBox.current!({ type: "add", order: remoteOrder });
+
+      expect(pendingOrderBook.getAll().some((o) => o.id === "sync-add-1")).toBe(true);
+    });
+
+    it("applies a remote cancel() broadcast, removing the order from the local Map", async () => {
+      const order = await pendingOrderBook.add(makeOrder({ userId: "user-1" }));
+      await pendingOrderBook.startSync();
+
+      syncHandlerBox.current!({ type: "remove", id: order.id });
+
+      expect(pendingOrderBook.getAll().some((o) => o.id === order.id)).toBe(false);
+    });
+
+    it("does not resurrect an order this worker already knows is terminal (out-of-order add broadcast)", async () => {
+      const order = await pendingOrderBook.add(makeOrder({ userId: "user-1" }));
+      await pendingOrderBook.markTriggered(order.id); // already removed locally
+      await pendingOrderBook.startSync();
+
+      // A stale/out-of-order "add" broadcast for the same id arrives late.
+      syncHandlerBox.current!({ type: "add", order: { ...order, status: "PENDING" } });
+
+      expect(pendingOrderBook.getAll().some((o) => o.id === order.id)).toBe(false);
+    });
   });
 });
