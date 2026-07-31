@@ -99,7 +99,7 @@ receivers:
           {{ range .Alerts }}
           *Alert:* {{ .Annotations.summary }}
           *Details:* {{ .Annotations.description }}
-          *Since:* {{ .StartsAt | humanizeDuration }}
+          *Since:* {{ .StartsAt }}
           {{ end }}
 
   - name: slack-warning
