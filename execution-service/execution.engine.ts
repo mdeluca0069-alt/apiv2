@@ -1,3 +1,5 @@
+import { randomUUID }       from "node:crypto";
+import { Decimal }          from "@prisma/client/runtime/library";
 import { prisma }           from "../shared/db.js";
 import { eventBus }         from "../events-bus/event.bus.js";
 import { fillEngine }       from "./fill.engine.js";
@@ -43,6 +45,18 @@ class ExposureHaltedError extends Error {
  *  which specific limit was hit, not a generic catch-all. */
 class RiskLimitExceededError extends Error {
   constructor(readonly reason: string, detail: string) { super(detail); this.name = "RiskLimitExceededError"; }
+}
+
+/** PHASE2_REMEDIATION (H7): thrown (never returned) inside the unified
+ *  transaction when the execution-fee charge's conditional UPDATE affects
+ *  zero rows (client's free balance can't cover the fee) -- same rollback
+ *  reasoning as the errors above: margin is already locked by this point,
+ *  throwing rolls it back too. In practice this should be rare (the fee is
+ *  typically small relative to the margin already required to have passed
+ *  the checks above), but it must still fail closed rather than let a
+ *  trade open commission-free or push balance negative. */
+class FeeChargeFailedError extends Error {
+  constructor(detail: string) { super(detail); this.name = "FeeChargeFailedError"; }
 }
 
 /** LEDGER_FREEZE.md §0.6: order.controller.ts's pre-trade rejection path
@@ -365,6 +379,55 @@ export class ExecutionEngine {
           throw new RiskLimitExceededError(concentrationCheck.reason, concentrationCheck.detail);
         }
 
+        // ── PHASE2_REMEDIATION (H7): charge the execution fee ─────────────
+        // fillEngine.fill() (above) already computes `fees` -- proportional
+        // to whatever was actually filled (result.filledQuantity), using
+        // the FEE_BPS table in liquidity.provider.ts -- and that exact
+        // figure is already written into Order.fees/Fill.fees/TradeAudit.
+        // fees and surfaced as "commission revenue" on the admin dashboard
+        // (gateway/routes.ts) and in tax reporting. But nothing anywhere in
+        // this codebase ever actually debited it from the client's wallet:
+        // grepping wallet-service/ and this file confirmed the ONLY wallet
+        // operation at position OPEN was the margin lock above -- the fee
+        // was computed, displayed, and counted as revenue, but never
+        // collected. (Contrast with position CLOSE: settlement.engine.ts's
+        // commission.calculator.ts-based charge IS genuinely debited --
+        // this open-time fee was the sole gap.) Charged here, atomically,
+        // via the same conditional-UPDATE-then-INSERT-ledger pattern
+        // checkAndLockMargin() uses, so a client whose free balance can't
+        // cover it fails closed and rolls back the margin lock too, rather
+        // than opening a position commission-free or pushing balance
+        // negative. Debits `balance` directly (not `locked` -- a fee is an
+        // outright charge, not a margin reservation), same ledger shape
+        // (DR CLIENT / CR BROKER_COMMISSION, type COMMISSION) settlement.
+        // engine.ts already uses at close, so admin/statement queries that
+        // aggregate by ledger `type` see one consistent commission model
+        // across both position open and close.
+        if (fillResult.fees > 0) {
+          const feeDecimal = new Decimal(fillResult.fees);
+          const feeCharge = await tx.$queryRaw<Array<{ id: string }>>`
+            WITH debited AS (
+              UPDATE "WalletAccount"
+              SET balance = balance - ${feeDecimal}
+              WHERE "userId" = ${req.userId} AND balance >= ${feeDecimal}
+              RETURNING "userId"
+            )
+            INSERT INTO "LedgerEntry"
+              (id, "userId", currency, amount, type, reference, status, note, "debitAccount", "creditAccount")
+            SELECT
+              ${randomUUID()}, debited."userId", 'USD', ${feeDecimal.negated()}, 'COMMISSION', ${req.orderId},
+              'COMPLETED', ${`Execution fee on ${req.symbol} open (${fillResult.fees.toFixed(2)} USD)`},
+              ${`CLIENT:${req.userId}`}, 'BROKER_COMMISSION'
+            FROM debited
+            RETURNING id
+          `;
+          if (feeCharge.length === 0) {
+            throw new FeeChargeFailedError(
+              `FEE_CHARGE_FAILED: insufficient free balance to cover the ${fillResult.fees.toFixed(2)} USD execution fee`,
+            );
+          }
+        }
+
         // ── 4. Create position ────────────────────────────────────────────
         // For a partial fill, the position covers only the filled portion,
         // with proportional margin; the unfilled remainder is the caller's
@@ -467,6 +530,11 @@ export class ExecutionEngine {
         await orderLifecycle.rejectOrder(req.orderId, err.message);
         emitOrderRejected(req, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: err.reason };
+      }
+      if (err instanceof FeeChargeFailedError) {
+        await orderLifecycle.rejectOrder(req.orderId, err.message);
+        emitOrderRejected(req, err.message);
+        return { status: "REJECTED", orderId: req.orderId, reason: "FEE_CHARGE_FAILED" };
       }
       const reason = `Execution failed: ${(err as Error).message}`;
       await orderLifecycle.rejectOrder(req.orderId, reason);
