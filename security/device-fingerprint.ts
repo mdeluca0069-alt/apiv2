@@ -18,6 +18,7 @@
 
 import { createHmac } from "node:crypto";
 import { getRedis }   from "../shared/redis.js";
+import { getClientIp } from "../shared/client-ip.js";
 import type { IncomingMessage } from "node:http";
 
 const PROFILE_TTL_S = 90 * 24 * 60 * 60;
@@ -63,7 +64,7 @@ export function computeFingerprint(req: IncomingMessage): string {
   const lang     = req.headers["accept-language"]    ?? "";
   const enc      = req.headers["accept-encoding"]    ?? "";
   const platform = req.headers["sec-ch-ua-platform"] ?? "";
-  const rawIp    = (req.headers["x-forwarded-for"]?.toString().split(",")[0] ?? req.socket?.remoteAddress ?? "").trim();
+  const rawIp    = getClientIp(req);
   const subnet   = extractSubnet(rawIp);
   const material = [ua, lang, enc, platform, subnet].join("|");
   return createHmac("sha256", getFingerprintSecret())

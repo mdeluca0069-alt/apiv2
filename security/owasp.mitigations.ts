@@ -37,6 +37,7 @@
 
 import type { IncomingMessage } from "node:http";
 import { normalizeRole } from "./rbac.engine.js";
+import { getClientIp } from "../shared/client-ip.js";
 
 // ─── A01: Broken Access Control ───────────────────────────────────────────────
 
@@ -189,18 +190,16 @@ export function validateJWTClaims(payload: {
 
 /**
  * Extract real client IP from request headers.
- * Handles proxies (X-Forwarded-For) safely.
+ *
+ * PHASE2_REMEDIATION (H18): this used to have its own inline XFF parsing
+ * that trusted the leftmost header entry unconditionally, with no check
+ * of whether the request actually came through a trusted proxy -- the
+ * same spoofing gap found across every other IP-extraction site in the
+ * codebase (shared/http.ts, auth.controller.ts, device-fingerprint.ts).
+ * Delegates to the single canonical, trust-validated implementation.
  */
 export function extractClientIp(req: IncomingMessage): string {
-  // Trust only the FIRST IP in X-Forwarded-For (attacker-controlled IPs are appended)
-  const xff  = req.headers["x-forwarded-for"];
-  if (typeof xff === "string" && xff) {
-    const firstIp = xff.split(",")[0]?.trim();
-    if (firstIp && /^\d{1,3}(\.\d{1,3}){3}$/.test(firstIp)) return firstIp;
-  }
-  const xrip = req.headers["x-real-ip"];
-  if (typeof xrip === "string" && xrip) return xrip;
-  return req.socket.remoteAddress ?? "127.0.0.1";
+  return getClientIp(req);
 }
 
 // ─── A08: Data Integrity Failures ────────────────────────────────────────────

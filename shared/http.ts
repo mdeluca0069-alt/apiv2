@@ -5,6 +5,7 @@ import type { BrokerState } from "./state.js";
 import type { RateLimiter } from "../gateway/rate-limiter.js";
 import type { ClientTier } from "../gateway/rate-limiter.js";
 import { scoreIp, trackVelocity } from "../security/ip-reputation.js";
+import { getClientIp } from "./client-ip.js";
 import { trackEndpoint, trackAdminForbidden } from "../security/event-correlator.js";
 import { logger } from "./logger.js";
 import { wafEngine }    from "../security/waf.engine.js";
@@ -174,7 +175,7 @@ export function createApiServer(options: ApiServerOptions) {
 
     const url      = new URL(req.url ?? "/", "http://localhost");
     const method   = (req.method ?? "GET") as HttpMethod;
-    const clientIp = (req.headers["x-forwarded-for"]?.toString().split(",")[0] ?? req.socket.remoteAddress ?? "unknown").trim();
+    const clientIp = getClientIp(req);
 
     // ── IP reputation check ───────────────────────────────────────────────
     const ipRep = await scoreIp(clientIp).catch(() => null);

@@ -1,6 +1,7 @@
 import { authService }      from "./auth.service.js";
 import { sessionManager }   from "./session.manager.js";
 import { IS_PERSISTENT }    from "../shared/db.js";
+import { getClientIp }      from "../shared/client-ip.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 /**
@@ -22,12 +23,6 @@ type RouteContext = {
   query:       URLSearchParams;
   params:      Record<string, string>;
 };
-
-function extractIp(req: IncomingMessage): string {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string") return forwarded.split(",")[0].trim();
-  return req.socket?.remoteAddress ?? "unknown";
-}
 
 function setCookieHeader(res: ServerResponse, token: string): void {
   const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
@@ -56,7 +51,7 @@ export const authController = {
     const body = ctx.body as Record<string, unknown>;
     const email    = String(body?.email    ?? "");
     const password = String(body?.password ?? "");
-    const ip       = extractIp(ctx.req);
+    const ip       = getClientIp(ctx.req);
     const ua       = String(ctx.req.headers["user-agent"] ?? "");
 
     const result = await authService.login(email, password, { ip, userAgent: ua });
@@ -91,7 +86,7 @@ export const authController = {
     const body     = ctx.body as Record<string, unknown>;
     const mfaToken = String(body?.mfaToken ?? "");
     const code     = String(body?.code     ?? "");
-    const ip       = extractIp(ctx.req);
+    const ip       = getClientIp(ctx.req);
     const ua       = String(ctx.req.headers["user-agent"] ?? "");
 
     if (!mfaToken || !code) {
