@@ -81,6 +81,19 @@ export async function assertAccountEligibleToTrade(userId: string): Promise<{ el
   return { eligible: true };
 }
 
+/**
+ * PHASE2_REMEDIATION (H6): execution.engine.ts's atomic transaction needs
+ * the user's tier to call clientExposureLimits.checkAtomic() (tier-keyed
+ * limits), but ExecutionRequest doesn't carry it -- reuses the same 60s
+ * TTL cache preTradeCheck() itself uses, same pattern as
+ * assertAccountEligibleToTrade() above, rather than adding a second,
+ * differently-timed cache or a fresh DB round trip inside the transaction.
+ */
+export async function getCachedUserTier(userId: string): Promise<string> {
+  const user = await getCachedUser(userId);
+  return user?.tier ?? "STANDARD";
+}
+
 async function getCachedInstrument(symbol: string): Promise<CachedInstrument | null> {
   const now = Date.now();
   const hit  = instrumentCache.get(symbol);

@@ -117,3 +117,53 @@ describe("ConcentrationGuard.check()", () => {
     expect(result.ok).toBe(false);
   });
 });
+
+describe("ConcentrationGuard.checkAtomic() — PHASE2_REMEDIATION (H6)", () => {
+  // check() (above) reads Position rows live but takes no lock -- two
+  // near-simultaneous orders for the same client could both pass the same
+  // pre-order HHI snapshot and both commit. checkAtomic() closes that gap:
+  // called inside execution.engine.ts's transaction, under a
+  // pg_advisory_xact_lock(hashtext(userId)) -- the SAME lock key
+  // ClientExposureLimitsChecker.checkAtomic() uses, since both guard the
+  // same resource (this client's open-position set).
+  function rawRow(symbol: string, quantity: number, entryPrice: number) {
+    return { symbol, quantity: String(quantity), entryPrice: String(entryPrice) };
+  }
+
+  function makeTx(rows: ReturnType<typeof rawRow>[]) {
+    return { $queryRaw: vi.fn().mockResolvedValue(rows) };
+  }
+
+  it("exempts a client's first position (would result in only 1 open position)", async () => {
+    const tx = makeTx([]);
+    const result = await concentrationGuard.checkAtomic(tx as never, "user-1", "EURUSD", 100_000);
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects a 3rd position that would dominate the portfolio, computed from the SAME live-queried rows checkAtomic() itself fetched", async () => {
+    const tx = makeTx([rawRow("EURUSD", 5_000, 1.0), rawRow("GBPUSD", 5_000, 1.0)]);
+
+    const result = await concentrationGuard.checkAtomic(tx as never, "user-1", "USDJPY", 90_000);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("CONCENTRATION_LIMIT_EXCEEDED");
+  });
+
+  it("accepts adding to an existing symbol when the resulting book stays diversified", async () => {
+    const tx = makeTx([rawRow("EURUSD", 40_000, 1.0), rawRow("GBPUSD", 40_000, 1.0)]);
+    const result = await concentrationGuard.checkAtomic(tx as never, "user-1", "USDJPY", 20_000);
+    expect(result.ok).toBe(true);
+  });
+
+  it("acquires the advisory lock scoped to userId, inside the caller's own transaction (no separate transaction opened)", async () => {
+    const tx = makeTx([]);
+
+    await concentrationGuard.checkAtomic(tx as never, "user-42", "EURUSD", 1_000);
+
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    const sql = (tx.$queryRaw.mock.calls[0]![0] as TemplateStringsArray).join("");
+    expect(sql).toContain("pg_advisory_xact_lock");
+    expect(sql).toContain("Position");
+    const params = tx.$queryRaw.mock.calls[0]!.slice(1);
+    expect(params).toContain("user-42");
+  });
+});

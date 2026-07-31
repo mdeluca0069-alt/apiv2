@@ -4,12 +4,14 @@ import { fillEngine }       from "./fill.engine.js";
 import { orderLifecycle }   from "../trading-service/order.lifecycle.js";
 import { marginController } from "../risk-service/margin.controller.js";
 import { exposureRegistry } from "../risk-service/exposure.limits.js";
+import { clientExposureLimits } from "../risk-service/client.exposure.limits.js";
+import { concentrationGuard } from "../risk-service/concentration.guard.js";
 import { metrics }          from "../gateway/metrics.js";
 import { reconciliationEngine } from "../settlement/reconciliation.engine.js";
 import { quoteCache }       from "../market-data/quote.cache.js";
 import { checkRequote }     from "./requote.policy.js";
 import { leverageGuard }    from "../risk-service/leverage.guard.js";
-import { assertAccountEligibleToTrade } from "../risk-service/risk.engine.js";
+import { assertAccountEligibleToTrade, getCachedUserTier } from "../risk-service/risk.engine.js";
 import { killSwitch }       from "../risk-service/kill.switch.js";
 import type { ExecutionRequest, ExecutionResult } from "../shared/contracts.js";
 import type { CancelToken }  from "./execution.queue.js";
@@ -30,6 +32,17 @@ class ExecutionCancelledError extends Error {
  *  ExecutionCancelledError above. */
 class ExposureHaltedError extends Error {
   constructor(detail: string) { super(detail); this.name = "ExposureHaltedError"; }
+}
+
+/** PHASE2_REMEDIATION (H6): thrown (never returned) inside the unified
+ *  transaction when the atomic per-client exposure or concentration check
+ *  fails -- same rollback reasoning as ExposureHaltedError above (margin
+ *  is already locked by this point; throwing rolls it back too). Carries
+ *  its own `reason` (CLIENT_EXPOSURE_LIMIT_EXCEEDED /
+ *  CONCENTRATION_LIMIT_EXCEEDED) so the client-visible rejection reflects
+ *  which specific limit was hit, not a generic catch-all. */
+class RiskLimitExceededError extends Error {
+  constructor(readonly reason: string, detail: string) { super(detail); this.name = "RiskLimitExceededError"; }
 }
 
 /** LEDGER_FREEZE.md §0.6: order.controller.ts's pre-trade rejection path
@@ -321,6 +334,37 @@ export class ExecutionEngine {
         );
         if (!exposureCheck.ok) throw new ExposureHaltedError(exposureCheck.detail);
 
+        // ── PHASE2_REMEDIATION (H6): atomic per-client exposure + ────────
+        // concentration checks, same "re-check under lock at the last
+        // moment" pattern as the per-symbol exposure check just above.
+        // risk.engine.ts's preTradeCheck() already runs clientExposureLimits.
+        // check() and concentrationGuard.check() as SOFT pre-trade reads
+        // (both files' own doc comments already flagged this: "a same-
+        // instant double-submit race here could in theory admit one order
+        // slightly over cap") -- two near-simultaneous orders for the same
+        // client could both pass the soft check and both commit, together
+        // breaching a cap neither alone would have. These *Atomic() calls
+        // re-validate live, under the same per-user advisory lock, inside
+        // this same transaction -- a failure rolls back the margin lock and
+        // per-symbol exposure claim too, same as ExposureHaltedError above.
+        // (correlationGuard is deliberately NOT hardened here -- its own
+        // doc comment documents it as advisory/risk-quality, not a capital-
+        // safety invariant, fails open by design; converting it to a hard
+        // atomic gate would be a scope change beyond this atomicity fix.)
+        const tier = await getCachedUserTier(req.userId);
+        const clientExposureCheck = await clientExposureLimits.checkAtomic(
+          tx, req.userId, tier, effectiveNotional,
+        );
+        if (!clientExposureCheck.ok) {
+          throw new RiskLimitExceededError(clientExposureCheck.reason, clientExposureCheck.detail);
+        }
+        const concentrationCheck = await concentrationGuard.checkAtomic(
+          tx, req.userId, req.symbol, effectiveNotional,
+        );
+        if (!concentrationCheck.ok) {
+          throw new RiskLimitExceededError(concentrationCheck.reason, concentrationCheck.detail);
+        }
+
         // ── 4. Create position ────────────────────────────────────────────
         // For a partial fill, the position covers only the filled portion,
         // with proportional margin; the unfilled remainder is the caller's
@@ -418,6 +462,11 @@ export class ExecutionEngine {
         await orderLifecycle.rejectOrder(req.orderId, err.message);
         emitOrderRejected(req, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: "INSTRUMENT_HALTED" };
+      }
+      if (err instanceof RiskLimitExceededError) {
+        await orderLifecycle.rejectOrder(req.orderId, err.message);
+        emitOrderRejected(req, err.message);
+        return { status: "REJECTED", orderId: req.orderId, reason: err.reason };
       }
       const reason = `Execution failed: ${(err as Error).message}`;
       await orderLifecycle.rejectOrder(req.orderId, reason);

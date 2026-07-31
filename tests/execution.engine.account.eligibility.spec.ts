@@ -75,6 +75,16 @@ vi.mock("../settlement/reconciliation.engine.js", () => ({
 const { mockAssertEligible } = vi.hoisted(() => ({ mockAssertEligible: vi.fn() }));
 vi.mock("../risk-service/risk.engine.js", () => ({
   assertAccountEligibleToTrade: mockAssertEligible,
+  getCachedUserTier: vi.fn().mockResolvedValue("STANDARD"),
+}));
+// PHASE2_REMEDIATION (H6): execute()'s transaction now also atomically
+// re-checks per-client exposure/concentration caps -- default to success
+// so this file's tests keep exercising KYC/kill-switch, not these caps.
+vi.mock("../risk-service/client.exposure.limits.js", () => ({
+  clientExposureLimits: { checkAtomic: vi.fn().mockResolvedValue({ ok: true }) },
+}));
+vi.mock("../risk-service/concentration.guard.js", () => ({
+  concentrationGuard: { checkAtomic: vi.fn().mockResolvedValue({ ok: true }) },
 }));
 
 const { mockIsActive, mockGetState } = vi.hoisted(() => ({

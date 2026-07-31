@@ -123,3 +123,58 @@ describe("ClientExposureLimitsChecker.check()", () => {
     expect(vipResult.ok).toBe(true);
   });
 });
+
+describe("ClientExposureLimitsChecker.checkAtomic() — PHASE2_REMEDIATION (H6)", () => {
+  // check() (above) reads Position rows live but takes no lock -- this
+  // class's own doc comment already flagged that as a same-instant
+  // double-submit race that could admit one order slightly over cap.
+  // checkAtomic() closes that gap: called inside execution.engine.ts's
+  // transaction, under a pg_advisory_xact_lock(hashtext(userId)).
+  function rawRow(symbol: string, quantity: number, entryPrice: number) {
+    return { symbol, quantity: String(quantity), entryPrice: String(entryPrice) };
+  }
+
+  function makeTx(rows: ReturnType<typeof rawRow>[]) {
+    return { $queryRaw: vi.fn().mockResolvedValue(rows) };
+  }
+
+  it("accepts when the client has no open positions and the order is well under the tier cap", async () => {
+    const tx = makeTx([]);
+
+    const result = await clientExposureLimits.checkAtomic(tx as never, "user-1", "STANDARD", 10_000);
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects when projected notional would exceed the tier's cap, computed from the SAME live-queried rows checkAtomic() itself fetched", async () => {
+    const tx = makeTx([rawRow("EURUSD", 100_000, 1.1)]); // 110,000 notional open
+
+    const limit = CLIENT_EXPOSURE_LIMITS.STANDARD.maxNotionalUsd;
+    const incoming = limit - 110_000 + 1;
+
+    const result = await clientExposureLimits.checkAtomic(tx as never, "user-1", "STANDARD", incoming);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("CLIENT_EXPOSURE_LIMIT_EXCEEDED");
+  });
+
+  it("rejects when opening the position would exceed the tier's max open position count", async () => {
+    const limit = CLIENT_EXPOSURE_LIMITS.STANDARD.maxOpenPositions;
+    const tx = makeTx(Array.from({ length: limit }, () => rawRow("EURUSD", 10, 1.0)));
+
+    const result = await clientExposureLimits.checkAtomic(tx as never, "user-1", "STANDARD", 100);
+    expect(result.ok).toBe(false);
+  });
+
+  it("acquires the advisory lock scoped to userId, inside the caller's own transaction (no separate transaction opened)", async () => {
+    const tx = makeTx([]);
+
+    await clientExposureLimits.checkAtomic(tx as never, "user-42", "STANDARD", 1_000);
+
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    const sql = (tx.$queryRaw.mock.calls[0]![0] as TemplateStringsArray).join("");
+    expect(sql).toContain("pg_advisory_xact_lock");
+    expect(sql).toContain("Position");
+    // userId is a bound param, not string-interpolated into the SQL text.
+    const params = tx.$queryRaw.mock.calls[0]!.slice(1);
+    expect(params).toContain("user-42");
+  });
+});

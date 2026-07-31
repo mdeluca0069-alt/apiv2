@@ -23,8 +23,12 @@
  * a client whose book is more concentrated than roughly "2.5 equal-weighted
  * positions" is blocked from concentrating further.
  */
+import type { Prisma } from "@prisma/client";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { liveNotional } from "../market-data/position.valuation.js";
+
+/** See order.lifecycle.ts / exposure.limits.ts — same composability contract. */
+type Db = Prisma.TransactionClient | typeof prisma;
 
 const MIN_POSITIONS_BEFORE_ENFORCEMENT = 3;
 const MAX_CONCENTRATION_HHI_PCT        = 40; // same 0-100 scale as exposure.analytics.ts's concentrationRisk
@@ -49,6 +53,66 @@ class ConcentrationGuard {
     const bySymbol = new Map<string, number>();
     for (const p of positions) {
       const notional = liveNotional({ symbol: p.symbol, quantity: p.quantity.toNumber(), entryPrice: p.entryPrice.toNumber() });
+      bySymbol.set(p.symbol, (bySymbol.get(p.symbol) ?? 0) + notional);
+    }
+    bySymbol.set(symbol, (bySymbol.get(symbol) ?? 0) + incomingNotional);
+
+    const grossTotal = [...bySymbol.values()].reduce((sum, n) => sum + n, 0);
+    if (grossTotal <= 0) return { ok: true };
+
+    const hhi = [...bySymbol.values()].reduce((sum, n) => sum + (n / grossTotal) ** 2, 0);
+    const concentrationPct = Math.round(hhi * 10000) / 100;
+
+    if (concentrationPct > MAX_CONCENTRATION_HHI_PCT) {
+      return {
+        ok:     false,
+        reason: "CONCENTRATION_LIMIT_EXCEEDED",
+        detail: `Opening this position would bring portfolio concentration (HHI) to ${concentrationPct.toFixed(1)}, exceeding the ${MAX_CONCENTRATION_HHI_PCT} limit`,
+      };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * PHASE2_REMEDIATION (H6): atomic, cluster-wide version of check() above.
+   *
+   * check() (the pre-trade advisory read) reads Position rows live but
+   * takes no lock -- two near-simultaneous orders for the same client can
+   * both read the same pre-order position set, both compute a projected
+   * HHI under the cap, and both commit, together pushing the client's real
+   * concentration above the limit neither individual check would have
+   * allowed alone.
+   *
+   * Same pattern as exposure.limits.ts's checkCanOpenAtomic() / client.
+   * exposure.limits.ts's checkAtomic(): must be called inside the same DB
+   * transaction that will create the position (execution.engine.ts).
+   * Shares the same `pg_advisory_xact_lock(hashtext(userId))` key as
+   * ClientExposureLimitsChecker.checkAtomic() -- both guard the same
+   * resource (this client's open-position set) and Postgres advisory
+   * locks are re-entrant within a transaction, so acquiring the same key
+   * twice in one transaction is a safe no-op the second time, not a
+   * self-deadlock.
+   */
+  async checkAtomic(
+    tx:               Db,
+    userId:           string,
+    symbol:           string,
+    incomingNotional: number,
+  ): Promise<ConcentrationCheckResult> {
+    if (!IS_PERSISTENT) return { ok: true };
+
+    const rows = await tx.$queryRaw<Array<{ symbol: string; quantity: string; entryPrice: string }>>`
+      WITH lock_acquired AS (SELECT pg_advisory_xact_lock(hashtext(${userId})))
+      SELECT p.symbol, p.quantity, p."entryPrice"
+      FROM "Position" p, lock_acquired
+      WHERE p."userId" = ${userId} AND p.status = 'OPEN'
+    `;
+
+    if (rows.length + 1 < MIN_POSITIONS_BEFORE_ENFORCEMENT) return { ok: true };
+
+    const bySymbol = new Map<string, number>();
+    for (const p of rows) {
+      const notional = liveNotional({ symbol: p.symbol, quantity: parseFloat(p.quantity), entryPrice: parseFloat(p.entryPrice) });
       bySymbol.set(p.symbol, (bySymbol.get(p.symbol) ?? 0) + notional);
     }
     bySymbol.set(symbol, (bySymbol.get(symbol) ?? 0) + incomingNotional);
