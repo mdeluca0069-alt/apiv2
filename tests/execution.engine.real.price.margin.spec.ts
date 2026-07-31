@@ -25,7 +25,12 @@ const { mockTx, mockPrisma } = vi.hoisted(() => {
   const mockTx = {
     $queryRaw:   vi.fn(),
     $executeRaw: vi.fn().mockResolvedValue(undefined),
-    position:    { create: vi.fn() },
+    // PHASE2_REMEDIATION (H4): checkAndLockMargin()'s atomic claim now also
+    // reads open positions to compute live unrealizedPnl -- empty here (this
+    // file is about the ORDER's own margin, not other positions' P&L), so
+    // the equity-aware gate reduces to the old balance-only behavior for
+    // every test below.
+    position:    { create: vi.fn(), findMany: vi.fn().mockResolvedValue([]) },
     walletAccount: { update: vi.fn().mockResolvedValue({}) },
     ledgerEntry: { create: vi.fn().mockResolvedValue({}) },
     outboxEvent: { create: vi.fn() },

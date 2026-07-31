@@ -26,7 +26,9 @@ const { mockTx, mockPrisma } = vi.hoisted(() => {
   const mockTx = {
     $queryRaw:   vi.fn(),
     $executeRaw: vi.fn().mockResolvedValue(undefined),
-    position:    { create: vi.fn() },
+    // PHASE2_REMEDIATION (H4): checkAndLockMargin()'s atomic claim now also
+    // reads open positions to compute live unrealizedPnl -- empty here.
+    position:    { create: vi.fn(), findMany: vi.fn().mockResolvedValue([]) },
     walletAccount: { update: vi.fn().mockResolvedValue({}) },
     ledgerEntry: { create: vi.fn().mockResolvedValue({}) },
     outboxEvent: { create: vi.fn() },

@@ -13,32 +13,29 @@ import type { MarginState } from "../shared/contracts.js";
 type Db = Prisma.TransactionClient | typeof prisma;
 
 export class MarginController {
-  async getMarginState(userId: string): Promise<MarginState> {
-    const [wallet, openPositions] = await Promise.all([
-      prisma.walletAccount.findUnique({ where: { userId } }),
-      prisma.position.findMany({
-        where:  { userId, status: "OPEN" },
-        select: { symbol: true, side: true, quantity: true, entryPrice: true, marginUsed: true },
-      }),
-    ]);
-
-    if (!wallet) throw new Error(`WALLET_NOT_FOUND:${userId}`);
-
-    const balance    = wallet.balance.toNumber();
-    const marginUsed = openPositions.reduce((s: number, p) => s + p.marginUsed.toNumber(), 0);
-
-    // FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #2): live floating P&L from current
-    // quotes, not the persisted Position.pnl column — that column is only
-    // refreshed every 5s by PositionPriceMonitor's in-memory cache, which can
-    // silently and permanently drop a position on a transient error, freezing
-    // its pnl at its creation-time value (0) for the life of the process.
-    // This is the pre-trade risk gate (canAcceptOrder below feeds
-    // risk.engine.ts's preTradeCheck) — it must never approve an order
-    // against phantom free margin. A position with no live quote right now
-    // contributes 0 (skipped), same limitation as ledger.engine.ts's
-    // withdrawal fix (FASE 4.1) — strictly safer than reading a stale
-    // number, not a guarantee every position's real risk is captured.
-    const unrealizedPnl = openPositions.reduce((sum, p) => {
+  /**
+   * FASE 4.2 (RISK_ENGINE_FREEZE.md Bug #2): live floating P&L from current
+   * quotes, not the persisted Position.pnl column — that column is only
+   * refreshed every 5s by PositionPriceMonitor's in-memory cache, which can
+   * silently and permanently drop a position on a transient error, freezing
+   * its pnl at its creation-time value (0) for the life of the process.
+   * This feeds getMarginState() (the pre-trade risk gate — canAcceptOrder
+   * below feeds risk.engine.ts's preTradeCheck) AND, since PHASE2_REMEDIATION
+   * H4, checkAndLockMargin()'s own atomic claim — it must never approve an
+   * order, in either place, against phantom free margin. A position with no
+   * live quote right now contributes 0 (skipped), same limitation as
+   * ledger.engine.ts's withdrawal fix (FASE 4.1) — strictly safer than
+   * reading a stale number, not a guarantee every position's real risk is
+   * captured. Accepts `db` so the atomic-claim call site can read within its
+   * own transaction, same composability contract as checkAndLockMargin/
+   * releaseMargin.
+   */
+  private async _computeUnrealizedPnl(db: Db, userId: string): Promise<number> {
+    const openPositions = await db.position.findMany({
+      where:  { userId, status: "OPEN" },
+      select: { symbol: true, side: true, quantity: true, entryPrice: true },
+    });
+    return openPositions.reduce((sum, p) => {
       const quote = quoteCache.get(p.symbol);
       if (!quote) return sum;
       const { rawPnl } = pnlCalculator.unrealized(
@@ -46,6 +43,22 @@ export class MarginController {
       );
       return sum + rawPnl;
     }, 0);
+  }
+
+  async getMarginState(userId: string): Promise<MarginState> {
+    const [wallet, openPositions, unrealizedPnl] = await Promise.all([
+      prisma.walletAccount.findUnique({ where: { userId } }),
+      prisma.position.findMany({
+        where:  { userId, status: "OPEN" },
+        select: { marginUsed: true },
+      }),
+      this._computeUnrealizedPnl(prisma, userId),
+    ]);
+
+    if (!wallet) throw new Error(`WALLET_NOT_FOUND:${userId}`);
+
+    const balance    = wallet.balance.toNumber();
+    const marginUsed = openPositions.reduce((s: number, p) => s + p.marginUsed.toNumber(), 0);
 
     const equity = balance + unrealizedPnl;
     const freeMargin    = equity - marginUsed;
@@ -85,6 +98,29 @@ export class MarginController {
     db?: Db,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const run = async (tx: Db): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      // PHASE2_REMEDIATION (H4): this is the one atomic, race-proof margin
+      // gate in the platform -- every caller (order.controller.ts,
+      // execution.engine.ts) reaches it AFTER risk.engine.ts's preTradeCheck()
+      // already ran the correct equity-based canAcceptOrder() check. But
+      // preTradeCheck() is a plain, non-locking read: two near-simultaneous
+      // orders for the same user can both read the same equity snapshot and
+      // both pass it, so THIS conditional UPDATE is what has to be the real,
+      // final safety net. It previously gated on `balance - locked` alone --
+      // ignoring unrealized P&L on the user's other open positions entirely.
+      // An account already carrying a large floating LOSS could still lock
+      // margin for a brand-new position as if every dollar of balance were
+      // free, exactly the gap preTradeCheck()'s equity-aware check upstream
+      // was supposed to prevent -- silently falling back to balance-only
+      // here made the supposedly-authoritative gate weaker than the
+      // advisory one in front of it. unrealizedPnl is computed fresh, right
+      // here (live quotes, see _computeUnrealizedPnl's docstring) --
+      // necessarily a best-effort read (quotes aren't a Postgres column, so
+      // this can't be part of the same atomic statement), the same
+      // tolerance already accepted everywhere else in this codebase that
+      // derives equity from live quotes.
+      const unrealizedPnl = await this._computeUnrealizedPnl(tx, userId);
+      const pnlAdjustment = new Decimal(unrealizedPnl);
+
       // FASE 2.2/2.3 perf: the conditional wallet UPDATE and the MARGIN_LOCK
       // ledger INSERT are one round trip via a data-modifying CTE, instead of
       // two separate statements. The INSERT's SELECT ... FROM locked draws
@@ -101,8 +137,8 @@ export class MarginController {
           UPDATE "WalletAccount"
           SET locked = locked + ${new Decimal(required)}
           WHERE "userId" = ${userId}
-            AND balance > 0
-            AND (balance - locked) >= ${new Decimal(required)}
+            AND (balance + ${pnlAdjustment}) > 0
+            AND (balance + ${pnlAdjustment} - locked) >= ${new Decimal(required)}
           RETURNING "userId"
         )
         INSERT INTO "LedgerEntry"
@@ -124,7 +160,7 @@ export class MarginController {
           SELECT balance, locked FROM "WalletAccount" WHERE "userId" = ${userId}
         `;
         if (rows.length === 0) return { ok: false as const, reason: `WALLET_NOT_FOUND:${userId}` };
-        const available = parseFloat(rows[0].balance) - parseFloat(rows[0].locked);
+        const available = parseFloat(rows[0].balance) + unrealizedPnl - parseFloat(rows[0].locked);
         return {
           ok:     false as const,
           reason: `INSUFFICIENT_MARGIN: need ${required.toFixed(2)}, available=${available.toFixed(2)}`,
