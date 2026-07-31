@@ -42,6 +42,25 @@ const ROUTE_PERMISSIONS: Array<[string, RegExp, RoutePermission]> = [
   ["POST",   /^\/api\/v1\/deposit/,                            { resource: "wallet",   action: "write",      sensitivityLevel: "HIGH" }],
   ["GET",    /^\/api\/v1\/ledger/,                             { resource: "wallet",   action: "read",       sensitivityLevel: "MEDIUM" }],
 
+  // PHASE2_REMEDIATION (H16/N1): the admin-side deposit/withdrawal APPROVAL
+  // routes -- the actual money-movement authorization points -- matched no
+  // ROUTE_PERMISSIONS entry at all before this fix, despite POST /api/v1/
+  // withdraw (the CLIENT-initiated side, two rows above) already requiring
+  // CRITICAL+MFA. Any of admin/risk/compliance/super_admin could approve a
+  // withdrawal with no RBAC restriction and no step-up. wallet:write:all is
+  // granted to ADMIN only (rbac.engine.ts's permission matrix does not
+  // grant it to RISK_MANAGER or COMPLIANCE_OFFICER), so this also closes a
+  // segregation-of-duties gap, not just adds MFA. Approve moves real money
+  // and requires step-up; reject does not move money but still requires
+  // the same RBAC restriction, since a wrongful rejection of a legitimate
+  // request is also a form of abuse this control should prevent.
+  ["GET",    /^\/api\/v1\/admin\/deposits\/pending$/,           { resource: "wallet",  action: "read",       sensitivityLevel: "MEDIUM" }],
+  ["GET",    /^\/api\/v1\/admin\/withdrawals\/pending$/,        { resource: "wallet",  action: "read",       sensitivityLevel: "MEDIUM" }],
+  ["POST",   /^\/api\/v1\/admin\/deposits\/[^/]+\/approve$/,    { resource: "wallet",  action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "CAPITAL_OPERATION" }],
+  ["POST",   /^\/api\/v1\/admin\/deposits\/[^/]+\/reject$/,     { resource: "wallet",  action: "write",      sensitivityLevel: "HIGH" }],
+  ["POST",   /^\/api\/v1\/admin\/withdrawals\/[^/]+\/approve$/, { resource: "wallet",  action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "WITHDRAWAL" }],
+  ["POST",   /^\/api\/v1\/admin\/withdrawals\/[^/]+\/reject$/,  { resource: "wallet",  action: "write",      sensitivityLevel: "HIGH" }],
+
   // ── KYC ───────────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/kyc/,                                { resource: "kyc",      action: "read",       sensitivityLevel: "MEDIUM" }],
   ["POST",   /^\/api\/v1\/kyc/,                                { resource: "kyc",      action: "write",      sensitivityLevel: "HIGH" }],
@@ -61,11 +80,32 @@ const ROUTE_PERMISSIONS: Array<[string, RegExp, RoutePermission]> = [
   ["POST",   /^\/api\/v1\/admin\/risk/,                        { resource: "risk",     action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
   ["GET",    /^\/api\/v1\/admin\/risk/,                        { resource: "risk",     action: "read",       sensitivityLevel: "HIGH" }],
 
-  // ── Admin: Users ───────────────────────────────────────────────────────────
-  ["GET",    /^\/api\/v1\/admin\/users/,                       { resource: "users",    action: "read",       sensitivityLevel: "HIGH" }],
-  ["POST",   /^\/api\/v1\/admin\/users/,                       { resource: "users",    action: "write",      sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
-  ["DELETE", /^\/api\/v1\/admin\/users/,                       { resource: "users",    action: "delete",     sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
-  ["POST",   /^\/api\/v1\/admin\/trading\/pause/,              { resource: "trading",  action: "override",   sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
+  // ── Admin: Users / Client Management ──────────────────────────────────────
+  // PHASE2_REMEDIATION (H16): these four entries used to target /admin/users
+  // (GET/POST/DELETE) and /admin/trading/pause -- paths that do not exist
+  // anywhere in gateway/routes.ts (a full route audit confirmed zero
+  // matches). Dead ROUTE_PERMISSIONS rows give a false sense of coverage:
+  // the ACTUAL client-management routes (/admin/client-accounts, /admin/
+  // client/:email, /admin/client/tier, /admin/client/kyc) and the actual
+  // kill-switch route (/admin/trading/kill-switch) matched no rule at all,
+  // falling through to "no route-level permission rule — base auth
+  // sufficient" -- any of admin/risk/compliance/super_admin interchangeably,
+  // no RBAC, no MFA. Repointed to the real paths.
+  //
+  // /admin/client/kyc specifically closes a segregation-of-duties BYPASS:
+  // it sets a user's kycStatus directly (state.adminSetKycStatus) and was
+  // reachable by any of the 4 admin-ish roles, while the "official" KYC
+  // approval flow (POST /admin/kyc/cases/:caseId/approve|reject, below)
+  // was already correctly RBAC-restricted to kyc:approve (ADMIN/
+  // COMPLIANCE_OFFICER only, RISK_MANAGER excluded per rbac.engine.ts's
+  // permission matrix). A risk-only staffer blocked from the real approval
+  // endpoint could achieve the identical effect through this route. Now
+  // gated by the same kyc:approve permission as its sibling endpoint.
+  ["GET",    /^\/api\/v1\/admin\/client-accounts$/,            { resource: "users",    action: "read",       sensitivityLevel: "HIGH" }],
+  ["GET",    /^\/api\/v1\/admin\/client\/[^/]+$/,               { resource: "users",    action: "read",       sensitivityLevel: "HIGH" }],
+  ["POST",   /^\/api\/v1\/admin\/client\/tier$/,                { resource: "users",    action: "write",      sensitivityLevel: "HIGH",     requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
+  ["POST",   /^\/api\/v1\/admin\/client\/kyc$/,                 { resource: "kyc",      action: "approve",    sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "KYC_APPROVAL" }],
+  ["POST",   /^\/api\/v1\/admin\/trading\/kill-switch$/,        { resource: "risk",     action: "override",   sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
 
   // ── Admin: Compliance ──────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/admin\/compliance/,                  { resource: "compliance", action: "read",     sensitivityLevel: "HIGH" }],
@@ -82,7 +122,11 @@ const ROUTE_PERMISSIONS: Array<[string, RegExp, RoutePermission]> = [
   // ── Settings ───────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/settings/,                           { resource: "settings", action: "read",       sensitivityLevel: "LOW" }],
   ["POST",   /^\/api\/v1\/settings/,                           { resource: "settings", action: "write",      sensitivityLevel: "HIGH" }],
-  ["POST",   /^\/api\/v1\/admin\/settings/,                    { resource: "settings", action: "configure",  sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
+  // PHASE2_REMEDIATION (H16): /admin/settings never matched any real route
+  // either (same dead-rule issue as the block above) -- repointed to
+  // /admin/broker/spread, a genuine live-pricing configuration route the
+  // audit found with no fine-grained coverage at all.
+  ["POST",   /^\/api\/v1\/admin\/broker\/spread$/,             { resource: "settings", action: "configure",  sensitivityLevel: "CRITICAL", requireMFA: true, mfaOperationClass: "ADMIN_CRITICAL" }],
 
   // ── API Keys ───────────────────────────────────────────────────────────────
   ["GET",    /^\/api\/v1\/api-keys/,                           { resource: "api_keys", action: "read",       sensitivityLevel: "MEDIUM" }],
