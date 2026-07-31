@@ -29,6 +29,12 @@ const { mockTx, mockPrisma } = vi.hoisted(() => {
     walletAccount: { update: vi.fn().mockResolvedValue({}) },
     ledgerEntry: { create: vi.fn().mockResolvedValue({}) },
     outboxEvent: { create: vi.fn() },
+    // PHASE2_REMEDIATION (H2): req.preLockedMargin triggers releaseMargin()
+    // composed into this same tx, which (via immutableAudit.write(tx))
+    // needs auditLog.create -- unused by this file's pre-existing tests
+    // (none set preLockedMargin), but required for the new H2 describe
+    // block below.
+    auditLog:    { create: vi.fn().mockResolvedValue({}) },
   };
   const mockPrisma = {
     $transaction: vi.fn(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx)),
@@ -193,5 +199,58 @@ describe("ExecutionEngine.execute() — margin locked reflects the real fill pri
     // (not 1,000*0.5 = 500, the stale mid-based figure)
     const posCreateArg = mockTx.position.create.mock.calls[0][0] as { data: { marginUsed: { toNumber(): number } } };
     expect(posCreateArg.data.marginUsed.toNumber()).toBeCloseTo(525, 2);
+  });
+});
+
+describe("ExecutionEngine.execute() — PHASE2_REMEDIATION (H2): resting-order true-up (release estimate, lock real)", () => {
+  beforeEach(() => {
+    // These tests simulate a resting order whose placement-time estimate
+    // (1,000) is already reflected in WalletAccount.locked -- unlike the
+    // rest of this file's tests (immediate MARKET fills, nothing pre-locked).
+    mockTx.$queryRaw.mockImplementation(makeQueryRawDispatcher("100000", "1000"));
+  });
+
+  it("releases req.preLockedMargin BEFORE locking the real fill-price amount, when set", async () => {
+    mockFill.mockReturnValue(fillAt(1.0500));
+
+    await executionEngine.execute({ ...REQ, preLockedMargin: 1_000 }, ORIGINAL_QUOTE);
+
+    expect(mockTx.walletAccount.update).toHaveBeenCalledTimes(1);
+    const releaseArg = mockTx.walletAccount.update.mock.calls[0]![0] as { data: { locked: { decrement: { toNumber(): number } } } };
+    expect(releaseArg.data.locked.decrement.toNumber()).toBeCloseTo(1_000, 2);
+
+    const releaseCallOrder = mockTx.walletAccount.update.mock.invocationCallOrder[0]!;
+    const lockCall = mockTx.$queryRaw.mock.calls.find((c) => (c[0] as TemplateStringsArray).join("").includes("SET locked = locked +"));
+    expect(lockCall).toBeDefined();
+    const lockCallIndex = mockTx.$queryRaw.mock.calls.indexOf(lockCall!);
+    const lockCallOrder = mockTx.$queryRaw.mock.invocationCallOrder[lockCallIndex]!;
+    expect(releaseCallOrder).toBeLessThan(lockCallOrder);
+  });
+
+  it("never releases anything for a MARKET order (no preLockedMargin) -- unchanged, single-lock behavior", async () => {
+    mockFill.mockReturnValue(fillAt(1.0500));
+
+    await executionEngine.execute(REQ, ORIGINAL_QUOTE); // REQ has no preLockedMargin
+
+    expect(mockTx.walletAccount.update).not.toHaveBeenCalled();
+  });
+
+  it("locks the real amount, not the pre-locked estimate, after releasing it", async () => {
+    mockFill.mockReturnValue(fillAt(1.0500));
+
+    await executionEngine.execute({ ...REQ, preLockedMargin: 1_000 }, ORIGINAL_QUOTE);
+
+    const lockCall = mockTx.$queryRaw.mock.calls.find((c) => (c[0] as TemplateStringsArray).join("").includes("SET locked = locked +"));
+    const lockedAmount = lockedAmountFromCall(lockCall!);
+    expect(lockedAmount).toBeCloseTo(1_050, 2); // real margin, not the released 1,000 estimate
+  });
+
+  it("still fills successfully even when the pre-locked estimate differs substantially from the real amount", async () => {
+    mockFill.mockReturnValue(fillAt(1.0500));
+
+    const result = await executionEngine.execute({ ...REQ, preLockedMargin: 1_000 }, ORIGINAL_QUOTE);
+
+    expect(result.status).toBe("FILLED");
+    expect(mockTx.position.create).toHaveBeenCalledTimes(1);
   });
 });

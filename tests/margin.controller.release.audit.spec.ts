@@ -120,3 +120,44 @@ describe("MarginController.releaseMargin() — Bug #7 fix", () => {
     expect(emitSpy).toHaveBeenCalledWith("wallet.event", expect.objectContaining({ amount: 50 }));
   });
 });
+
+describe("MarginController.releaseMargin() — PHASE2_REMEDIATION (H2): composable `db` param", () => {
+  // PHASE2_REMEDIATION (H2): execution.engine.ts's resting-order fill
+  // true-up needs to release the placement-time estimate and lock the real
+  // fill-price amount in ONE transaction, so a failure partway through
+  // rolls back both -- the same composability contract checkAndLockMargin()
+  // already had. Mirrors that method's own `db` tests in spirit: when `db`
+  // is supplied, no new prisma.$transaction is opened.
+  it("uses the supplied tx directly instead of opening prisma.$transaction", async () => {
+    setLockedAmount("500");
+    const tx = (prisma as unknown as { __tx: unknown }).__tx;
+
+    await marginController.releaseMargin("user-1", "order-1", 120, tx as never);
+
+    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(mockWalletUpdate).toHaveBeenCalledTimes(1);
+    expect(mockLedgerCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it("still writes the AuditLog row atomically inside the composed tx", async () => {
+    setLockedAmount("500");
+    const tx = (prisma as unknown as { __tx: unknown }).__tx;
+
+    await marginController.releaseMargin("user-1", "order-1", 120, tx as never);
+
+    expect(mockAuditLogCreate).toHaveBeenCalledTimes(1);
+    const entry = mockAuditLogCreate.mock.calls[0][0].data as { action: string; entity: string };
+    expect(entry.action).toBe("margin.released");
+    expect(entry.entity).toBe("order-1");
+  });
+
+  it("defers the metric/event emission to the caller -- the composed transaction hasn't committed yet", async () => {
+    setLockedAmount("500");
+    const tx = (prisma as unknown as { __tx: unknown }).__tx;
+
+    await marginController.releaseMargin("user-1", "order-1", 120, tx as never);
+
+    expect(emitSpy).not.toHaveBeenCalled();
+    expect(mockMetricsInc).not.toHaveBeenCalled();
+  });
+});

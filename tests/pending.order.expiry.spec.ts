@@ -47,6 +47,13 @@ vi.mock("../events-bus/event.bus.js", () => ({
   eventBus: { emit: mockEmit },
 }));
 
+// PHASE2_REMEDIATION (H2): _expireOrder() now releases the margin locked
+// at placement time once an order is confirmed expired.
+const { mockReleaseMargin } = vi.hoisted(() => ({ mockReleaseMargin: vi.fn().mockResolvedValue(undefined) }));
+vi.mock("../risk-service/margin.controller.js", () => ({
+  marginController: { releaseMargin: mockReleaseMargin },
+}));
+
 const { pendingOrderExpiryService } = await import("../trading-service/pending.order.expiry.js");
 
 function pendingOrder(overrides: Partial<Record<string, unknown>> = {}) {
@@ -68,6 +75,7 @@ beforeEach(() => {
   mockGetExpiredFromSource.mockResolvedValue([]);
   mockGetAll.mockReturnValue([]);
   mockTransition.mockResolvedValue(undefined);
+  mockReleaseMargin.mockResolvedValue(undefined);
 });
 
 describe("PendingOrderExpiryService._scan() — PHASE2_REMEDIATION (H1/H3): DB-sourced, not local-Map-sourced", () => {
@@ -159,5 +167,40 @@ describe("PendingOrderExpiryService._scan() — PHASE2_REMEDIATION (H1/H3): DB-s
     await pendingOrderExpiryService.scanNow();
 
     expect(mockRelease).toHaveBeenCalledWith("pending-order-expiry");
+  });
+});
+
+describe("PendingOrderExpiryService._expireOrder() — PHASE2_REMEDIATION (H2): releases margin locked at placement", () => {
+  it("releases the claimed order's margin after a successful expiry claim", async () => {
+    const order = pendingOrder({ marginRequired: 250 });
+    mockGetExpiredFromSource.mockResolvedValue([order]);
+    mockMarkTriggered.mockResolvedValue(order);
+
+    await pendingOrderExpiryService.scanNow();
+
+    expect(mockReleaseMargin).toHaveBeenCalledWith("user-1", "ord-1", 250);
+  });
+
+  it("does not release margin when the claim fails (already filled/cancelled elsewhere)", async () => {
+    const order = pendingOrder();
+    mockGetExpiredFromSource.mockResolvedValue([order]);
+    mockMarkTriggered.mockResolvedValue(null);
+
+    await pendingOrderExpiryService.scanNow();
+
+    expect(mockReleaseMargin).not.toHaveBeenCalled();
+  });
+
+  it("still transitions the order to its terminal status even if the margin release itself fails", async () => {
+    const order = pendingOrder();
+    mockGetExpiredFromSource.mockResolvedValue([order]);
+    mockMarkTriggered.mockResolvedValue(order);
+    mockReleaseMargin.mockRejectedValue(new Error("wallet unreachable"));
+
+    const result = await pendingOrderExpiryService.scanNow();
+
+    expect(result.expired).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(mockTransition).toHaveBeenCalledWith("ord-1", "CANCELLED", expect.any(String), "SYSTEM");
   });
 });

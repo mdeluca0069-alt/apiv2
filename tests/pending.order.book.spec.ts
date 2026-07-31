@@ -103,6 +103,18 @@ vi.mock("../events-bus/event.bus.js", () => ({
   eventBus: { emit: emitSpy, on: vi.fn() },
 }));
 
+// PHASE2_REMEDIATION (H2): cancel() and its DB-fallback/OCO-sibling paths
+// now release margin on every cancellation. Default to success so the
+// pre-existing coverage in this file (which predates H2 and isn't about
+// margin) isn't affected; margin.release.spec.ts below covers the
+// release behavior itself.
+const { mockReleaseMargin } = vi.hoisted(() => ({
+  mockReleaseMargin: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("../risk-service/margin.controller.js", () => ({
+  marginController: { releaseMargin: mockReleaseMargin },
+}));
+
 const { mockPublish, mockSubscribe, syncHandlerBox } = vi.hoisted(() => ({
   mockPublish: vi.fn().mockResolvedValue(undefined),
   mockSubscribe: vi.fn().mockResolvedValue(undefined),

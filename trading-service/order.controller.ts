@@ -1,5 +1,6 @@
 import { randomUUID }           from "node:crypto";
 import { riskEngine }           from "../risk-service/risk.engine.js";
+import { marginController }     from "../risk-service/margin.controller.js";
 import { executionEngine }      from "../execution-service/execution.engine.js";
 import { executionQueue }       from "../execution-service/execution.queue.js";
 import type { CancelToken }     from "../execution-service/execution.queue.js";
@@ -308,6 +309,11 @@ export class OrderController {
         takeProfit:     pending.takeProfit,
         marginRequired: pending.marginRequired,
         notional:       pending.notional,
+        // PHASE2_REMEDIATION (H2): margin for this exact amount was already
+        // locked at placement time (order.controller.ts's _parkPendingOrder()) --
+        // execute() releases it and locks the real, fill-price-derived amount
+        // instead, atomically, rather than locking on top of it.
+        preLockedMargin: pending.marginRequired,
       },
       syntheticQuote,
     );
@@ -319,33 +325,53 @@ export class OrderController {
 
     // PARTIALLY_FILLED: position was opened for the filled portion.
     // Re-queue the remainder as a new resting order at the current execution price.
-    // Margin for the full original quantity was already locked — the remainder's share
-    // is passed through so the pending book record stays accurate for display and release.
+    //
+    // PHASE2_REMEDIATION (H2): execute()'s true-up releases the FULL
+    // pre-locked estimate and locks only the FILLED portion's real margin
+    // (see execution.engine.ts's "release unused margin" step) -- the
+    // remainder's share is NOT left locked, so it must be locked fresh here
+    // before re-parking it, exactly like a brand-new resting order. If that
+    // fails (e.g. the client's free margin no longer covers it), the
+    // remainder is deliberately NOT re-queued -- an unfilled remainder with
+    // no client-facing ack to reject is safer dropped than left resting
+    // unprotected, which is the exact gap this fix closes everywhere else.
     if (result.status === "PARTIALLY_FILLED") {
       const remainingQty = (result as { remainingQuantity?: number }).remainingQuantity ?? 0;
       if (remainingQty > 0) {
-        await pendingOrderBook.add({
-          orderId:        pending.orderId,
-          userId:         pending.userId,
-          symbol:         pending.symbol,
-          side:           pending.side,
-          type:           pending.type,
-          quantity:       remainingQty,
-          triggerPrice:   execPrice,
-          limitPrice:     pending.limitPrice,
-          trailAmount:    pending.trailAmount,
-          leverage:       pending.leverage,
-          stopLoss:       pending.stopLoss,
-          takeProfit:     pending.takeProfit,
-          marginRequired: pending.marginRequired * (remainingQty / pending.quantity),
-          notional:       pending.notional   * (remainingQty / pending.quantity),
-          clientOrderId:  pending.clientOrderId,
-        });
-        console.log(
-          `[order-controller] PARTIAL_FILL remainder re-queued: ` +
-          `orderId=${pending.orderId} filled=${result.filledQuantity} ` +
-          `remaining=${remainingQty} re-trigger@${execPrice}`,
+        const remainderMargin = pending.marginRequired * (remainingQty / pending.quantity);
+        const remainderNotional = pending.notional * (remainingQty / pending.quantity);
+        const remainderLock = await marginController.checkAndLockMargin(
+          pending.userId, pending.orderId, remainderMargin,
         );
+        if (!remainderLock.ok) {
+          console.error(
+            `[order-controller] PARTIAL_FILL remainder NOT re-queued (margin unavailable): ` +
+            `orderId=${pending.orderId} remaining=${remainingQty} reason=${remainderLock.reason}`,
+          );
+        } else {
+          await pendingOrderBook.add({
+            orderId:        pending.orderId,
+            userId:         pending.userId,
+            symbol:         pending.symbol,
+            side:           pending.side,
+            type:           pending.type,
+            quantity:       remainingQty,
+            triggerPrice:   execPrice,
+            limitPrice:     pending.limitPrice,
+            trailAmount:    pending.trailAmount,
+            leverage:       pending.leverage,
+            stopLoss:       pending.stopLoss,
+            takeProfit:     pending.takeProfit,
+            marginRequired: remainderMargin,
+            notional:       remainderNotional,
+            clientOrderId:  pending.clientOrderId,
+          });
+          console.log(
+            `[order-controller] PARTIAL_FILL remainder re-queued: ` +
+            `orderId=${pending.orderId} filled=${result.filledQuantity} ` +
+            `remaining=${remainingQty} re-trigger@${execPrice}`,
+          );
+        }
       }
     }
     // FILLED: normal completion — no further action needed
@@ -523,6 +549,36 @@ export class OrderController {
       },
     });
 
+    // PHASE2_REMEDIATION (H2): lock margin NOW, while the order is accepted
+    // but before it rests unprotected. Root cause this closes: marginRequired
+    // was previously just a stored number on the PendingOrder/Order record --
+    // never moved into WalletAccount.locked until (if ever) the order later
+    // triggered and reached execution.engine.ts, so a client could stack an
+    // unlimited number of resting orders whose combined notional far exceeded
+    // real account equity, with nothing backing any of them while they rested.
+    // A resting order is never accepted here without margin genuinely locked
+    // for it. Released again on cancel/expiry (pending.order.book.ts/
+    // pending.order.expiry.ts) or true-up'd to the real fill price at trigger
+    // time (execution.engine.ts's H2 true-up, via ExecutionRequest.preLockedMargin).
+    const marginLock = await marginController.checkAndLockMargin(userId, order.id, riskResult.marginRequired);
+    if (!marginLock.ok) {
+      await orderLifecycle.rejectOrder(order.id, marginLock.reason).catch(() => {});
+      return {
+        id:              order.id,
+        clientOrderId:   req.clientOrderId,
+        symbol,
+        side:            req.side,
+        type:            req.type ?? "LIMIT",
+        quantity:        req.quantity,
+        requestedPrice:  price,
+        status:          "REJECTED",
+        rejectionReason: marginLock.reason,
+        marginRequired:  riskResult.marginRequired,
+        notional:        riskResult.notional,
+        createdAt:       order.createdAt.toISOString(),
+      };
+    }
+
     // Transition to ACCEPTED (resting, not yet filled)
     await orderLifecycle.transition(order.id, "ACCEPTED",
       `Resting ${type} order @ ${price} — waiting for trigger`, "SYSTEM");
@@ -555,6 +611,10 @@ export class OrderController {
     } catch (addErr) {
       // P0-2: If persistence fails after retries, reject the order so the
       // client knows their resting order was NOT safely stored.
+      // PHASE2_REMEDIATION (H2): also release the margin just locked above --
+      // otherwise a persist failure here would leave the client's margin
+      // orphaned in WalletAccount.locked for an order that was never parked.
+      await marginController.releaseMargin(userId, order.id, riskResult.marginRequired).catch(() => {});
       await orderLifecycle.rejectOrder(order.id, `PENDING_PERSIST_FAILED: ${(addErr as Error).message}`).catch(() => {});
       return {
         id:              order.id,

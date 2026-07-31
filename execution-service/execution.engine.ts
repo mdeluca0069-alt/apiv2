@@ -273,6 +273,26 @@ export class ExecutionEngine {
     let outcome: TxOutcome;
     try {
       outcome = await prisma.$transaction(async (tx) => {
+        // ── PHASE2_REMEDIATION (H2): true-up a resting order's pre-locked
+        // estimate before locking the real, execution-price-derived amount.
+        // order.controller.ts's _parkPendingOrder() now locks
+        // riskResult.marginRequired (a MID-price estimate) at order-
+        // PLACEMENT time, so a resting order is never unbacked while it
+        // rests. By the time it reaches here, the real fill price is known
+        // and realMarginRequired above was recomputed from it -- if we
+        // locked realMarginRequired on top of the still-outstanding
+        // estimate without releasing the estimate first, the client would
+        // be double-charged locked margin for the same order. Released and
+        // re-locked in the SAME transaction as the check-and-lock below, so
+        // a failure (insufficient real margin) rolls back the release too,
+        // leaving the original estimate's lock exactly as it was.
+        // req.preLockedMargin is only ever set for a resting-order fill
+        // (see ExecutionRequest's docstring) -- a MARKET/IOC/FOK order was
+        // never parked and had nothing locked before this transaction.
+        if (req.preLockedMargin !== undefined) {
+          await marginController.releaseMargin(req.userId, req.orderId, req.preLockedMargin, tx);
+        }
+
         // ── 3. Atomic margin check-and-lock ──────────────────────────────
         // FOR UPDATE on the wallet row (inside margin.controller.ts) serializes
         // concurrent margin-lock attempts per user under this same transaction.

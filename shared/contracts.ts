@@ -658,6 +658,17 @@ export type ExecutionRequest = {
   takeProfit?:     number;
   marginRequired:  number;
   notional:        number;
+  /**
+   * PHASE2_REMEDIATION (H2): set only for a resting (LIMIT/STOP/STOP_LIMIT/
+   * TRAILING_STOP) order's fill -- the amount already locked in
+   * WalletAccount.locked at order-PLACEMENT time (order.controller.ts's
+   * _parkPendingOrder()). execute() releases exactly this amount before
+   * locking the real, execution-price-derived margin, so a resting fill is
+   * a true-up (release estimate, lock real) instead of a double-lock.
+   * Omitted for a MARKET/IOC/FOK order, which was never parked and so
+   * never had any margin locked before reaching execute().
+   */
+  preLockedMargin?: number;
 };
 
 export type ExecutionResult =

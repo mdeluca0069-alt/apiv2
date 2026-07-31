@@ -71,6 +71,18 @@ vi.mock("../trading-service/pending.order.book.js", () => ({
   pendingOrderBook: { add: mockPendingAdd, cancel: mockPendingCancel, getForUser: mockGetForUser },
 }));
 
+// PHASE2_REMEDIATION (H2): _parkPendingOrder() now locks margin at
+// placement time before parking a resting order -- default to success so
+// these OCO-placement tests exercise the OCO rollback logic itself, not
+// margin availability (see margin.controller.*.spec.ts for that).
+const { mockCheckAndLockMargin, mockReleaseMargin } = vi.hoisted(() => ({
+  mockCheckAndLockMargin: vi.fn().mockResolvedValue({ ok: true }),
+  mockReleaseMargin: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("../risk-service/margin.controller.js", () => ({
+  marginController: { checkAndLockMargin: mockCheckAndLockMargin, releaseMargin: mockReleaseMargin },
+}));
+
 vi.mock("../trading-service/position.price.monitor.js", () => ({
   positionPriceMonitor: { isAtCapacity: vi.fn().mockReturnValue(false), addPosition: vi.fn() },
   PositionMonitorCapacityError: class PositionMonitorCapacityError extends Error {},

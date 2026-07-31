@@ -2,6 +2,7 @@ import { randomUUID }   from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { eventBus }      from "../events-bus/event.bus.js";
 import { publishControlChannel, subscribeControlChannel } from "../shared/control.channel.js";
+import { marginController } from "../risk-service/margin.controller.js";
 
 const CHANNEL = "pending-order";
 
@@ -288,6 +289,7 @@ class PendingOrderBook {
 
     this.orders.delete(pendingId); // clear any stale local copy, if one existed
     this._markTerminalLocally(pendingId);
+    await this._releaseMarginFor(claimed);
     eventBus.emit("order.cancelled", {
       orderId:   claimed.orderId,
       pendingId: claimed.id,
@@ -347,6 +349,7 @@ class PendingOrderBook {
         if (!claimed) continue;
         this.orders.delete(o.id);
         this._markTerminalLocally(o.id);
+        await this._releaseMarginFor(claimed);
         eventBus.emit("order.cancelled", {
           orderId: claimed.orderId, pendingId: claimed.id, userId: claimed.userId,
           symbol: claimed.symbol, reason, timestamp: new Date().toISOString(),
@@ -358,11 +361,28 @@ class PendingOrderBook {
     }
   }
 
+  /**
+   * PHASE2_REMEDIATION (H2): margin was locked at placement time
+   * (order.controller.ts's _parkPendingOrder()) and must come back to the
+   * client's free balance now that this order will never fill (cancel or
+   * expiry). Non-fatal on failure -- the terminal transition is already
+   * committed by the caller, and an orphaned lock is a narrower, recoverable
+   * problem (caught by the same reconciliation sweep that already handles
+   * orphan margin from other causes) than blocking a cancel/expiry
+   * confirmation on a release hiccup.
+   */
+  private async _releaseMarginFor(order: Pick<PendingOrder, "userId" | "orderId" | "marginRequired">): Promise<void> {
+    await marginController.releaseMargin(order.userId, order.orderId, order.marginRequired).catch((err) => {
+      console.error(`[order-book] margin release failed for order ${order.orderId}:`, (err as Error).message);
+    });
+  }
+
   private async _cancelOne(order: PendingOrder, reason: string): Promise<void> {
     order.status = "CANCELLED";
     this.orders.delete(order.id);
     this._markTerminalLocally(order.id);
     await this._cancelPersisted(order.id, "CANCELLED");
+    await this._releaseMarginFor(order);
 
     eventBus.emit("order.cancelled", {
       orderId:   order.orderId,

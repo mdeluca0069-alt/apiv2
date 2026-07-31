@@ -152,16 +152,28 @@ export class MarginController {
   }
 
   /**
-   * Releases margin back to free balance when a position closes.
+   * Releases margin back to free balance when a position closes (or, since
+   * PHASE2_REMEDIATION H2, when a resting order that had margin locked at
+   * placement is cancelled/expires/is true-up'd at fill time).
    *
    * Uses FOR UPDATE on the wallet row to:
    *   1. Prevent concurrent releases from racing each other to a negative locked value.
    *   2. Clamp the release to the actual current locked amount (safe against orphan-release).
+   *
+   * PHASE2_REMEDIATION (H2): accepts an optional `db` (an already-open
+   * Prisma.TransactionClient), same composability contract as
+   * checkAndLockMargin() above -- execution.engine.ts's resting-order fill
+   * path needs to release the placement-time estimate and lock the real
+   * fill-price-derived amount atomically, in ONE transaction, so a failure
+   * partway through rolls back both instead of leaving the wallet in an
+   * inconsistent released-but-not-relocked state. Omit `db` for the
+   * original standalone behavior (own transaction, unchanged for cancel/
+   * expiry callers and the pre-existing partial-fill unused-margin release).
    */
-  async releaseMargin(userId: string, positionId: string, amount: number): Promise<void> {
+  async releaseMargin(userId: string, positionId: string, amount: number, db?: Db): Promise<void> {
     let released = 0;
 
-    await prisma.$transaction(async (tx) => {
+    const run = async (tx: Db) => {
       const rows = await tx.$queryRaw<Array<{ locked: string }>>`
         SELECT locked FROM "WalletAccount" WHERE "userId" = ${userId} FOR UPDATE
       `;
@@ -203,7 +215,21 @@ export class MarginController {
       }, tx);
 
       released = safeRelease;
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 3000, timeout: 8000 });
+    };
+
+    if (db) {
+      // Composed into the caller's own (not-yet-committed) transaction --
+      // defer the metric/event to the caller, which knows the outer
+      // transaction's real outcome (see execution.engine.ts's H2 true-up:
+      // it emits its own event/metric only after the whole transaction
+      // commits, the same way it already defers every other side effect
+      // of a fill). The immutableAudit write inside run() above still
+      // happens atomically with the release either way.
+      await run(db);
+      return;
+    }
+
+    await prisma.$transaction(run, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 3000, timeout: 8000 });
 
     if (released > 0) {
       metrics.inc("partial_fill_margin_released_total");

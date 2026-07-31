@@ -13,11 +13,17 @@
  * was filled between the expiry check and the transition, `markTriggered` returns
  * null and the transition is skipped. The Order row will already be FILLED.
  *
- * This service does NOT release margin on expiry — margin was reserved when the
- * pending order was created and must remain locked until the order reaches a
- * terminal state (FILLED, CANCELLED, LIMIT_EXPIRED, REJECTED). The broker's
- * reconciliation engine detects and releases orphan margin for expired orders
- * that were not filled.
+ * PHASE2_REMEDIATION (H2): margin IS released on expiry now. CANCELLED and
+ * LIMIT_EXPIRED (the two terminal statuses this service assigns) are
+ * themselves terminal states, so per this file's own margin-lifecycle rule
+ * ("remain locked until the order reaches a terminal state"), expiry is
+ * exactly the point margin must come back to the client -- the previous
+ * version of this comment asserted margin stayed locked through expiry
+ * while simultaneously describing expiry as terminal, an internal
+ * contradiction that traced back to margin never actually being locked at
+ * placement in the first place (see order.controller.ts's
+ * _parkPendingOrder() and pending.order.book.ts's cancel() paths for the
+ * placement-time lock and the other release points).
  *
  * Wiring: call start() in main.ts alongside orderTriggerWatcher.start().
  */
@@ -26,6 +32,7 @@ import { pendingOrderBook } from "./pending.order.book.js";
 import { orderLifecycle }   from "./order.lifecycle.js";
 import { eventBus }         from "../events-bus/event.bus.js";
 import { jobCoordinator }   from "../realtime-infra/job.coordinator.js";
+import { marginController } from "../risk-service/margin.controller.js";
 import type { PendingOrder } from "./pending.order.book.js";
 
 export class PendingOrderExpiryService {
@@ -101,6 +108,15 @@ export class PendingOrderExpiryService {
     // If it returns null the order was already processed (filled or cancelled).
     const removed = await pendingOrderBook.markTriggered(order.id);
     if (!removed) return;
+
+    // PHASE2_REMEDIATION (H2): margin was locked at placement time and must
+    // come back to the client's free balance now that this order will
+    // never fill -- see this file's docstring. Non-fatal on failure (same
+    // reasoning as pending.order.book.ts's cancel-path release): the
+    // expiry transition below still proceeds either way.
+    await marginController.releaseMargin(removed.userId, removed.orderId, removed.marginRequired).catch((err) => {
+      console.error(`[order-expiry] margin release failed for expired order ${removed.orderId}:`, (err as Error).message);
+    });
 
     const terminalStatus = order.armedByStopLimit ? "LIMIT_EXPIRED" : "CANCELLED";
     const detail = order.armedByStopLimit
