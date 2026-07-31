@@ -2,6 +2,7 @@ import { prisma }       from "../shared/db.js";
 import type { KillSwitchState } from "../shared/contracts.js";
 import { alertManager } from "../alerting/alert.manager.js";
 import { metrics }      from "../gateway/metrics.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { publishControlChannel, subscribeControlChannel } from "../shared/control.channel.js";
 
 const SETTING_KEY = "kill_switch";
@@ -57,6 +58,19 @@ export class KillSwitch {
     metrics.inc("kill_switch_activations_total");
     void alertManager.killSwitchActivated(reason, activatedBy);
     void publishControlChannel(CHANNEL, _cached);
+    // PHASE2_REMEDIATION (H16, admin audit-log gap): this is the single
+    // most severe control in the platform -- it halts ALL trading
+    // cluster-wide -- yet had zero record in the permanent, hash-chained
+    // AuditLog. The BrokerSetting row above is overwritten on every state
+    // change (no history) and alertManager's notification is transient,
+    // not a queryable historical record. Mirrors the actor/action/entity/
+    // payload shape already used throughout this codebase.
+    await immutableAudit.write({
+      actor:   activatedBy,
+      action:  "kill_switch.activated",
+      entity:  "platform",
+      payload: { reason, activatedAt: _cached.activatedAt } as object,
+    });
   }
 
   async deactivate(deactivatedBy: string): Promise<void> {
@@ -66,6 +80,12 @@ export class KillSwitch {
     };
     await this._persist();
     void publishControlChannel(CHANNEL, _cached);
+    await immutableAudit.write({
+      actor:   deactivatedBy,
+      action:  "kill_switch.deactivated",
+      entity:  "platform",
+      payload: { reason: _cached.reason } as object,
+    });
   }
 
   private async _persist(): Promise<void> {

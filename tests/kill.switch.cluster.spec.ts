@@ -21,6 +21,12 @@ const { mockUpsert, mockKillSwitchActivated, mockPublish, mockSubscribe } = vi.h
 
 vi.mock("../shared/db.js", () => ({
   prisma: { brokerSetting: { upsert: mockUpsert, findUnique: vi.fn().mockResolvedValue(null) } },
+  // PHASE2_REMEDIATION (H16): kill.switch.ts now also calls immutableAudit.write(),
+  // which itself imports { prisma, IS_PERSISTENT } from this same module. Its guard
+  // (`if (!IS_PERSISTENT || !prisma) return id;`) means IS_PERSISTENT: false makes
+  // the audit write a safe no-op here -- this spec is about cross-worker propagation,
+  // not persistence, which is covered separately in kill.switch.audit.spec.ts.
+  IS_PERSISTENT: false,
 }));
 vi.mock("../alerting/alert.manager.js", () => ({
   alertManager: { killSwitchActivated: mockKillSwitchActivated },
