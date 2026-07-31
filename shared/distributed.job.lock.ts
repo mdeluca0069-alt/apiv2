@@ -50,6 +50,28 @@ export class DistributedJobLock {
    * Returns true if acquired (this worker should run the job).
    * Returns false if another worker holds the lock.
    * Returns true if Redis is unavailable (graceful degradation).
+   *
+   * CRITICAL_REMEDIATION (C17): the `!redis` branch below only covers
+   * Redis never having been configured/initialized at all. A Redis
+   * OUTAGE after a successful start -- the case this class's own
+   * docstring ("Degraded mode: when Redis is unavailable getRedis()
+   * returns null") and jobCoordinator.tryLead()'s docstring ("When Redis
+   * is unavailable, always returns true") both claim to handle -- left
+   * getRedis() returning the same non-null client object it always did;
+   * only the actual `redis.set(...)` call below would reject. That
+   * rejection was never caught here (unlike startRenewal()/release() in
+   * this same class, which both already wrap their Redis calls in
+   * try/catch for exactly this reason), so it propagated straight out of
+   * tryAcquire() -> jobCoordinator.tryLead() as an unhandled rejection.
+   * Every documented call site (`if (!(await jobCoordinator.tryLead(...)))
+   * return;`) calls tryLead() BEFORE its own try/finally block, so this
+   * uncaught throw skipped the job entirely, every single cycle, for the
+   * full duration of any Redis outage -- stop-out scan, liquidation
+   * watchdog, pending-order-expiry, and every other job.coordinator.ts-
+   * registered job. The documented "fail open" contract was correct in
+   * intent and correct for the "never configured" case; it just never
+   * reached the "was working, now erroring" case, which is what an actual
+   * outage looks like.
    */
   async tryAcquire(): Promise<boolean> {
     const redis = getRedis();
@@ -59,7 +81,14 @@ export class DistributedJobLock {
     }
 
     this.leaseId = randomUUID();
-    const result = await redis.set(this.key, this.leaseId, "EX", this.ttlSeconds, "NX");
+    let result: string | null;
+    try {
+      result = await redis.set(this.key, this.leaseId, "EX", this.ttlSeconds, "NX");
+    } catch (err) {
+      this.leaseId = null;
+      console.warn(`[dist-lock] job "${this.jobId}" — Redis error acquiring lock, running without coordination:`, (err as Error).message);
+      return true;
+    }
     const acquired = result === "OK";
 
     if (!acquired) {

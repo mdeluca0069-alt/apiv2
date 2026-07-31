@@ -159,6 +159,79 @@ describe("tryAcquire() — Redis unavailable", () => {
   });
 });
 
+// ─── 3b. tryAcquire() — CRITICAL_REMEDIATION (C17): Redis OUTAGE mid-operation ─
+//
+// Distinct from "Redis unavailable" above (getRedis() returns null, i.e.
+// never configured/initialized). This covers getRedis() returning a real,
+// non-null client -- exactly what happens once Redis has connected at
+// least once -- where the actual command REJECTS because the server is
+// now unreachable. Before this fix, that rejection was never caught here
+// (unlike release()/startRenewal() in this same class, which already
+// catch exactly this), so it propagated out of tryAcquire() as an
+// unhandled rejection -- every job.coordinator.ts-registered job
+// (stop-out scan, liquidation watchdog, pending-order-expiry, ...) would
+// silently stop running for the full duration of any Redis outage,
+// contradicting this class's own documented "fail open" contract.
+
+describe("tryAcquire() — Redis OUTAGE mid-operation (C17)", () => {
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getRedisMock.mockReturnValue(mockRedis); // non-null client -- Redis WAS configured
+  });
+
+  it("returns true (fails open) when redis.set() rejects, instead of throwing", async () => {
+    mockRedis.set.mockRejectedValue(new Error("Connection is closed."));
+    const lock = new DistributedJobLock("test-job");
+
+    await expect(lock.tryAcquire()).resolves.toBe(true);
+  });
+
+  it("does not leave a stale leaseId set when the outage causes a fail-open", async () => {
+    mockRedis.set.mockRejectedValue(new Error("Connection is closed."));
+    const lock = new DistributedJobLock("test-job");
+    await lock.tryAcquire();
+
+    // If leaseId were left set, release() would call eval — verify it does NOT.
+    mockRedis.eval.mockResolvedValue(0);
+    await lock.release();
+    expect(mockRedis.eval).not.toHaveBeenCalled();
+  });
+
+  it("a job loop using the documented `if (!(await tryLead())) return;` pattern is NOT skipped during an outage", async () => {
+    // Mirrors the exact pattern documented at the top of job.coordinator.ts
+    // and distributed.job.lock.ts -- proves the fix actually closes the gap
+    // for real call sites, not just the return value in isolation.
+    mockRedis.set.mockRejectedValue(new Error("READONLY You can't write against a read only replica."));
+    const lock = new DistributedJobLock("stop-out-scan", 25);
+
+    let ranJob = false;
+    if (await lock.tryAcquire()) {
+      try {
+        ranJob = true; // stands in for stopOutEngine.scanAll()
+      } finally {
+        await lock.release();
+      }
+    }
+
+    expect(ranJob).toBe(true);
+  });
+
+  it("logs a distinct warning from the 'never configured' case (operators can tell outage apart from no-Redis-configured)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockRedis.set.mockRejectedValue(new Error("Connection is closed."));
+    const lock = new DistributedJobLock("test-job");
+
+    await lock.tryAcquire();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Redis error acquiring lock"),
+      expect.any(String),
+    );
+    warnSpy.mockRestore();
+  });
+});
+
 // ─── 4. release() ─────────────────────────────────────────────────────────────
 
 describe("release()", () => {
