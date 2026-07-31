@@ -130,6 +130,7 @@ import { jobCoordinator }        from "./realtime-infra/job.coordinator.js";
 import { feedHealthMonitor }     from "./market-data/feed.health.monitor.js";
 // ── Task 13: Horizontal Scaling ───────────────────────────────────────────────
 import { wsCluster }             from "./realtime-infra/websocket.cluster.js";
+import { nextConnectionSeq }     from "./realtime-infra/ws.sequence.js";
 import { distributedCache }      from "./realtime-infra/cache.layer.js";
 import { eventArchive }          from "./realtime-infra/event.archive.js";
 import { initReadReplica, disconnectReadReplica } from "./shared/read-replica.js";
@@ -413,6 +414,10 @@ interface AuthenticatedSocket extends WebSocket {
   // to 0 the moment it's found under the mark again. See the keepalive
   // interval below for the terminate policy.
   backpressureStrikes?: number;
+  // PHASE2_REMEDIATION (H8): monotonic counter for THIS connection only,
+  // attached to every outbound message as `seq` -- see sendToSocket's
+  // docstring for why this replaced a userId-keyed shared counter.
+  seq?: number;
 }
 
 // ─── HTTP + WebSocket server ──────────────────────────────────────────────────
@@ -521,6 +526,9 @@ wss.on("connection", (rawSocket: WebSocket, req: IncomingMessage) => {
   socket.tenantId     = extReq._jwtTenantId;
   socket.roles        = extReq._jwtRoles;
   socket.authenticated = Boolean(socket.userId);
+  // PHASE2_REMEDIATION (H8): anchors this connection's seq series at 0 so
+  // the first message it receives is seq=1 -- see sendToSocket's docstring.
+  socket.seq          = 0;
 
   socket.on("pong",  () => { socket.isAlive = true; });
   socket.on("error", (err) => {
@@ -966,27 +974,39 @@ setInterval(async () => {
 
 // ─── Per-user event dispatch ──────────────────────────────────────────────────
 
-// REALTIME_FREEZE.md H.3: monotonic per-(node, user) counter attached to
-// every per-user WS message as `seq`, so a client can detect a gap or
-// out-of-order delivery on its current connection. Deliberately NOT a
-// Redis-backed cross-node counter -- pushToUser/sendToSocket are called from
-// hot synchronous paths (e.g. position.pnl_updated on every tick); awaiting
-// a Redis round-trip there would (a) hurt latency on the highest-frequency
-// push path and (b) risk two concurrent callers resolving their INCR out of
-// send order, which is a WORSE ordering bug than the one this fix removes.
-// Consequence: `seq` gives a real, gap-detectable total order for messages
-// delivered to a single connection (which is always exactly one node), but
-// does NOT provide a global cross-node order -- two nodes racing to deliver
-// to the same user's two open tabs via Redis pub/sub can still interleave
-// (per-tab order is still correct; cross-tab is not). A true distributed
-// sequencer is a larger, separate piece of work, flagged in
-// REALTIME_CERTIFICATION_REPORT.md.
-const wsSeqCounters = new Map<string, number>();
-function nextSeq(userId: string): number {
-  const next = (wsSeqCounters.get(userId) ?? 0) + 1;
-  wsSeqCounters.set(userId, next);
-  return next;
-}
+// REALTIME_FREEZE.md H.3 / PHASE2_REMEDIATION (H8): monotonic per-CONNECTION
+// counter attached to every per-user WS message as `seq`, so a client can
+// detect a gap or out-of-order delivery on its own socket.
+//
+// H8 root cause: this was originally a `Map<userId, number>` (one shared
+// counter per user per node), not one counter per socket. A user with two
+// simultaneous connections on the same node (multi-tab/multi-device -- a
+// routine occurrence on a trading platform) had both sockets incrementing
+// the SAME counter, so each socket only ever saw a subset of the sequence
+// (whatever the sibling socket's sends consumed was invisible to it) --
+// artificial gaps in what api/websocket.ts's client (see its `onopen`
+// resetting `lastSeq = null` and its `onmessage` regression check) expects
+// to be a clean, connection-anchored series starting at 1. The client-side
+// contract already assumes per-connection scoping; only the server's
+// counter was mis-scoped. Fixed by moving the counter onto the socket
+// object itself (AuthenticatedSocket.seq, initialized to 0 at connection --
+// see the connection handler above), the same established pattern this
+// file already uses for other per-connection mutable state (`isAlive`,
+// `backpressureStrikes`), instead of a userId-keyed shared Map.
+//
+// Deliberately still NOT a Redis-backed cross-node counter -- pushToUser/
+// sendToSocket are called from hot synchronous paths (e.g.
+// position.pnl_updated on every tick); awaiting a Redis round-trip there
+// would (a) hurt latency on the highest-frequency push path and (b) risk
+// two concurrent callers resolving their INCR out of send order, which is a
+// WORSE ordering bug than the one this fix removes. Consequence: `seq`
+// gives a real, gap-detectable total order for messages delivered to a
+// single connection (which is always exactly one node), but does NOT
+// provide a global cross-node order -- two nodes racing to deliver to the
+// same user's two open tabs via Redis pub/sub can still interleave
+// (per-tab order is still correct; cross-tab is not, and each tab now
+// genuinely gets its own clean series). A true distributed sequencer is a
+// larger, separate piece of work, flagged in REALTIME_CERTIFICATION_REPORT.md.
 
 /**
  * Returns false on a send failure (broken pipe) OR when the socket is
@@ -999,7 +1019,7 @@ function nextSeq(userId: string): number {
  */
 function sendToSocket(client: AuthenticatedSocket, type: string, data: unknown, extra?: Record<string, unknown>): boolean {
   if (isBackpressured(client)) return false;
-  const msg = JSON.stringify({ type, payload: data, seq: nextSeq(client.userId!), ...extra });
+  const msg = JSON.stringify({ type, payload: data, seq: nextConnectionSeq(client), ...extra });
   try { client.send(msg); return true; } catch { return false; }
 }
 
