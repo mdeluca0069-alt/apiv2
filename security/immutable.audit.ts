@@ -357,7 +357,7 @@ export class ImmutableAuditLog {
    * Archive audit logs to S3 for long-term immutable storage.
    * Called daily. Each archive batch has its own manifest with SHA-256.
    */
-  async archiveBatch(from: Date, to: Date): Promise<{ archived: number; manifestHash: string }> {
+  async archiveBatch(from: Date, to: Date, actor = "system"): Promise<{ archived: number; manifestHash: string }> {
     if (!IS_PERSISTENT || !prisma) return { archived: 0, manifestHash: "" };
 
     const entries = await prisma.auditLog.findMany({
@@ -386,6 +386,18 @@ export class ImmutableAuditLog {
         console.error("[immutable-audit] CloudWatch archive failed:", (err as Error).message);
       });
     }
+
+    // PHASE2_REMEDIATION (H16, admin audit-log gap): archival removes/
+    // relocates entries from the queryable hot path -- the archive action
+    // itself (who archived what range, resulting manifest hash) was not
+    // itself part of the permanent chain. Self-referential but safe: write()
+    // does not call archiveBatch(), so there is no recursion.
+    await this.write({
+      actor,
+      action:  "audit_log.archived",
+      entity:  "platform",
+      payload: { from: from.toISOString(), to: to.toISOString(), archived: entries.length, manifestHash } as object,
+    });
 
     return { archived: entries.length, manifestHash };
   }

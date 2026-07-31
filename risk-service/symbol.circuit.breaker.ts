@@ -32,6 +32,8 @@
 import { brokerSpreadConfig } from "../liquidity-engine/broker.spread.config.js";
 import { alertManager }       from "../alerting/alert.manager.js";
 import { metrics }            from "../gateway/metrics.js";
+import { immutableAudit }     from "../security/immutable.audit.js";
+import { IS_PERSISTENT }      from "../shared/db.js";
 
 const WINDOW_MS   = 10_000;   // "abnormal move" measured over this rolling window
 const COOLDOWN_MS = 5 * 60_000; // halt duration before auto-recovery is attempted
@@ -186,6 +188,18 @@ export class SymbolCircuitBreaker {
     await brokerSpreadConfig.setEnabled(key, true, adminId);
     this.haltedByBreaker.delete(key);
     console.log(`[symbol-circuit-breaker] ${key} manually cleared by ${adminId}`);
+
+    // PHASE2_REMEDIATION (H16, admin audit-log gap): manually clearing a
+    // halt before its cooldown elapses re-enables trading on this symbol --
+    // had zero permanent record of who did this and when.
+    if (IS_PERSISTENT) {
+      await immutableAudit.write({
+        actor:   adminId,
+        action:  "symbol_circuit_breaker.manually_cleared",
+        entity:  key,
+        payload: {} as object,
+      });
+    }
   }
 
   /**

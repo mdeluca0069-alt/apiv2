@@ -10,6 +10,8 @@
  * on deploy/restart — that is honest behaviour for a per-instance metric.
  */
 
+import { immutableAudit } from "../security/immutable.audit.js";
+
 let _circuitOpen  = false;
 let _openedAt: number | null = null;
 let _totalOpenMs  = 0;
@@ -19,12 +21,21 @@ export const feedCircuit = {
   open(): void {
     if (!_circuitOpen) { _circuitOpen = true; _openedAt = Date.now(); }
   },
-  close(): void {
+  /**
+   * `actor` is only supplied by the admin manual-reset route
+   * (POST /admin/feed/circuit/reset) -- FeedManager's own automatic
+   * recovery-path caller omits it, so only the admin override is written
+   * to the permanent audit trail (PHASE2_REMEDIATION H16).
+   */
+  close(actor?: string): void {
     if (_circuitOpen && _openedAt !== null) {
       _totalOpenMs += Date.now() - _openedAt;
       _openedAt = null;
     }
     _circuitOpen = false;
+    if (actor) {
+      void immutableAudit.write({ actor, action: "feed.circuit_reset", entity: "platform", payload: {} as object }).catch(() => {});
+    }
   },
   isOpen(): boolean { return _circuitOpen; },
 

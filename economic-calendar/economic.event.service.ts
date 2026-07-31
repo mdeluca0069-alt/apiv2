@@ -9,6 +9,7 @@
  */
 
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import {
   fetchForexFactory,
   fetchTradingEconomics,
@@ -89,8 +90,14 @@ class EconomicEventService {
     );
   }
 
-  /** Full refresh: fetch all sources, upsert to DB, rebuild cache. */
-  async refresh(): Promise<void> {
+  /**
+   * Full refresh: fetch all sources, upsert to DB, rebuild cache.
+   * `actor` is only supplied by the admin route (POST /admin/olos/calendar/
+   * refresh) -- main.ts's startup and scheduled calls omit it, so only the
+   * manual admin trigger is written to the permanent audit trail
+   * (PHASE2_REMEDIATION H16).
+   */
+  async refresh(actor?: string): Promise<void> {
     if (!IS_PERSISTENT) return;
     if (this._refreshing) return;
     this._refreshing = true;
@@ -115,6 +122,12 @@ class EconomicEventService {
 
       await this._upsertAll(all);
       await this._rebuildCache(from, to);
+
+      if (actor) {
+        void immutableAudit.write({
+          actor, action: "olos.calendar_refresh_triggered", entity: "platform", payload: { eventsFetched: all.length } as object,
+        }).catch(() => {});
+      }
     } finally {
       this._refreshing = false;
     }

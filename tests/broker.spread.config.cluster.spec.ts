@@ -25,8 +25,23 @@ const { mockUpsert, mockPublish, mockSubscribe } = vi.hoisted(() => ({
 }));
 
 vi.mock("../shared/db.js", () => ({
+  // PHASE2_REMEDIATION (H16): BrokerSpreadConfig.update() now also calls
+  // immutableAudit.write(), which itself imports { prisma, IS_PERSISTENT }
+  // from this same module and needs auditLog.create + $transaction to no
+  // longer throw. This spec is about cross-worker propagation, not audit
+  // content -- see broker.spread.config.update.audit.spec.ts for that.
   IS_PERSISTENT: true,
-  prisma: { brokerSetting: { upsert: mockUpsert, findMany: vi.fn().mockResolvedValue([]) } },
+  prisma: {
+    brokerSetting: { upsert: mockUpsert, findMany: vi.fn().mockResolvedValue([]) },
+    auditLog: { create: vi.fn().mockResolvedValue({}) },
+    $executeRaw: vi.fn().mockResolvedValue(0),
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    $transaction: vi.fn((cb: (tx: unknown) => unknown) => cb({
+      auditLog: { create: vi.fn().mockResolvedValue({}) },
+      $executeRaw: vi.fn().mockResolvedValue(0),
+      $queryRaw: vi.fn().mockResolvedValue([]),
+    })),
+  },
 }));
 
 let capturedHandler: ((payload: unknown) => void) | null = null;

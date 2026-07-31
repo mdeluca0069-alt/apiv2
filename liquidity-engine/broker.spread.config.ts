@@ -17,6 +17,7 @@
 
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { publishControlChannel, subscribeControlChannel } from "../shared/control.channel.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -387,6 +388,23 @@ export class BrokerSpreadConfig {
     );
 
     void publishControlChannel(CONTROL_CHANNEL, entry);
+
+    // PHASE2_REMEDIATION (H16, admin audit-log gap): broker spread controls
+    // client-facing pricing on every trade for this symbol -- the admin
+    // route calling this (`POST /admin/broker/spread`) had zero permanent
+    // record of who changed it and when. setEnabled() forwards into this
+    // same method, so its automated circuit-breaker callers get an audit
+    // trail entry too (attributed to their own "system:circuit-breaker"
+    // actor, distinguishable from a real admin's id) -- a strictly wider
+    // net than the admin gap alone, not a scoping concern.
+    if (IS_PERSISTENT) {
+      await immutableAudit.write({
+        actor:   adminId,
+        action:  "broker.spread_updated",
+        entity:  key,
+        payload: { spread: entry.spread, enabled: entry.enabled } as object,
+      });
+    }
 
     return entry;
   }

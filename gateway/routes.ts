@@ -2058,7 +2058,7 @@ export const routes: Route[] = [
       if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
       if (!IS_PERSISTENT) return { ok: false, reason: "SANDBOX_MODE" };
 
-      const result = await selfOptimizerService.run();
+      const result = await selfOptimizerService.run(principal.sub);
       return { ok: true, ...result };
     },
   },
@@ -2085,7 +2085,7 @@ export const routes: Route[] = [
       if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
       if (!IS_PERSISTENT) return { ok: false, reason: "SANDBOX_MODE" };
 
-      void economicEventService.refresh();
+      void economicEventService.refresh(principal.sub);
       return { ok: true, message: "Calendar refresh triggered" };
     },
   },
@@ -2376,13 +2376,15 @@ export const routes: Route[] = [
     method: "POST",
     path: api("/admin/affiliates"),
     admin: true,
-    handler: async ({ body }) => {
+    handler: async ({ body, authHeader, state }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
       const b = (body ?? {}) as Record<string, unknown>;
       const name  = b.name  ? String(b.name)  : "";
       const email = b.email ? String(b.email) : "";
       if (!name || !email) return { ok: false, reason: "name and email are required" };
       const commissionPct = typeof b.commissionPct === "number" ? b.commissionPct : undefined;
-      const affiliate = await affiliateService.create({ name, email, commissionPct });
+      const affiliate = await affiliateService.create({ name, email, commissionPct }, principal.sub);
       return { ok: true, affiliate };
     },
   },
@@ -4079,7 +4081,10 @@ export const routes: Route[] = [
     method: "POST",
     path: api("/admin/spread/event"),
     admin: true,
-    handler: async ({ body }) => {
+    handler: async ({ body, authHeader, state }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
+
       const b = (body ?? {}) as Record<string, unknown>;
       if (!b.name || !b.scheduledAt || !b.multiplier)
         return { ok: false, reason: "name, scheduledAt and multiplier are required" };
@@ -4091,7 +4096,7 @@ export const routes: Route[] = [
         multiplier:    Number(b.multiplier),
         scheduledAt:   new Date(String(b.scheduledAt)),
       };
-      dynamicSpreadEngine.addEvent(ev);
+      dynamicSpreadEngine.addEvent(ev, principal.sub);
       // CRITICAL_REMEDIATION (C11): this admin call previously only reached
       // whichever single replica handled the HTTP request -- the other
       // replicas' event calendars never learned about it, so they applied
@@ -4123,8 +4128,10 @@ export const routes: Route[] = [
     method: "POST",
     path: api("/admin/feed/circuit/reset"),
     admin: true,
-    handler: () => {
-      feedCircuit.close();
+    handler: async ({ authHeader, state }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
+      feedCircuit.close(principal.sub);
       return { ok: true, message: "Feed circuit reset to CLOSED by admin" };
     },
   },
@@ -4134,11 +4141,13 @@ export const routes: Route[] = [
     method: "POST",
     path: api("/admin/feed/refresh"),
     admin: true,
-    handler: async () => {
+    handler: async ({ authHeader, state }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "UNAUTHENTICATED" };
       const { FeedManager } = await import("../market-data/feed.manager.js");
       const fm = (globalThis as Record<string, unknown>).__feedManager as InstanceType<typeof FeedManager> | undefined;
       if (!fm) return { ok: false, reason: "FeedManager not initialized" };
-      const seeded = await (fm as unknown as { forceRefreshAll: () => Promise<number> }).forceRefreshAll();
+      const seeded = await (fm as unknown as { forceRefreshAll: (actor?: string) => Promise<number> }).forceRefreshAll(principal.sub);
       return { ok: true, seeded, source: "twelvedata-rest", timestamp: new Date().toISOString() };
     },
   },
@@ -5838,6 +5847,7 @@ export const routes: Route[] = [
       const result = await immutableAudit.archiveBatch(
         new Date(parsed.data.from),
         new Date(parsed.data.to),
+        principal.sub,
       );
       return { ok: true, ...result };
     },

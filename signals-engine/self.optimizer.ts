@@ -25,6 +25,7 @@
  */
 
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import {
   adaptiveWeights,
   DEFAULT_WEIGHTS,
@@ -73,7 +74,7 @@ class SelfOptimizerService {
    * Run the weekly optimization. Should be called by the job coordinator.
    * Returns a full result object regardless of whether optimization ran or was skipped.
    */
-  async run(): Promise<OptimizationResult> {
+  async run(actor?: string): Promise<OptimizationResult> {
     if (!IS_PERSISTENT || !prisma) {
       return this._skipped("Database not available (sandbox mode)");
     }
@@ -203,6 +204,20 @@ class SelfOptimizerService {
     console.log(
       `[self-optimizer] v${newVersion} — samples=${rows.length}, WR=${winRate.toFixed(1)}%, PF=${profitFactor.toFixed(2)}, Sharpe=${sharpe.toFixed(2)}`,
     );
+
+    // PHASE2_REMEDIATION (H16, admin audit-log gap): a manual optimizer run
+    // publishes a new live ConfidenceWeights version affecting every signal
+    // generated afterward -- `actor` is only supplied by the admin route
+    // (POST /admin/olos/optimizer/run); the scheduled/automatic caller (if
+    // any is added later) can omit it to skip the write.
+    if (actor) {
+      void immutableAudit.write({
+        actor,
+        action:  "olos.optimizer_run",
+        entity:  String(newVersion),
+        payload: { previousVersion: priorVersion, sampleSize: rows.length } as object,
+      }).catch(() => {});
+    }
 
     return {
       ran:              true,

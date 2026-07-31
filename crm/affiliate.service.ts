@@ -35,7 +35,7 @@ function generateCode(name: string): string {
 class AffiliateService {
 
   /** Admin: create a new affiliate (starts PENDING until activated). */
-  async create(input: { name: string; email: string; commissionPct?: number }): Promise<AffiliateSummary> {
+  async create(input: { name: string; email: string; commissionPct?: number }, adminId: string): Promise<AffiliateSummary> {
     if (!IS_PERSISTENT) {
       throw Object.assign(new Error("Affiliate creation requires a database connection."), { status: 503 });
     }
@@ -59,6 +59,14 @@ class AffiliateService {
         status:        "PENDING",
       },
     });
+
+    // PHASE2_REMEDIATION (H16, admin audit-log gap): setStatus() below
+    // already writes an audit entry on activate/deactivate but create()
+    // itself -- which establishes the commission rate and referral code --
+    // had none.
+    await immutableAudit.write({
+      actor: adminId, action: "affiliate.created", entity: row.id, payload: { name: row.name, email: row.email, commissionPct: input.commissionPct ?? 20 },
+    }).catch(() => {});
 
     return this._toSummary(row, 0, new Prisma.Decimal(0));
   }

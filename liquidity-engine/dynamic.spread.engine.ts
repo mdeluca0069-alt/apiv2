@@ -151,10 +151,23 @@ export class DynamicSpreadEngine {
 
   // ── Event calendar management ────────────────────────────────────────────
 
-  addEvent(ev: SpreadEvent): void {
+  addEvent(ev: SpreadEvent, actor?: string): void {
     this.events.push(ev);
     this._pruneStaleEvents();
     console.log(`[dynamic-spread] event scheduled: ${ev.name} at ${ev.scheduledAt.toISOString()} ×${ev.multiplier}`);
+    // PHASE2_REMEDIATION (H16, admin audit-log gap): a scheduled spread-
+    // widening event affects every trader's effective spread on the named
+    // symbols for the whole window -- had zero permanent record of who
+    // scheduled it. `actor` is only supplied by the admin route; internal/
+    // system callers (none currently exist) can omit it to skip the write.
+    if (actor) {
+      void immutableAudit.write({
+        actor,
+        action:  "spread.event_added",
+        entity:  ev.name,
+        payload: { ...ev, scheduledAt: ev.scheduledAt.toISOString() } as object,
+      }).catch(() => {});
+    }
   }
 
   clearEvents(): void {

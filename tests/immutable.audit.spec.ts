@@ -311,3 +311,51 @@ describe("ImmutableAuditLog.verifyChain() — tamper detection", () => {
     expect(result.totalChecked).toBe(0);
   });
 });
+
+describe("ImmutableAuditLog.archiveBatch() — PHASE2_REMEDIATION (H16): self-referential audit trail", () => {
+  // PHASE2_REMEDIATION (H16, admin audit-log gap): the admin route audit
+  // found that POST /admin/security/audit/archive -- which lives INSIDE
+  // the audit subsystem itself -- was the one action that removed/
+  // relocated entries from the queryable hot path without itself being
+  // part of the permanent chain. archiveBatch() now calls this.write()
+  // (safe: write() never calls archiveBatch(), so there is no recursion).
+  it("writes a self-referential audit entry recording who archived what range and the resulting manifest hash", async () => {
+    mockAuditFindMany.mockResolvedValue([
+      { id: "e1", actor: "a", action: "act", entity: "x", payload: {}, createdAt: new Date("2026-07-20T00:00:00.000Z") },
+    ]);
+
+    const from = new Date("2026-07-01T00:00:00.000Z");
+    const to   = new Date("2026-07-31T00:00:00.000Z");
+    const result = await immutableAudit.archiveBatch(from, to, "admin-1");
+
+    expect(result.archived).toBe(1);
+    // write() is called via $transaction -> auditLog.create, once for the
+    // archival record itself (no other write() calls happen in this path).
+    expect(mockAuditCreate).toHaveBeenCalledTimes(1);
+    const data = mockAuditCreate.mock.calls[0]![0].data as { actor: string; action: string; entity: string; payload: Record<string, unknown> };
+    expect(data.actor).toBe("admin-1");
+    expect(data.action).toBe("audit_log.archived");
+    expect(data.entity).toBe("platform");
+    expect(data.payload).toMatchObject({ archived: 1, manifestHash: result.manifestHash });
+  });
+
+  it("defaults actor to 'system' when none is supplied (a non-HTTP/scheduled caller)", async () => {
+    mockAuditFindMany.mockResolvedValue([
+      { id: "e1", actor: "a", action: "act", entity: "x", payload: {}, createdAt: new Date("2026-07-20T00:00:00.000Z") },
+    ]);
+
+    await immutableAudit.archiveBatch(new Date("2026-07-01T00:00:00.000Z"), new Date("2026-07-31T00:00:00.000Z"));
+
+    const data = mockAuditCreate.mock.calls[0]![0].data as { actor: string };
+    expect(data.actor).toBe("system");
+  });
+
+  it("does not write a self-referential entry when there is nothing to archive (no rows in range)", async () => {
+    mockAuditFindMany.mockResolvedValue([]);
+
+    const result = await immutableAudit.archiveBatch(new Date("2026-07-01T00:00:00.000Z"), new Date("2026-07-31T00:00:00.000Z"), "admin-1");
+
+    expect(result.archived).toBe(0);
+    expect(mockAuditCreate).not.toHaveBeenCalled();
+  });
+});

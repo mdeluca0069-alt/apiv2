@@ -37,6 +37,7 @@ import { BinanceFeed }        from "./feeds/binance.feed.js";
 import { fetchCurrentPrices } from "./feeds/twelvedata.rest.js";
 import { eventBus }         from "../events-bus/event.bus.js";
 import { feedCircuit }      from "../shared/feed.circuit.js";
+import { immutableAudit }   from "../security/immutable.audit.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -152,7 +153,7 @@ export class FeedManager {
   isCircuitOpen(): boolean { return this.circuitOpen; }
 
   /** Force an immediate TwelveData REST fetch for every symbol (ignores rotation timer). */
-  async forceRefreshAll(): Promise<number> {
+  async forceRefreshAll(actor?: string): Promise<number> {
     if (!this.opts.apiKey) return 0;
     let refreshed = 0;
     const totalBatches = Math.ceil(this.opts.symbols.length / REST_BATCH_SIZE);
@@ -170,6 +171,13 @@ export class FeedManager {
           }
         }
       } catch { /* continue to next batch */ }
+    }
+    // PHASE2_REMEDIATION (H16, admin audit-log gap): admin-forced REST
+    // refresh bypasses the normal rotation timer -- `actor` is only
+    // supplied by the admin route (POST /admin/feed/refresh), so only that
+    // manual override is written to the permanent audit trail.
+    if (actor) {
+      void immutableAudit.write({ actor, action: "feed.force_refresh", entity: "platform", payload: { refreshed } as object }).catch(() => {});
     }
     return refreshed;
   }
