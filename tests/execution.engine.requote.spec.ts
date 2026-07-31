@@ -43,6 +43,16 @@ const { mockTx, mockPrisma } = vi.hoisted(() => {
 });
 vi.mock("../shared/db.js", () => ({ prisma: mockPrisma, IS_PERSISTENT: true }));
 
+// CRITICAL_REMEDIATION Phase 2 (H15): execute() now re-checks account
+// eligibility (KYC) and the kill switch before proceeding -- not the
+// subject of this file, so both pass by default.
+vi.mock("../risk-service/risk.engine.js", () => ({
+  assertAccountEligibleToTrade: vi.fn().mockResolvedValue({ eligible: true }),
+}));
+vi.mock("../risk-service/kill.switch.js", () => ({
+  killSwitch: { isActive: vi.fn().mockReturnValue(false), getState: vi.fn().mockReturnValue({ active: false, reason: "" }) },
+}));
+
 const { mockFill } = vi.hoisted(() => ({ mockFill: vi.fn() }));
 vi.mock("../execution-service/fill.engine.js", () => ({
   fillEngine: { fill: mockFill, providerId: "MOCK_LP" },

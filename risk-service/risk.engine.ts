@@ -48,6 +48,39 @@ async function getCachedUser(userId: string): Promise<CachedUser | null> {
   return row as CachedUser | null;
 }
 
+/**
+ * CRITICAL_REMEDIATION Phase 2 (H15) — re-verify KYC/account eligibility at
+ * the moment an order actually fills, not only at the moment it was first
+ * submitted.
+ *
+ * Root cause: preTradeCheck() below correctly gates kycStatus==="approved"
+ * at ORDER-REQUEST time, but a resting LIMIT/STOP order can sit for hours
+ * or days before its trigger price is reached. execution.engine.ts's
+ * execute() -- the shared path for both an immediate MARKET fill and a
+ * later pending-order fill (trading-service/order.controller.ts's
+ * executePendingOrder()) -- never re-checked KYC status at all; it trusted
+ * req.marginRequired/req.notional as pre-approved at submission time (see
+ * that file's own comment on this exact subject for margin) and went
+ * straight to execution. If an admin/compliance officer revokes a user's
+ * KYC approval (adminSetKycStatus -> "rejected", the only account-freeze
+ * mechanism this schema has -- there is no separate frozen/suspended
+ * column) after the user has already placed a resting order but before it
+ * triggers, that order could still fill and execute a real trade against
+ * an account that is no longer approved to trade at all.
+ *
+ * Reuses the same 60s TTL cache preTradeCheck() itself uses (not a new,
+ * differently-timed cache) so this doesn't add a second, inconsistent
+ * source of truth for "is this user's KYC currently approved."
+ */
+export async function assertAccountEligibleToTrade(userId: string): Promise<{ eligible: boolean; reason?: string }> {
+  const user = await getCachedUser(userId);
+  if (!user) return { eligible: false, reason: "User not found" };
+  if (user.kycStatus !== "approved") {
+    return { eligible: false, reason: `KYC status is '${user.kycStatus}'. Trading requires approved KYC.` };
+  }
+  return { eligible: true };
+}
+
 async function getCachedInstrument(symbol: string): Promise<CachedInstrument | null> {
   const now = Date.now();
   const hit  = instrumentCache.get(symbol);

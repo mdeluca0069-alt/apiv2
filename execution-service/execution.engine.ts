@@ -9,6 +9,8 @@ import { reconciliationEngine } from "../settlement/reconciliation.engine.js";
 import { quoteCache }       from "../market-data/quote.cache.js";
 import { checkRequote }     from "./requote.policy.js";
 import { leverageGuard }    from "../risk-service/leverage.guard.js";
+import { assertAccountEligibleToTrade } from "../risk-service/risk.engine.js";
+import { killSwitch }       from "../risk-service/kill.switch.js";
 import type { ExecutionRequest, ExecutionResult } from "../shared/contracts.js";
 import type { CancelToken }  from "./execution.queue.js";
 
@@ -108,6 +110,34 @@ export class ExecutionEngine {
   ): Promise<ExecutionResult> {
     const startMs    = Date.now();
     const cancelled  = () => cancelToken?.value === true;
+
+    // CRITICAL_REMEDIATION Phase 2 (H15) — re-verify account eligibility
+    // (KYC status, kill switch) at the moment of actual execution, not only
+    // at order-request time. This is the SHARED path for both an immediate
+    // MARKET fill (KYC/kill-switch were just checked seconds ago by
+    // riskEngine.preTradeCheck() -- this re-check is cheap and redundant
+    // but harmless there) and a resting LIMIT/STOP order's fill, which can
+    // happen hours or days after the order was originally submitted and
+    // approved (trading-service/order.controller.ts's executePendingOrder()
+    // calls this same execute(), with no re-check of its own). Without
+    // this, an admin/compliance officer revoking a user's KYC approval (the
+    // only account-freeze mechanism this schema has) or activating the
+    // kill switch AFTER a resting order was placed but BEFORE it triggers
+    // had no effect on that already-placed order -- it would still fill.
+    if (killSwitch.isActive()) {
+      const ks = killSwitch.getState();
+      const reason = `KILL_SWITCH_ACTIVE: ${ks.reason || "Admin kill switch active"}`;
+      await orderLifecycle.rejectOrder(req.orderId, reason);
+      emitOrderRejected(req, reason);
+      return { status: "REJECTED", orderId: req.orderId, reason: "KILL_SWITCH_ACTIVE" };
+    }
+    const eligibility = await assertAccountEligibleToTrade(req.userId);
+    if (!eligibility.eligible) {
+      const reason = `KYC_NOT_APPROVED: ${eligibility.reason ?? "account not eligible to trade"}`;
+      await orderLifecycle.rejectOrder(req.orderId, reason);
+      emitOrderRejected(req, reason);
+      return { status: "REJECTED", orderId: req.orderId, reason: "KYC_NOT_APPROVED" };
+    }
 
     // ── 1. Transition RECEIVED → ACCEPTED ────────────────────────────────
     await orderLifecycle.transition(req.orderId, "ACCEPTED",
