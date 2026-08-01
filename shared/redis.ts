@@ -22,7 +22,46 @@ export async function initRedis(url: string): Promise<Redis> {
   });
   await client.connect();
   _client = client;
+  void _warnIfEvictionUnsafe(client);
   return client;
+}
+
+/**
+ * PHASE2_REMEDIATION (H11): defense-in-depth startup check. This process's
+ * Redis instance is shared by both genuinely-evictable cache data
+ * (realtime-infra/cache.layer.ts) and correctness-critical mutual-exclusion
+ * locks (shared/distributed.job.lock.ts's `job:leader:*`,
+ * realtime-infra/websocket.cluster.ts's node registry) -- an `allkeys-*`
+ * eviction policy lets Redis evict a lock key under memory pressure
+ * exactly as if it had naturally expired, letting a second worker acquire
+ * the same lock with no error anywhere (silent double-execution of a
+ * scheduled job, not a visible incident). All three deploy surfaces
+ * (docker-compose.prod.yml, infrastructure/kubernetes/redis/
+ * redis-cluster.yaml, infrastructure/terraform/modules/elasticache/
+ * main.tf) were fixed to `noeviction`, but three separately-maintained IaC
+ * files can drift out of sync with each other or with a manually-managed
+ * Redis instance -- this check makes that drift loud (a startup log
+ * warning) instead of silently reintroducing the bug in whichever
+ * environment falls out of sync. Deliberately non-fatal: some managed
+ * Redis providers restrict the CONFIG command entirely, and this must not
+ * prevent the app from starting against a Redis it can't introspect.
+ */
+async function _warnIfEvictionUnsafe(client: Redis): Promise<void> {
+  try {
+    const [, policy] = (await client.config("GET", "maxmemory-policy")) as [string, string];
+    if (policy && policy !== "noeviction") {
+      console.warn(
+        `[redis] UNSAFE maxmemory-policy="${policy}" -- distributed lock keys ` +
+        `(job:leader:*, ws cluster registry) can be silently evicted under memory ` +
+        `pressure, indistinguishable from natural TTL expiry. Set "noeviction" on ` +
+        `this Redis instance (see docker-compose.prod.yml / infrastructure/kubernetes/` +
+        `redis/redis-cluster.yaml / infrastructure/terraform/modules/elasticache/main.tf).`,
+      );
+    }
+  } catch {
+    // CONFIG command unavailable/restricted (common on managed Redis) —
+    // non-fatal, this check is best-effort defense-in-depth only.
+  }
 }
 
 /** Return the connected client, or null if initRedis was never called / failed. */
