@@ -12,18 +12,74 @@ import type { ChainableCommander } from "ioredis";
 
 let _client: Redis | null = null;
 
+/**
+ * PHASE2_REMEDIATION (H12): a single Redis instance/container is a real
+ * single point of failure -- every subsystem it backs (distributed job
+ * locks, WS cluster registry, cross-node WS relay, rate limiting) goes
+ * down simultaneously, across every worker, the instant it does. This
+ * repo's docker-compose.prod.yml deploy path had no replica/Sentinel at
+ * all (unlike the Kubernetes self-hosted path, which already uses Redis
+ * Cluster's built-in automatic failover, and the Terraform/ElastiCache
+ * path, which already has automatic_failover_enabled=true/multi_az_enabled
+ * =true) -- see that file's Redis Sentinel service definitions for the
+ * infra half of this fix. This type lets the app actually consume a
+ * Sentinel-monitored topology (host:port pairs discovered/promoted by
+ * Sentinel, not a fixed host the app would otherwise keep talking to
+ * after a failover moves the primary elsewhere) instead of only ever
+ * supporting a single fixed connection string.
+ */
+export type RedisConnectTarget =
+  | string
+  | { sentinels: Array<{ host: string; port: number }>; name: string; password?: string };
+
 /** Connect and store the singleton. Throws if the server is unreachable. */
-export async function initRedis(url: string): Promise<Redis> {
-  const client = new Redis(url, {
+export async function initRedis(target: RedisConnectTarget): Promise<Redis> {
+  const baseOptions = {
     lazyConnect:          true,
     enableOfflineQueue:   false,
     maxRetriesPerRequest: 1,
     connectTimeout:       3_000,
-  });
+  } as const;
+
+  const client =
+    typeof target === "string"
+      ? new Redis(target, baseOptions)
+      : new Redis({
+          sentinels: target.sentinels,
+          name:      target.name,
+          password:  target.password,
+          ...baseOptions,
+        });
+
   await client.connect();
   _client = client;
   void _warnIfEvictionUnsafe(client);
   return client;
+}
+
+/**
+ * PHASE2_REMEDIATION (H12): builds the connect target for initRedis() from
+ * environment variables -- Sentinel-monitored mode when REDIS_SENTINELS is
+ * set (format: "host1:port1,host2:port2,host3:port3", as configured for
+ * docker-compose.prod.yml's sentinel containers), otherwise the existing
+ * single-URL mode (REDIS_URL / a supplied default). Kept separate from
+ * initRedis() itself so the parsing logic has its own unit coverage
+ * without needing a live/mocked Redis connection.
+ */
+export function resolveRedisTarget(env: NodeJS.ProcessEnv, defaultUrl: string): RedisConnectTarget {
+  const sentinelsRaw = env.REDIS_SENTINELS;
+  if (!sentinelsRaw) return env.REDIS_URL ?? defaultUrl;
+
+  const sentinels = sentinelsRaw.split(",").map((entry) => {
+    const [host, port] = entry.trim().split(":");
+    return { host, port: Number(port) };
+  });
+
+  return {
+    sentinels,
+    name:     env.REDIS_SENTINEL_NAME ?? "igfxpro-redis",
+    password: env.REDIS_PASSWORD,
+  };
 }
 
 /**

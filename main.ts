@@ -56,7 +56,7 @@ dotenvConfig({ path: new URL("../.env", import.meta.url).pathname });
 import { IncomingMessage } from "node:http";
 import { PrismaClient }   from "@prisma/client";
 import { WebSocketServer, type WebSocket } from "ws";
-import { initRedis }      from "./shared/redis.js";
+import { initRedis, resolveRedisTarget } from "./shared/redis.js";
 
 import { routes }               from "./gateway/routes.js";
 import { createApiServer }      from "./shared/http.js";
@@ -169,11 +169,15 @@ jwtKeyManager.scheduleAutoRotation();
 const prisma = process.env.DATABASE_URL ? new PrismaClient() : undefined;
 
 // ─── Redis + Rate Limiter + Distributed Execution Queue ──────────────────────
-const redisUrl      = process.env.REDIS_URL ?? "redis://localhost:6379";
+// PHASE2_REMEDIATION (H12): resolveRedisTarget() picks Sentinel-monitored
+// mode (auto-discovers/follows the current primary across a failover)
+// when REDIS_SENTINELS is set, falling back to the original fixed-URL
+// mode otherwise -- see shared/redis.ts's docstring.
+const redisTarget   = resolveRedisTarget(process.env, "redis://localhost:6379");
 const _isProduction = process.env.NODE_ENV === "production";
 let   rateLimiter: RateLimiter | undefined;
 try {
-  const redis = await initRedis(redisUrl);
+  const redis = await initRedis(redisTarget);
   rateLimiter = new RateLimiter(redis);
   console.log("[igfxpro-apiv2] Redis connected — rate limiter + distributed execution queue active");
 
