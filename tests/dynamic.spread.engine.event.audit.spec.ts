@@ -49,8 +49,13 @@ describe("DynamicSpreadEngine.addEvent() — PHASE2_REMEDIATION (H16): immutable
   it("does not write an audit entry when no actor is supplied (no admin trigger)", () => {
     const engine = new DynamicSpreadEngine();
     const ev = {
+      // Relative to "now" (not a hardcoded absolute timestamp): getEvents()
+      // filters out events whose scheduledAt + windowMinutes has already
+      // passed (dynamic.spread.engine.ts:188) -- a fixed past-dated
+      // fixture goes stale and starts failing the instant real wall-clock
+      // time crosses it, regardless of this test's own logic.
       name: "CPI", assetClasses: ["ALL"], windowMinutes: 15,
-      multiplier: 1.8, scheduledAt: new Date("2026-08-01T14:00:00.000Z"),
+      multiplier: 1.8, scheduledAt: new Date(Date.now() + 30 * 60_000),
     };
 
     engine.addEvent(ev);
