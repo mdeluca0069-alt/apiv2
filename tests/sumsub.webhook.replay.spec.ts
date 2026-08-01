@@ -37,8 +37,14 @@ vi.mock("../kyc-service/sumsub.provider.js", () => ({
 const webhookEventStore = new Map<string, { payloadHash: string }>();
 
 const mockKycCase = {
-  findFirst: vi.fn(),
-  update:    vi.fn().mockResolvedValue({}),
+  findFirst:  vi.fn(),
+  // PHASE C PENTEST (race-condition finding #4): processSumsubWebhook()
+  // now uses the same atomic-conditional updateMany() guard as
+  // approveCase()/_rejectCase() (see kyc.service.ts's TERMINAL_KYC_STATUSES
+  // docstring) -- this mock always reports 1 row affected, matching a
+  // case that's never already terminal, since replay protection (this
+  // file's actual subject) is orthogonal to that separate finding.
+  updateMany: vi.fn().mockResolvedValue({ count: 1 }),
 };
 const mockUser = { update: vi.fn().mockResolvedValue({}) };
 const mockSumsubWebhookEvent = {
@@ -80,9 +86,9 @@ describe("KycService.processSumsubWebhook() — PHASE C PENTEST: replay protecti
   it("applies the effect on first delivery (case approved, user kycStatus flipped)", async () => {
     await kycService.processSumsubWebhook(GREEN_PAYLOAD, "valid-digest");
 
-    expect(mockKycCase.update).toHaveBeenCalledTimes(1);
-    expect(mockKycCase.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: "case-1" },
+    expect(mockKycCase.updateMany).toHaveBeenCalledTimes(1);
+    expect(mockKycCase.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: "case-1" }),
       data:  expect.objectContaining({ status: "APPROVED" }),
     }));
     expect(mockUser.update).toHaveBeenCalledWith({ where: { id: "user-1" }, data: { kycStatus: "approved" } });
@@ -91,25 +97,25 @@ describe("KycService.processSumsubWebhook() — PHASE C PENTEST: replay protecti
   it("REPLAY: the exact same captured payload replayed later is recognized and does NOT re-apply its effect", async () => {
     // First (legitimate) delivery.
     await kycService.processSumsubWebhook(GREEN_PAYLOAD, "valid-digest");
-    expect(mockKycCase.update).toHaveBeenCalledTimes(1);
+    expect(mockKycCase.updateMany).toHaveBeenCalledTimes(1);
 
     // Simulate time passing: the case was legitimately re-reviewed and
     // rejected in the meantime (a real webhook, different content/hash,
     // would correctly apply). Then the attacker replays the OLD captured
     // GREEN payload byte-for-byte.
-    mockKycCase.update.mockClear();
+    mockKycCase.updateMany.mockClear();
     mockUser.update.mockClear();
 
     await kycService.processSumsubWebhook(GREEN_PAYLOAD, "valid-digest");
 
     // The replay must be a no-op: no second write, no re-flip to approved.
-    expect(mockKycCase.update).not.toHaveBeenCalled();
+    expect(mockKycCase.updateMany).not.toHaveBeenCalled();
     expect(mockUser.update).not.toHaveBeenCalled();
   });
 
   it("a genuinely different webhook (different inspectionId/content) for the same applicant is still processed normally", async () => {
     await kycService.processSumsubWebhook(GREEN_PAYLOAD, "valid-digest");
-    mockKycCase.update.mockClear();
+    mockKycCase.updateMany.mockClear();
     mockUser.update.mockClear();
 
     const redPayload = JSON.stringify({
@@ -119,7 +125,7 @@ describe("KycService.processSumsubWebhook() — PHASE C PENTEST: replay protecti
     });
     await kycService.processSumsubWebhook(redPayload, "valid-digest");
 
-    expect(mockKycCase.update).toHaveBeenCalledTimes(1);
+    expect(mockKycCase.updateMany).toHaveBeenCalledTimes(1);
     expect(mockUser.update).toHaveBeenCalledWith({ where: { id: "user-1" }, data: { kycStatus: "rejected" } });
   });
 

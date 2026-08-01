@@ -84,6 +84,29 @@ export type KycStepSummary = {
 
 const _sandboxCases = new Map<string, KycCaseSummary>();
 
+/**
+ * PHASE C PENTEST (race-condition finding #4): approveCase(), _rejectCase(),
+ * and processSumsubWebhook() each read a case then did an UNCONDITIONAL
+ * `tx.kycCase.update({ where: { id: caseId }, data: { status: ... } })` --
+ * no `WHERE status IN (...)` precondition, no row lock, no explicit
+ * isolation level (defaulting to READ COMMITTED, unlike every money-moving
+ * flow elsewhere in this codebase, which explicitly uses Serializable).
+ * Concretely: an admin clicking "Approve" at the same moment a (possibly
+ * stale/delayed, or re-triggered) Sumsub webhook with reviewAnswer: RED
+ * arrives for the same applicant -- both transactions could run
+ * concurrently with no conflict detection, and whichever commits last
+ * silently wins; an already-APPROVED/REJECTED case could even be flipped
+ * again with no error. Every transition below now goes through
+ * `updateMany({ where: { id: caseId, status: { notIn: TERMINAL } } })` and
+ * checks `result.count === 1` -- the same atomic-conditional-UPDATE
+ * principle used throughout this codebase's other critical-state
+ * transitions (H2/H4/H7/H9/H14's CTEs elsewhere), just via Prisma's
+ * built-in conditional updateMany() since this is a plain single-table
+ * update, not a composed CTE. Once a case reaches APPROVED or REJECTED,
+ * no further automated/admin transition can silently overwrite it.
+ */
+const TERMINAL_KYC_STATUSES: KycCaseStatus[] = ["APPROVED", "REJECTED"];
+
 /** Prisma unique-constraint violation code (same pattern as order.lifecycle.ts). */
 function isPrismaUniqueViolation(err: unknown): boolean {
   return (
@@ -254,8 +277,8 @@ export class KycService {
     if (!kase) throw new Error(`KYC case not found: ${caseId}`);
 
     await prisma.$transaction(async (tx) => {
-      await tx.kycCase.update({
-        where: { id: caseId },
+      const result = await tx.kycCase.updateMany({
+        where: { id: caseId, status: { notIn: TERMINAL_KYC_STATUSES } },
         data: {
           status:      "APPROVED",
           reviewedBy:  adminId,
@@ -264,6 +287,12 @@ export class KycService {
           completedAt: new Date(),
         },
       });
+      if (result.count === 0) {
+        throw Object.assign(
+          new Error(`KYC case ${caseId} is already in a terminal state and cannot be re-approved`),
+          { status: 409 },
+        );
+      }
 
       // Update user's kycStatus in User table
       await tx.user.update({
@@ -381,9 +410,10 @@ export class KycService {
     const kase = await prisma.kycCase.findUnique({ where: { id: caseId } });
     if (!kase) return;
 
+    let blocked = false;
     await prisma.$transaction(async (tx) => {
-      await tx.kycCase.update({
-        where: { id: caseId },
+      const result = await tx.kycCase.updateMany({
+        where: { id: caseId, status: { notIn: TERMINAL_KYC_STATUSES } },
         data: {
           status:      "REJECTED",
           reviewedBy:  actorId,
@@ -392,6 +422,10 @@ export class KycService {
           completedAt: new Date(),
         },
       });
+      if (result.count === 0) {
+        blocked = true;
+        return;
+      }
 
       await tx.user.update({
         where: { id: kase.userId },
@@ -405,6 +439,11 @@ export class KycService {
         payload: { userId: kase.userId, reason } as object,
       }, tx);
     }, { maxWait: 10000, timeout: 15000 });
+
+    if (blocked) {
+      console.warn(`[kyc] case ${caseId} is already in a terminal state — reject by ${actorId} skipped`);
+      return;
+    }
 
     eventBus.emit("kyc.rejected", {
       userId: kase.userId, caseId, reason, actorId, timestamp: new Date().toISOString(),
@@ -550,9 +589,10 @@ export class KycService {
     const rejectLabels = reviewResult?.rejectLabels?.join(", ") ?? undefined;
     const clientComment = reviewResult?.clientComment ?? reviewResult?.moderationComment ?? undefined;
 
+    let blockedByTerminalState = false;
     await db.$transaction(async (tx) => {
-      await tx.kycCase.update({
-        where: { id: kase.id },
+      const result = await tx.kycCase.updateMany({
+        where: { id: kase.id, status: { notIn: TERMINAL_KYC_STATUSES } },
         data: {
           status:              newStatus,
           sumsubReviewStatus:  event.reviewStatus ?? null,
@@ -565,6 +605,10 @@ export class KycService {
           completedAt:         (reviewAnswer === "GREEN" || reviewAnswer === "RED") ? new Date() : undefined,
         },
       });
+      if (result.count === 0) {
+        blockedByTerminalState = true;
+        return;
+      }
 
       if (reviewAnswer === "GREEN") {
         await tx.user.update({
@@ -589,6 +633,11 @@ export class KycService {
         } as object,
       }, tx);
     }, { maxWait: 10000, timeout: 15000 });
+
+    if (blockedByTerminalState) {
+      console.warn(`[sumsub-webhook] case ${kase.id} is already in a terminal state — webhook-driven transition to ${newStatus} skipped`);
+      return;
+    }
 
     // Emit domain events
     if (reviewAnswer === "GREEN") {
