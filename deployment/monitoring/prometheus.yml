@@ -42,9 +42,18 @@ scrape_configs:
           component: cache
 
   # ── Node exporter (host metrics) ─────────────────────────────────────────
+  # PHASE2_REMEDIATION (H13): node-exporter runs with `network_mode: host`
+  # in docker-compose.monitoring.yml (required so it reports the real
+  # host's CPU/memory/disk, not its own container's) -- it therefore has
+  # NO Docker-DNS name, and `node-exporter:9100` could never resolve. Host
+  # metrics were silently entirely absent from Prometheus/Grafana despite
+  # the container being deployed and running. host.docker.internal (wired
+  # via that file's `extra_hosts: host-gateway` on the prometheus service)
+  # is the address that actually reaches the host's network namespace,
+  # where node-exporter is really listening.
   - job_name: node
     static_configs:
-      - targets: ["node-exporter:9100"]
+      - targets: ["host.docker.internal:9100"]
         labels:
           component: host
 
