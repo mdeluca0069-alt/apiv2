@@ -65,6 +65,53 @@ const SINGLE_USE_OPERATIONS: Set<MFAOperationClass> = new Set([
   "SECURITY_CHANGE",
 ]);
 
+/**
+ * PHASE C PENTEST (race-condition finding #3): the previous checkStepUp()
+ * did `redis.get(key)` -> JS `if (token.consumed)` check -> `redis.setex`
+ * to mark it consumed -- a plain read-modify-write with no atomicity.
+ * Two concurrent requests carrying the same single-use step-up token
+ * (client double-submit, two tabs, or a deliberate race) both read
+ * consumed:false before either wrote back, so both passed the gate and
+ * both proceeded to the guarded operation from ONE MFA verification --
+ * e.g. two concurrent withdrawal/2FA-disable calls authorized by a single
+ * step-up. This Lua script makes the check-and-consume a single atomic
+ * operation: Redis executes EVAL scripts without interleaving any other
+ * command, so two concurrent EVAL calls for the same key are fully
+ * serialized by Redis itself -- only the first can observe consumed:false
+ * and flip it; the second necessarily observes consumed:true (the first
+ * script's write already applied) and is rejected. Same pattern already
+ * used elsewhere in this codebase for atomic Redis state changes
+ * (gateway/rate-limiter.ts's ATOMIC_INCR_EXPIRE,
+ * execution-service/execution.queue.ts's RELEASE_LUA,
+ * shared/distributed.job.lock.ts's RELEASE_SCRIPT).
+ *
+ * KEYS[1] = the mfa:stepup:{userId}:{operationClass} key
+ * ARGV[1] = current time (ms, epoch)
+ * ARGV[2] = TTL to re-set on consume (seconds)
+ * Returns: nil (no token), "EXPIRED", "ALREADY_CONSUMED", or the
+ * (now-consumed) token JSON.
+ */
+const CONSUME_STEPUP_SCRIPT = `
+  local raw = redis.call("GET", KEYS[1])
+  if not raw then return false end
+  local ok, token = pcall(cjson.decode, raw)
+  if not ok then
+    redis.call("DEL", KEYS[1])
+    return "INVALID"
+  end
+  if token.expiresAt < tonumber(ARGV[1]) then
+    redis.call("DEL", KEYS[1])
+    return "EXPIRED"
+  end
+  if token.consumed then
+    return "ALREADY_CONSUMED"
+  end
+  token.consumed = true
+  local encoded = cjson.encode(token)
+  redis.call("SETEX", KEYS[1], ARGV[2], encoded)
+  return encoded
+`;
+
 // ─── MFAEnforcer ─────────────────────────────────────────────────────────────
 
 export class MFAEnforcer {
@@ -84,6 +131,40 @@ export class MFAEnforcer {
     }
 
     const key = this._redisKey(userId, operationClass);
+
+    // PHASE C PENTEST (race-condition finding #3): single-use operations
+    // go through the atomic check-and-consume Lua script (see its
+    // docstring) instead of a separate GET-then-check-then-SETEX, closing
+    // the check-then-consume race. Multi-use operations never mutate the
+    // token, so a plain GET (below) carries no lost-update risk.
+    if (SINGLE_USE_OPERATIONS.has(operationClass)) {
+      let result: unknown;
+      try {
+        result = await redis.eval(CONSUME_STEPUP_SCRIPT, 1, key, Date.now(), MFA_STEPUP_TTL_SECONDS);
+      } catch {
+        result = null;
+      }
+
+      if (!result) {
+        await this._auditMFACheck(userId, operationClass, false, "no_stepup_token");
+        return { valid: false, reason: "Step-up MFA required for this operation" };
+      }
+      if (result === "INVALID") {
+        return { valid: false, reason: "Invalid step-up token format" };
+      }
+      if (result === "EXPIRED") {
+        await this._auditMFACheck(userId, operationClass, false, "stepup_expired");
+        return { valid: false, reason: "Step-up MFA token expired — re-verify" };
+      }
+      if (result === "ALREADY_CONSUMED") {
+        return { valid: false, reason: "Step-up token already consumed — re-verify MFA" };
+      }
+
+      const token = JSON.parse(result as string) as StepUpToken;
+      await this._auditMFACheck(userId, operationClass, true, "stepup_valid");
+      return { valid: true, token };
+    }
+
     const raw = await redis.get(key).catch(() => null);
 
     if (!raw) {
@@ -99,21 +180,11 @@ export class MFAEnforcer {
       return { valid: false, reason: "Invalid step-up token format" };
     }
 
-    if (token.consumed && SINGLE_USE_OPERATIONS.has(operationClass)) {
-      return { valid: false, reason: "Step-up token already consumed — re-verify MFA" };
-    }
-
     const now = Date.now();
     if (token.expiresAt < now) {
       await redis.del(key).catch(() => null);
       await this._auditMFACheck(userId, operationClass, false, "stepup_expired");
       return { valid: false, reason: "Step-up MFA token expired — re-verify" };
-    }
-
-    // For single-use operations: consume the token immediately
-    if (SINGLE_USE_OPERATIONS.has(operationClass)) {
-      token.consumed = true;
-      await redis.setex(key, MFA_STEPUP_TTL_SECONDS, JSON.stringify(token)).catch(() => null);
     }
 
     await this._auditMFACheck(userId, operationClass, true, "stepup_valid");
