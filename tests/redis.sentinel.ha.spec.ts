@@ -20,12 +20,12 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-const { mockConnect, mockConfig, mockQuit, mockRedisCtor } = vi.hoisted(() => {
+const { mockConnect, mockRedisCtor } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockConfig  = vi.fn().mockResolvedValue(["maxmemory-policy", "noeviction"]);
   const mockQuit    = vi.fn().mockResolvedValue(undefined);
-  const mockRedisCtor = vi.fn(() => ({ connect: mockConnect, config: mockConfig, quit: mockQuit }));
-  return { mockConnect, mockConfig, mockQuit, mockRedisCtor };
+  const mockRedisCtor = vi.fn((..._args: unknown[]) => ({ connect: mockConnect, config: mockConfig, quit: mockQuit }));
+  return { mockConnect, mockRedisCtor };
 });
 
 vi.mock("ioredis", () => ({ Redis: mockRedisCtor }));
