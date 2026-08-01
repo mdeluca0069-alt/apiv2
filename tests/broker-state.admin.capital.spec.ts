@@ -72,7 +72,7 @@ describe("BrokerState.adminAllocateCapital — real DB mode", () => {
   it("credits the real WalletAccount atomically instead of overwriting it from the in-memory ledger", async () => {
     const mock  = makeMockPrisma(1_000);
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false, prisma: mock.prisma });
-    const admin = state.login(ADMIN_EMAIL, ADMIN_PASS)!.principal;
+    const admin = (await state.login(ADMIN_EMAIL, ADMIN_PASS))!.principal;
 
     await state.adminAllocateCapital(admin, { userId: TRADER_ID, amount: 500, note: "wire transfer" });
 
@@ -85,7 +85,7 @@ describe("BrokerState.adminAllocateCapital — real DB mode", () => {
   it("writes one real double-entry LedgerEntry with status COMPLETED (not the legacy APPROVED-forever status)", async () => {
     const mock  = makeMockPrisma(1_000);
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false, prisma: mock.prisma });
-    const admin = state.login(ADMIN_EMAIL, ADMIN_PASS)!.principal;
+    const admin = (await state.login(ADMIN_EMAIL, ADMIN_PASS))!.principal;
 
     await state.adminAllocateCapital(admin, { userId: TRADER_ID, amount: 500, note: "wire transfer" });
 
@@ -100,7 +100,7 @@ describe("BrokerState.adminAllocateCapital — real DB mode", () => {
   it("emits a wallet.event (feeds Notification + the durable event archive) and increments deposit metrics", async () => {
     const mock  = makeMockPrisma(1_000);
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false, prisma: mock.prisma });
-    const admin = state.login(ADMIN_EMAIL, ADMIN_PASS)!.principal;
+    const admin = (await state.login(ADMIN_EMAIL, ADMIN_PASS))!.principal;
 
     await state.adminAllocateCapital(admin, { userId: TRADER_ID, amount: 500, note: "wire transfer" });
 
@@ -116,7 +116,7 @@ describe("BrokerState.adminAllocateCapital — real DB mode", () => {
     // Force the underlying credit to fail as if the wallet truly doesn't exist.
     mock.walletAccount.findUnique.mockResolvedValueOnce(null as unknown as { balance: Decimal });
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false, prisma: mock.prisma });
-    const admin = state.login(ADMIN_EMAIL, ADMIN_PASS)!.principal;
+    const admin = (await state.login(ADMIN_EMAIL, ADMIN_PASS))!.principal;
     mock.auditLog.create.mockClear(); // drop the login's own auth.login audit row
     mockEmit.mockClear();
 
@@ -133,7 +133,7 @@ describe("BrokerState.adminWithdrawCapital — real DB mode", () => {
   it("debits the real WalletAccount atomically", async () => {
     const mock  = makeMockPrisma(1_000);
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false, prisma: mock.prisma });
-    const admin = state.login(ADMIN_EMAIL, ADMIN_PASS)!.principal;
+    const admin = (await state.login(ADMIN_EMAIL, ADMIN_PASS))!.principal;
 
     await state.adminWithdrawCapital(admin, { userId: TRADER_ID, amount: 300, note: "bank payout" });
 
@@ -152,7 +152,7 @@ describe("BrokerState.adminWithdrawCapital — real DB mode", () => {
   it("rejects a withdrawal exceeding the real balance instead of silently overwriting it with an unchecked figure", async () => {
     const mock  = makeMockPrisma(100); // real balance is only 100
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false, prisma: mock.prisma });
-    const admin = state.login(ADMIN_EMAIL, ADMIN_PASS)!.principal;
+    const admin = (await state.login(ADMIN_EMAIL, ADMIN_PASS))!.principal;
     mock.auditLog.create.mockClear(); // drop the login's own auth.login audit row
     mockEmit.mockClear();
     mockInc.mockClear();
@@ -173,7 +173,7 @@ describe("BrokerState.adminWithdrawCapital — real DB mode", () => {
 describe("BrokerState.adminAllocateCapital / adminWithdrawCapital — sandbox mode (no prisma)", () => {
   it("still works via the in-memory ledger only, and never touches the DB-mode side effects", async () => {
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false }); // no prisma
-    const admin = state.login(ADMIN_EMAIL, ADMIN_PASS)!.principal;
+    const admin = (await state.login(ADMIN_EMAIL, ADMIN_PASS))!.principal;
 
     const next = await state.adminAllocateCapital(admin, { userId: TRADER_ID, amount: 1_000, note: "sandbox" });
 

@@ -1,4 +1,5 @@
-import { randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { randomUUID, scrypt, scryptSync, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { hashPassword as argon2Hash } from "../auth-service/password.hasher.js";
 import { LiquidityProvider, type LiquidityBook } from "../liquidity-engine/liquidity.provider.js";
@@ -99,6 +100,12 @@ type OlosGovernance = {
 };
 
 const nowIso = () => new Date().toISOString();
+
+// PHASE2_REMEDIATION (H10): promisified scrypt for the per-request hot
+// paths (login/register) -- see BrokerState._verifyScryptAsync's docstring
+// for why the seed()-time hashing at construction is deliberately left on
+// the sync scryptSync instead.
+const scryptAsync = promisify(scrypt);
 
 type AmlAlert = {
   id: string;
@@ -912,28 +919,68 @@ export class BrokerState {
     }
   }
 
-  login(email: string, password: string) {
+  /**
+   * PHASE2_REMEDIATION (H10): async because _verifyScryptAsync now is.
+   * See that method's docstring for the root cause this fixes.
+   */
+  async login(email: string, password: string) {
     const user = this.users.get(email.toLowerCase());
     if (!user) return null;
-    if (!this._verifyScrypt(user.password, password)) return null;
+    if (!(await this._verifyScryptAsync(user.password, password))) return null;
 
     this.recordAudit(user.id, "auth.login", "session", { email });
     return this._issueTokens(user);
   }
 
+  /**
+   * Boot-time only (called twice, from seed(), inside the constructor --
+   * constructors can't be async). NOT used by any per-request path; see
+   * _hashScryptAsync for the one register() uses.
+   */
   private _hashScrypt(plain: string): string {
     const salt = randomUUID().replace(/-/g, "");
     const h = scryptSync(plain, salt, 64).toString("hex");
     return `${salt}:${h}`;
   }
 
-  private _verifyScrypt(stored: string, plain: string): boolean {
+  /**
+   * PHASE2_REMEDIATION (H10): async, request-path version of _hashScrypt
+   * above -- used by register(), which runs per-request (POST /auth/
+   * register in sandbox/non-persistent mode). See _verifyScryptAsync's
+   * docstring for the root cause.
+   */
+  private async _hashScryptAsync(plain: string): Promise<string> {
+    const salt = randomUUID().replace(/-/g, "");
+    const derived = (await scryptAsync(plain, salt, 64)) as Buffer;
+    return `${salt}:${derived.toString("hex")}`;
+  }
+
+  /**
+   * PHASE2_REMEDIATION (H10): scrypt is deliberately CPU/memory-hard --
+   * scryptSync (the previous implementation) blocks the ENTIRE shared
+   * Node.js event loop for the full duration of the KDF computation
+   * (Node's default N=16384 cost factor is typically ~50-100ms per call).
+   * This is a single-process app (main.ts runs one event loop for REST,
+   * WS delivery, the WS cluster heartbeat, price-feed processing, and
+   * every other user's order execution) with no worker-thread offload
+   * anywhere in the codebase -- every login attempt therefore stalled ALL
+   * concurrent activity on the process for that call's duration. A burst
+   * of concurrent logins (or a deliberate brute-force/DoS attempt against
+   * a route the existing rate limiter only throttles per-IP, not
+   * cluster-wide) could measurably degrade or stall live trading
+   * operations for unrelated users. Fixed by switching to the async
+   * `crypto.scrypt` (via node:util's promisify), which runs the actual KDF
+   * computation on libuv's threadpool instead of the JS main thread,
+   * freeing the event loop to keep servicing other requests/WS messages
+   * while a login's scrypt computation is in flight.
+   */
+  private async _verifyScryptAsync(stored: string, plain: string): Promise<boolean> {
     const colon = stored.indexOf(":");
     if (colon < 1) return false;
     const salt = stored.slice(0, colon);
     const hash = stored.slice(colon + 1);
     try {
-      const derived = scryptSync(plain, salt, 64).toString("hex");
+      const derived = ((await scryptAsync(plain, salt, 64)) as Buffer).toString("hex");
       if (hash.length !== derived.length) return false;
       return timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(derived, "hex"));
     } catch {
@@ -970,14 +1017,15 @@ export class BrokerState {
     };
   }
 
-  register(input: { email: string; password: string; fullName: string; country: string; tier?: Principal["tier"] }) {
+  /** PHASE2_REMEDIATION (H10): async — see login()/_verifyScryptAsync. */
+  async register(input: { email: string; password: string; fullName: string; country: string; tier?: Principal["tier"] }) {
     const existing = this.users.get(input.email.toLowerCase());
     if (existing) return this.login(input.email, input.password);
 
     const user: UserRecord = {
       id: randomUUID(),
       email: input.email,
-      password: this._hashScrypt(input.password),
+      password: await this._hashScryptAsync(input.password),
       _passwordPlain: input.password,
       fullName: input.fullName,
       tenantId: "tenant_igfxpro",
@@ -991,7 +1039,7 @@ export class BrokerState {
     void this.persistUser(user);
     void this.persistClientAccount(this.clientAccounts.get(user.id)!);
     this.recordAudit(user.id, "auth.register", "user", { email: user.email, country: input.country });
-    return this.login(input.email, input.password);
+    return await this.login(input.email, input.password);
   }
 
   refresh(refreshToken: string) {

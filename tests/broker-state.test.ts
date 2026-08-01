@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { BrokerState } from "../shared/state.js";
 
 describe("BrokerState", () => {
-  it("enforces ESMA leverage caps before filling sandbox orders", () => {
+  it("enforces ESMA leverage caps before filling sandbox orders", async () => {
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false });
-    const auth = state.login("trader@igfxpro.local", "OlosDemo!2026");
+    const auth = await state.login("trader@igfxpro.local", "OlosDemo!2026");
     expect(auth).toBeTruthy();
 
     const rejected = state.placeOrder(
@@ -22,9 +22,9 @@ describe("BrokerState", () => {
     expect(rejected.rejectionReason).toContain("ESMA");
   });
 
-  it("fills compliant sandbox orders and opens positions", () => {
+  it("fills compliant sandbox orders and opens positions", async () => {
     const state = new BrokerState({ secret: "test", liveTradingEnabled: false });
-    const auth = state.login("trader@igfxpro.local", "OlosDemo!2026");
+    const auth = await state.login("trader@igfxpro.local", "OlosDemo!2026");
     expect(auth).toBeTruthy();
 
     const filled = state.placeOrder(

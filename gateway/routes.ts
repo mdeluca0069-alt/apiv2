@@ -254,9 +254,9 @@ export const routes: Route[] = [
   {
     method: "POST",
     path: "/auth/session",
-    handler: ({ body, state, res }) => {
+    handler: async ({ body, state, res }) => {
       const parsed = LoginRequestSchema.parse(body);
-      const result = state.login(parsed.email, parsed.password);
+      const result = await state.login(parsed.email, parsed.password);
       if (!result) return { ok: false, reason: "invalid_credentials" };
 
       // Set refresh token as httpOnly cookie — JavaScript cannot read this
@@ -332,9 +332,9 @@ export const routes: Route[] = [
   {
     method: "POST",
     path: api("/auth/login"),
-    handler: ({ body, state }) => {
+    handler: async ({ body, state }) => {
       const parsed = LoginRequestSchema.parse(body);
-      const result = state.login(parsed.email, parsed.password);
+      const result = await state.login(parsed.email, parsed.password);
       if (!result) return { ok: false, reason: "invalid_credentials" };
       const isAdmin = result.principal.roles.some((role) => ["admin", "super_admin", "risk", "compliance"].includes(role));
       if (!isAdmin && !isClientAuthKeyValid(parsed.authKey)) return { ok: false, reason: "invalid_auth_key" };
@@ -344,10 +344,10 @@ export const routes: Route[] = [
   {
     method: "POST",
     path: api("/auth/register"),
-    handler: ({ body, state }) => {
+    handler: async ({ body, state }) => {
       const parsed = RegisterRequestSchema.parse(body);
       if (!isClientAuthKeyValid(parsed.authKey)) return { ok: false, reason: "invalid_auth_key" };
-      return state.register(parsed);
+      return await state.register(parsed);
     },
   },
   {
@@ -2556,7 +2556,7 @@ export const routes: Route[] = [
       // Sandbox fallback: in-memory state login
       const body   = ctx.body as Record<string, unknown>;
       const parsed = LoginRequestSchema.parse(body);
-      const result = ctx.state.login(parsed.email, parsed.password);
+      const result = await ctx.state.login(parsed.email, parsed.password);
       if (!result) return { ok: false, reason: "invalid_credentials" };
       const isAdmin = result.principal.roles.some((r: string) =>
         ["admin", "super_admin", "risk", "compliance"].includes(r)
@@ -2609,7 +2609,7 @@ export const routes: Route[] = [
       if (!isClientAuthKeyValid(parsed.authKey)) {
         return { ok: false, reason: "invalid_auth_key" };
       }
-      const regResult = ctx.state.register(parsed) as Record<string, unknown>;
+      const regResult = (await ctx.state.register(parsed)) as Record<string, unknown>;
       if (regResult?.refreshToken) {
         const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
         ctx.res.setHeader("Set-Cookie",

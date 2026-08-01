@@ -1,6 +1,10 @@
-import { scryptSync, timingSafeEqual } from "node:crypto";
+import { scrypt, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import { hash, verify, argon2id } from "argon2";
 import bcrypt from "bcryptjs";
+
+// PHASE2_REMEDIATION (H10): see verifyScrypt()'s docstring below.
+const scryptAsync = promisify(scrypt);
 
 const ARGON2_OPTIONS = {
   type: argon2id,
@@ -43,7 +47,7 @@ export async function verifyPassword(stored: string, plain: string): Promise<boo
     }
   }
   // Legacy scrypt path — format: salt:hexHash
-  return verifyScrypt(stored, plain);
+  return await verifyScrypt(stored, plain);
 }
 
 // Returns true when the stored hash should be re-hashed with Argon2id.
@@ -56,13 +60,27 @@ export function needsUpgrade(stored: string): boolean {
   return !stored.startsWith("$argon2id$");
 }
 
-function verifyScrypt(stored: string, plain: string): boolean {
+/**
+ * PHASE2_REMEDIATION (H10): was scryptSync, which blocks the entire shared
+ * Node.js event loop for the full KDF computation (~50-100ms at Node's
+ * default N=16384 cost factor) -- this single-process app has no
+ * worker-thread offload anywhere, so every hit of this legacy branch
+ * stalled all concurrent request/WS handling for that duration. Reachable
+ * on production DB-backed auth for any user whose stored hash is still the
+ * pre-Argon2id `salt:hexHash` scrypt format (shrinking via needsUpgrade()'s
+ * lazy rehash, but nonzero until each such user logs in once) -- including
+ * via fix-gateway/fix.credentials.ts's FIX 4.4 Logon handler, a second hot
+ * path that reaches this same function for institutional trading session
+ * setup. Switched to the async `crypto.scrypt` (libuv threadpool), matching
+ * the fix applied to shared/state.ts's sandbox-mode equivalent.
+ */
+async function verifyScrypt(stored: string, plain: string): Promise<boolean> {
   const colon = stored.indexOf(":");
   if (colon < 1) return false;
   const salt = stored.slice(0, colon);
   const hash = stored.slice(colon + 1);
   try {
-    const derived = scryptSync(plain, salt, 64).toString("hex");
+    const derived = ((await scryptAsync(plain, salt, 64)) as Buffer).toString("hex");
     if (hash.length !== derived.length) return false;
     return timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(derived, "hex"));
   } catch {
