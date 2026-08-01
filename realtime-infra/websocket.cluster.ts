@@ -56,23 +56,39 @@ export type ClusterStats = {
 class WsClusterManager {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private localConnections = 0;
+  private meta: Omit<ClusterNodeInfo, "connections"> | null = null;
 
   readonly nodeId: string = WORKER_ID;
 
-  /** Register this node in Redis and start the heartbeat. */
+  /**
+   * Register this node in Redis and start the heartbeat.
+   *
+   * PHASE2_REMEDIATION (H9): the heartbeat timer now starts UNCONDITIONALLY,
+   * even if this initial write fails. Previously, a transient Redis error
+   * here (register() awaited the writes, and main.ts only console.warn'd on
+   * rejection) meant heartbeatTimer was never created at all -- the node
+   * would run its entire process lifetime in permanent "single-node mode"
+   * with zero retry, even though Redis recovered seconds later. Since
+   * _heartbeat() below is now self-healing (rewrites the full key rather
+   * than just extending an existing one), the very next heartbeat tick
+   * (within HEARTBEAT_INTERVAL_MS) will successfully (re)join the cluster
+   * once Redis is reachable again, regardless of whether this initial write
+   * succeeded.
+   */
   async register(): Promise<void> {
     const redis = getRedis();
     if (!redis) return;
 
-    const meta: Omit<ClusterNodeInfo, "connections"> = {
+    this.meta = {
       nodeId:    this.nodeId,
       hostname:  process.env.HOSTNAME ?? "localhost",
       pid:       process.pid,
       startedAt: new Date().toISOString(),
     };
 
-    await redis.setex(KEY_NODE(this.nodeId), NODE_TTL_SECONDS, JSON.stringify(meta));
-    await redis.setex(KEY_CONNS(this.nodeId), NODE_TTL_SECONDS, "0");
+    await this._writeNodeKeys().catch((err) =>
+      console.warn(`[ws-cluster] node=${this.nodeId} initial registration write failed (will retry on next heartbeat):`, (err as Error).message),
+    );
 
     this.heartbeatTimer = setInterval(() => void this._heartbeat(), HEARTBEAT_INTERVAL_MS);
     console.log(`[ws-cluster] node=${this.nodeId} registered in Redis cluster`);
@@ -195,13 +211,40 @@ class WsClusterManager {
 
   // ── Private ─────────────────────────────────────────────────────────────────
 
-  private async _heartbeat(): Promise<void> {
+  /**
+   * PHASE2_REMEDIATION (H9): re-WRITE both keys (setex) rather than merely
+   * EXTEND their TTL (expire). `EXPIRE` on a key that no longer exists is a
+   * silent no-op -- it returns 0, throws nothing, and the old bare `catch`
+   * here never engaged. If KEY_NODE had already expired server-side (a
+   * Redis outage/latency spike lasting >= NODE_TTL_SECONDS, plausible given
+   * shared/redis.ts's connectTimeout=3s/maxRetriesPerRequest=1 fail-fast
+   * config), every subsequent `expire()` call kept "succeeding" against a
+   * key that was never coming back, and this node silently vanished from
+   * getClusterStats()/findUserNode() routing for the rest of its process
+   * lifetime even after Redis and this process were both fully healthy
+   * again. setex() unconditionally recreates the key with fresh content and
+   * TTL, so a node self-heals back into the registry on its very next tick
+   * once Redis is reachable, with no distinction between "renew" and
+   * "re-register" needed.
+   */
+  private async _writeNodeKeys(): Promise<void> {
     const redis = getRedis();
-    if (!redis) return;
+    if (!redis || !this.meta) return;
+    await redis.setex(KEY_NODE(this.nodeId), NODE_TTL_SECONDS, JSON.stringify(this.meta));
+    await redis.setex(KEY_CONNS(this.nodeId), NODE_TTL_SECONDS, String(this.localConnections));
+  }
+
+  private async _heartbeat(): Promise<void> {
     try {
-      await redis.expire(KEY_NODE(this.nodeId), NODE_TTL_SECONDS);
-      await redis.expire(KEY_CONNS(this.nodeId), NODE_TTL_SECONDS);
-    } catch { /* Redis blip — will retry next interval */ }
+      await this._writeNodeKeys();
+    } catch (err) {
+      // PHASE2_REMEDIATION (H9): was a bare `catch {}` with no logging --
+      // a persistently failing heartbeat (e.g. Redis unreachable for an
+      // extended window) produced zero operational signal. Still
+      // non-fatal/no-retry-storm (next interval tries again in
+      // HEARTBEAT_INTERVAL_MS regardless), just no longer silent.
+      console.warn(`[ws-cluster] node=${this.nodeId} heartbeat renewal failed (will retry next interval):`, (err as Error).message);
+    }
   }
 
   private async _publishConns(): Promise<void> {
@@ -209,7 +252,12 @@ class WsClusterManager {
     if (!redis) return;
     try {
       await redis.setex(KEY_CONNS(this.nodeId), NODE_TTL_SECONDS, String(this.localConnections));
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      // PHASE2_REMEDIATION (H9): same silent-catch fix as _heartbeat() --
+      // a failed publish here is self-healed by the next _heartbeat() tick
+      // regardless, but should still be observable.
+      console.warn(`[ws-cluster] node=${this.nodeId} connection-count publish failed (will self-heal on next heartbeat):`, (err as Error).message);
+    }
   }
 
   /** Scan all node presence keys with SCAN (non-blocking). */
