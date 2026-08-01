@@ -1142,12 +1142,15 @@ export class BrokerState {
    * Fix: in persistent mode, source alerts from AmlEngine's own audit
    * trail (the real, canonical record of every non-LOW assessment) instead
    * of re-deriving a separate, weaker signal. Review status (PENDING/
-   * REVIEWED/CLEARED) is still tracked via the existing in-memory
-   * _amlAlerts overlay -- reviewAmlAlert() is unchanged -- so an alert
-   * already reviewed keeps its status across repeated calls within this
-   * process's lifetime. The legacy ledger-derived seeding remains the
-   * sandbox/non-persistent fallback, unchanged, preserving demo-mode
-   * behavior.
+   * REVIEWED/CLEARED) is tracked via the in-memory _amlAlerts overlay for
+   * same-process repeat calls, AND (PHASE2_REMEDIATION H17) via the
+   * durable AmlAlertDisposition table for anything the in-memory Map
+   * doesn't have cached -- e.g. after a restart, when _amlAlerts starts as
+   * a fresh empty Map and would otherwise silently revert every already-
+   * reviewed/cleared alert back to PENDING, discarding the compliance
+   * officer's decision history. The legacy ledger-derived seeding remains
+   * the sandbox/non-persistent fallback, unchanged, preserving demo-mode
+   * behavior (no DB, nothing to restart-proof there).
    */
   async getAmlAlerts(): Promise<AmlAlert[]> {
     if (IS_PERSISTENT && this.prisma) {
@@ -1159,6 +1162,12 @@ export class BrokerState {
         orderBy: { createdAt: "desc" },
         take: 500,
       });
+
+      const alertIds = rows.map((r) => `AML-${r.id.slice(0, 8).toUpperCase()}`);
+      const dispositions = alertIds.length
+        ? await this.prisma.amlAlertDisposition.findMany({ where: { id: { in: alertIds } } })
+        : [];
+      const dispositionById = new Map(dispositions.map((d) => [d.id, d]));
 
       const userIds = [...new Set(rows.map((r) => r.entity))];
       const users = userIds.length
@@ -1174,6 +1183,7 @@ export class BrokerState {
         if (this._amlAlerts.has(id)) continue; // preserve any existing review status
         const payload = row.payload as { amount?: number; risk?: string; flags?: { code: string }[] };
         const user = userById.get(row.entity);
+        const disposition = dispositionById.get(id);
         this._amlAlerts.set(id, {
           id,
           userId:   row.entity,
@@ -1184,7 +1194,9 @@ export class BrokerState {
             : "FREQUENT",
           amount:    payload.amount ?? 0,
           timestamp: row.createdAt.toISOString(),
-          status:    "PENDING",
+          status:    (disposition?.status as "REVIEWED" | "CLEARED" | undefined) ?? "PENDING",
+          reviewedBy: disposition?.reviewedBy ?? undefined,
+          note:       disposition?.note ?? undefined,
         });
       }
 
@@ -1224,13 +1236,39 @@ export class BrokerState {
     );
   }
 
-  reviewAmlAlert(id: string, status: "REVIEWED" | "CLEARED", actor: string, note?: string): AmlAlert {
+  /**
+   * PHASE2_REMEDIATION (H17): async -- now persists the disposition to the
+   * durable AmlAlertDisposition table (see getAmlAlerts()'s docstring for
+   * the restart-survival root cause this closes), not just the in-memory
+   * _amlAlerts Map.
+   */
+  async reviewAmlAlert(id: string, status: "REVIEWED" | "CLEARED", actor: string, note?: string): Promise<AmlAlert> {
     const alert = this._amlAlerts.get(id);
     if (!alert) throw Object.assign(new Error(`AML alert ${id} not found`), { status: 404 });
     const updated: AmlAlert = { ...alert, status, reviewedBy: actor, note };
     this._amlAlerts.set(id, updated);
     this.recordAudit(actor, `admin.aml_alert_${status.toLowerCase()}`, id, { note });
+    await this.persistAmlDisposition(updated);
     return updated;
+  }
+
+  /**
+   * PHASE2_REMEDIATION (H17): upserts the compliance officer's review
+   * decision so it survives a process restart. No-op in sandbox/non-
+   * persistent mode (this.prisma unset), matching every other
+   * persistXxx() helper's graceful-degradation contract in this class.
+   */
+  private async persistAmlDisposition(alert: AmlAlert): Promise<void> {
+    if (!this.prisma) return;
+    try {
+      await this.prisma.amlAlertDisposition.upsert({
+        where:  { id: alert.id },
+        update: { status: alert.status, reviewedBy: alert.reviewedBy ?? "", note: alert.note, reviewedAt: new Date() },
+        create: { id: alert.id, userId: alert.userId, status: alert.status, reviewedBy: alert.reviewedBy ?? "", note: alert.note },
+      });
+    } catch (error) {
+      console.error("[broker-state] persist AML disposition failed", error);
+    }
   }
 
   getEconomicCalendar(): EconomicCalendarEvent[] {

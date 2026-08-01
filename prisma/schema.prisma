@@ -125,6 +125,35 @@ model AutopilotConsent {
   @@index([userId, createdAt])
 }
 
+// PHASE2_REMEDIATION (H17): AmlEngine's findings (compliance-engine/
+// aml.engine.ts) are already durably written to AuditLog (actor=
+// "AML_ENGINE") and survive a restart -- but the compliance officer's
+// REVIEW of an alert (status/reviewedBy/note, set via reviewAmlAlert() in
+// shared/state.ts) previously lived only in an in-memory Map on the
+// BrokerState singleton. A process restart (deploy, crash, PM2 reload)
+// silently reverted every reviewed/cleared AML alert back to PENDING,
+// discarding the compliance decision history a real broker's regulator
+// expects to be durable and auditable. Follows the same status/
+// reviewedBy/reviewedAt/note shape KycCase already uses for the same
+// "admin reviews a system-generated finding" pattern. Keyed by the same
+// deterministic alert id getAmlAlerts() already generates
+// (`AML-${auditLogRowId.slice(0,8).toUpperCase()}`), not by a separate
+// surrogate key, so a disposition row maps 1:1 onto the AuditLog finding
+// it was made against.
+model AmlAlertDisposition {
+  id         String   @id
+  userId     String
+  status     String
+  reviewedBy String
+  note       String?
+  reviewedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([status])
+  @@index([userId])
+}
+
 model BrokerSetting {
   key       String   @id
   value     Json
