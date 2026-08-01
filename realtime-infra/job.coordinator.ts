@@ -53,16 +53,19 @@ export type JobSpec = {
 };
 
 export type JobRegistration = JobSpec & {
-  lock:          DistributedJobLock;
-  registered:    boolean;
-  runCount:      number;
-  skippedCount:  number;
-  lastRunAt:     Date | null;
-  lastSkippedAt: Date | null;
-  lastError:     string | null;
+  lock:           DistributedJobLock;
+  registered:     boolean;
+  runCount:       number;
+  skippedCount:   number;
+  lastRunAt:      Date | null;
+  lastSkippedAt:  Date | null;
+  lastError:      string | null;
+  // PHASE2_REMEDIATION (H14): active TTL-renewal timer for the CURRENT
+  // run, if any -- see tryLead()/release()'s docstrings.
+  renewalHandle:  ReturnType<typeof setInterval> | null;
 };
 
-class JobCoordinator {
+export class JobCoordinator {
   private readonly registry = new Map<string, JobRegistration>();
 
   /**
@@ -83,6 +86,7 @@ class JobCoordinator {
       lastRunAt:     null,
       lastSkippedAt: null,
       lastError:     null,
+      renewalHandle: null,
     });
 
     console.log(`[job-coordinator] registered job "${spec.id}" ttl=${spec.ttlSeconds}s interval=${spec.intervalMs / 1_000}s`);
@@ -96,6 +100,28 @@ class JobCoordinator {
    * When Redis is unavailable, always returns true (graceful degradation).
    * The job's own idempotency guards (DB unique constraints, markTriggered, etc.)
    * prevent double-processing in that scenario.
+   *
+   * PHASE2_REMEDIATION (H14): every job registered here (the 10-job
+   * inventory table above, everything EXCEPT daily-snapshot-eod/
+   * swap-accrual-nightly, which construct DistributedJobLock directly and
+   * already call startRenewal() themselves) previously had NO renewal at
+   * all -- ttlSeconds is deliberately set shorter than the schedule
+   * interval (JobSpec.ttlSeconds's own doc comment: "must be < schedule
+   * interval") on the assumption a run always finishes well inside its
+   * TTL window. True in the common case, but if a run's actual duration
+   * ever approaches or exceeds ttlSeconds (DB contention, a large
+   * position/order count, a slow tick under load -- exactly the
+   * conditions most likely during a real incident, not a quiet one), the
+   * lock silently expired mid-run with nothing renewing it. The next
+   * scheduled tick (this worker or another) could then acquire the same
+   * now-free lock and start running the SAME job again concurrently with
+   * the still-in-flight first run -- for jobs like stop-out-scan or
+   * liquidation-watchdog, a real double-execution correctness risk, not
+   * just wasted CPU. Now starts the same startRenewal() mechanism the two
+   * settlement jobs already used, at half the TTL (comfortably before
+   * expiry, and for the vast majority of runs that finish quickly,
+   * release() below clears the timer before its first tick ever fires --
+   * no extra Redis calls added to the common case).
    */
   async tryLead(jobId: string): Promise<boolean> {
     const entry = this._get(jobId);
@@ -104,6 +130,9 @@ class JobCoordinator {
     if (!acquired) {
       entry.skippedCount++;
       entry.lastSkippedAt = new Date();
+    } else {
+      const renewalIntervalSeconds = Math.max(1, Math.floor(entry.ttlSeconds / 2));
+      entry.renewalHandle = entry.lock.startRenewal(renewalIntervalSeconds);
     }
 
     return acquired;
@@ -115,9 +144,18 @@ class JobCoordinator {
    */
   async release(jobId: string): Promise<void> {
     const entry = this._get(jobId);
+    this._stopRenewal(entry);
     await entry.lock.release();
     entry.runCount++;
     entry.lastRunAt = new Date();
+  }
+
+  /** PHASE2_REMEDIATION (H14): stop this job's renewal timer, if one is running. */
+  private _stopRenewal(entry: JobRegistration): void {
+    if (entry.renewalHandle) {
+      clearInterval(entry.renewalHandle);
+      entry.renewalHandle = null;
+    }
   }
 
   /**
@@ -131,8 +169,8 @@ class JobCoordinator {
   }
 
   /** Returns a snapshot of all registered jobs for admin/monitoring endpoints. */
-  getInventory(): Array<Omit<JobRegistration, "lock">> {
-    return [...this.registry.values()].map(({ lock: _lock, ...rest }) => rest);
+  getInventory(): Array<Omit<JobRegistration, "lock" | "renewalHandle">> {
+    return [...this.registry.values()].map(({ lock: _lock, renewalHandle: _renewalHandle, ...rest }) => rest);
   }
 
   private _get(jobId: string): JobRegistration {
