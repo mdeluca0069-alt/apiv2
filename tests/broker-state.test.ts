@@ -39,6 +39,6 @@ describe("BrokerState", () => {
     );
 
     expect(filled.status).toBe("FILLED");
-    expect(state.getPositions()).toHaveLength(1);
+    expect(state.getPositions(auth!.principal.sub)).toHaveLength(1);
   });
 });

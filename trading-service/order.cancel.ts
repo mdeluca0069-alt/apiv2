@@ -86,7 +86,13 @@ async function cancelOrderMemory(
   userId:  string,
   state:   BrokerState,
 ): Promise<CancelResult> {
-  const orders = state.getOrders() as Array<{ id: string; status: string }>;
+  // PHASE C PENTEST (RBAC/IDOR): state.getOrders(userId) is already scoped
+  // to the caller's own orders -- an orderId belonging to another user
+  // simply won't be found here, matching cancelOrderDb()'s explicit
+  // `order.userId !== userId` check above (404-style non-disclosure
+  // instead of a separate 403, consistent with how NOT_FOUND is already
+  // used for a missing id).
+  const orders = state.getOrders(userId) as Array<{ id: string; status: string }>;
   const order  = orders.find((o) => o.id === orderId);
 
   if (!order) return { ok: false, reason: "ORDER_NOT_FOUND" };
@@ -94,10 +100,13 @@ async function cancelOrderMemory(
     return { ok: false, reason: `CANNOT_CANCEL_${order.status}_ORDER` };
   }
 
-  const stateAny = state as unknown as Record<string, unknown>;
-  if (typeof stateAny["updateOrderStatusInMemory"] === "function") {
-    (stateAny["updateOrderStatusInMemory"] as (id: string, uid: string, s: string) => void)(orderId, userId, "CANCELLED");
-  }
+  // PHASE C PENTEST: updateOrderStatusInMemory() previously did not exist
+  // on BrokerState at all -- this dynamic-dispatch check always evaluated
+  // false, so the sandbox cancel path never actually updated order status
+  // (silently a no-op beyond the event emission below). It's now a real
+  // method (shared/state.ts), which also enforces ownership itself as a
+  // second layer of defense.
+  state.updateOrderStatusInMemory(orderId, userId, "CANCELLED");
 
   const ts = new Date().toISOString();
   eventBus.emit("order.cancelled", {

@@ -460,7 +460,7 @@ export const routes: Route[] = [
         }));
       }
 
-      return state.getPositions();
+      return state.getPositions(principal.sub);
     },
   },
   {
@@ -496,7 +496,7 @@ export const routes: Route[] = [
         });
       }
 
-      return state.getOrders();
+      return state.getOrders(principal.sub);
     },
   },
   {
@@ -520,14 +520,24 @@ export const routes: Route[] = [
         });
       }
 
-      return state.getOrders();
+      return state.getOrders(principal.sub);
     },
   },
   {
     method: "GET",
     path: "/trading/history",
     auth: true,
-    handler: ({ state }) => state.getOrders(),
+    // PHASE C PENTEST (RBAC/IDOR): this legacy (non-api/v1-prefixed)
+    // duplicate of GET /api/v1/trading/history previously called
+    // state.getOrders() with no principal resolved at all -- unlike every
+    // other route touching orders/positions in this file, it never even
+    // checked authentication before returning data, let alone scoped it
+    // to the caller.
+    handler: ({ state, authHeader }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "unauthenticated" };
+      return state.getOrders(principal.sub);
+    },
   },
   {
     method: "POST",
@@ -3219,7 +3229,7 @@ export const routes: Route[] = [
     path: api("/admin/hedge/stats"),
     admin: true,
     handler: ({ state }) => {
-      const positions = state.getPositions();
+      const positions = state.getAllPositions();
       const riskPolicy = state.getRiskPolicy();
       const ordersPlaced = metrics.get("orders_placed_total");
       const ordersFilled = metrics.get("orders_filled_total");
@@ -3744,7 +3754,7 @@ export const routes: Route[] = [
     handler: ({ state }) => {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
-      const orders = state.getOrders();
+      const orders = state.getAllOrders();
       const todayOrders = orders.filter((o) => new Date(o.createdAt) >= today);
 
       const hourlyCounts = new Array<number>(24).fill(0);
@@ -4279,8 +4289,8 @@ export const routes: Route[] = [
     path: api("/platform/stats"),
     handler: async ({ state }) => {
       const accounts  = state.getClientAccounts();
-      const orders    = state.getOrders();
-      const positions = state.getPositions();
+      const orders    = state.getAllOrders();
+      const positions = state.getAllPositions();
       const quotes    = state.getQuotes();
       const filled    = orders.filter((o) => o.status === "FILLED");
       const totalVol  = filled.reduce((s, o) => s + ((o as any).quantity ?? 0) * ((o as any).price ?? 0), 0);

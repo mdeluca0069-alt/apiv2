@@ -427,6 +427,21 @@ export class BrokerState {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly orders = new Map<string, OrderAck>();
   private readonly positions = new Map<string, Position>();
+  // PHASE C PENTEST (RBAC/IDOR finding, sandbox/non-persistent mode): the
+  // OrderAck/Position wire schemas (shared/contracts.ts) deliberately carry
+  // no `userId` field (never exposed to clients), so this in-memory
+  // fallback (used only when DATABASE_URL is unset -- the DB-backed path
+  // scopes every query by principal.sub directly) had no way to enforce
+  // ownership at all: closePositionInMemory() only checked that the caller
+  // had SOME client account (true for any authenticated trader, not that
+  // THEY owned this position), modifyPositionSlTp() had no ownership check
+  // whatsoever, and getOrders()/getPositions() returned every order/
+  // position in the process with no per-user filter. Any authenticated
+  // trader could view, close, or modify another trader's positions/orders
+  // by id in this mode. This map tracks ownership internally (order id and
+  // position id are always the same value in this in-memory model -- see
+  // placeOrder()) without changing the public response shape.
+  private readonly ownerByOrderId = new Map<string, string>();
   private readonly clientAccounts = new Map<string, BrokerClientAccount>();
   private readonly liquidityControls = new Map<string, LiquidityControl>();
   private readonly audit: AuditRecord[] = [];
@@ -586,8 +601,15 @@ export class BrokerState {
         entry.status === "APPROVED"
       )
       .reduce((sum, entry) => sum + entry.amount, 0);
-    const marginUsed = this.getPositions().reduce((sum, position) => sum + position.marginUsed, 0);
-    const unrealizedPnl = this.getPositions().reduce((sum, position) => sum + position.pnl, 0);
+    // PHASE C PENTEST (RBAC/IDOR): was unscoped this.getPositions() before
+    // that method required a userId -- silently summed EVERY trader's
+    // margin/pnl into each individual account's own equity calculation.
+    // Scoping to this account's own positions was always the correct
+    // behavior, not a change in intent, just previously impossible to
+    // express since getPositions() had no ownership filter to give it.
+    const ownPositions = this.getPositions(account.userId);
+    const marginUsed = ownPositions.reduce((sum, position) => sum + position.marginUsed, 0);
+    const unrealizedPnl = ownPositions.reduce((sum, position) => sum + position.pnl, 0);
     const equity = allocated + unrealizedPnl;
     const freeMargin = Math.max(0, equity - marginUsed);
     const riskScore = Math.min(100, Math.round((marginUsed / Math.max(equity, 1)) * 100 + (freeMargin < equity * 0.25 ? 25 : 8)));
@@ -829,6 +851,7 @@ export class BrokerState {
         notional: Number(order.notional),
         createdAt: order.createdAt.toISOString(),
       });
+      this.ownerByOrderId.set(order.id, order.userId);
     });
 
     this.positions.clear();
@@ -845,6 +868,7 @@ export class BrokerState {
         leverage: position.leverage,
         openedAt: position.openedAt.toISOString(),
       });
+      this.ownerByOrderId.set(position.id, position.userId);
     });
 
     this.audit.length = 0;
@@ -1487,8 +1511,8 @@ export class BrokerState {
       },
       accounts: this.getClientAccounts(),
       quotes: this.getQuotes(),
-      positions: this.getPositions(),
-      orders: this.getOrders(),
+      positions: this.getAllPositions(),
+      orders: this.getAllOrders(),
       riskPolicy: this.getRiskPolicy(),
       liquidityControls: this.getLiquidityControls(),
       olosGovernance: this.getOlosGovernance(),
@@ -1985,6 +2009,7 @@ export class BrokerState {
       openedAt: ack.createdAt,
     };
     this.positions.set(ack.id, position);
+    this.ownerByOrderId.set(ack.id, principal.sub);
     void this.persistFilledOrder(ack, position, principal.sub);
     this.recordAudit(principal.sub, "trading.order_filled", "order", ack);
 
@@ -2015,7 +2040,13 @@ export class BrokerState {
     return ack;
   }
 
-  getOrders(): OrderAck[] {
+  /** This user's own orders only. Every client-facing call site must use this, not getAllOrders(). */
+  getOrders(userId: string): OrderAck[] {
+    return this.getAllOrders().filter((o) => this.ownerByOrderId.get(o.id) === userId);
+  }
+
+  /** ADMIN-ONLY: every order in the process, regardless of owner. Never call from a client-facing (non-admin) route. */
+  getAllOrders(): OrderAck[] {
     return [...this.orders.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
@@ -2029,9 +2060,10 @@ export class BrokerState {
     if (!pos)                   return { ok: false, reason: "POSITION_NOT_FOUND" };
     if (pos.side === undefined)  return { ok: false, reason: "INVALID_POSITION" };
 
-    // Verify ownership against account id stored in position
-    const account = this.getClientAccounts().find((a) => a.userId === userId);
-    if (!account)               return { ok: false, reason: "UNAUTHORIZED" };
+    // PHASE C PENTEST (RBAC/IDOR): must match THIS position's actual
+    // owner, not merely confirm the caller has SOME client account (true
+    // for any authenticated trader) -- see ownerByOrderId's docstring.
+    if (this.ownerByOrderId.get(positionId) !== userId) return { ok: false, reason: "UNAUTHORIZED" };
 
     const quote     = this.getQuote(pos.symbol);
     const exitPrice = quote ? (pos.side === "BUY" ? quote.bid : quote.ask) : pos.entryPrice;
@@ -2041,6 +2073,7 @@ export class BrokerState {
 
     // Remove from in-memory positions
     this.positions.delete(positionId);
+    this.ownerByOrderId.delete(positionId);
 
     // Recalculate account capital
     const clientAcc = this.clientAccounts.get(userId);
@@ -2066,6 +2099,11 @@ export class BrokerState {
     const pos = this.positions.get(positionId);
     if (!pos) return { ok: false, reason: "POSITION_NOT_FOUND" };
 
+    // PHASE C PENTEST (RBAC/IDOR): this check did not exist at all before
+    // -- any authenticated trader could rewrite another trader's SL/TP by
+    // guessing/enumerating a position id. See ownerByOrderId's docstring.
+    if (this.ownerByOrderId.get(positionId) !== userId) return { ok: false, reason: "UNAUTHORIZED" };
+
     const entry = pos.entryPrice;
     if (stopLoss !== undefined) {
       if (pos.side === "BUY"  && stopLoss >= entry) return { ok: false, reason: "SL_MUST_BE_BELOW_ENTRY_FOR_BUY" };
@@ -2085,7 +2123,31 @@ export class BrokerState {
     return { ok: true, positionId };
   }
 
-  getPositions(): Position[] {
+  /**
+   * PHASE C PENTEST: transitions an in-memory order's status, enforcing
+   * ownership. Previously referenced dynamically by trading-service/
+   * order.cancel.ts's cancelOrderMemory() via
+   * `stateAny["updateOrderStatusInMemory"]` -- that method never actually
+   * existed on this class, so the sandbox cancel path silently never
+   * updated order status at all (the order stayed CANCELLABLE forever,
+   * even after being "cancelled"). Fixed as a real method here, now with
+   * the ownership check that path always should have had too.
+   */
+  updateOrderStatusInMemory(orderId: string, userId: string, status: OrderAck["status"]): boolean {
+    const order = this.orders.get(orderId);
+    if (!order) return false;
+    if (this.ownerByOrderId.get(orderId) !== userId) return false;
+    this.orders.set(orderId, { ...order, status });
+    return true;
+  }
+
+  /** This user's own positions only. Every client-facing call site must use this, not getAllPositions(). */
+  getPositions(userId: string): Position[] {
+    return this.getAllPositions().filter((p) => this.ownerByOrderId.get(p.id) === userId);
+  }
+
+  /** ADMIN-ONLY: every open position in the process, regardless of owner. Never call from a client-facing (non-admin) route. */
+  getAllPositions(): Position[] {
     return [...this.positions.values()].map((position) => {
       const quote = this.getQuote(position.symbol);
       const markPrice = quote?.mid ?? position.entryPrice;
@@ -2097,8 +2159,9 @@ export class BrokerState {
 
   getWallet(userId = "usr_trader_demo"): WalletBalance {
     const account = this.ensureClientAccount(userId);
-    const marginUsed = this.getPositions().reduce((sum, position) => sum + position.marginUsed, 0);
-    const unrealizedPnl = this.getPositions().reduce((sum, position) => sum + position.pnl, 0);
+    const ownPositions = this.getPositions(userId);
+    const marginUsed = ownPositions.reduce((sum, position) => sum + position.marginUsed, 0);
+    const unrealizedPnl = ownPositions.reduce((sum, position) => sum + position.pnl, 0);
     const equity = account.capital.allocated + unrealizedPnl;
     return {
       currency: "EUR",
@@ -2112,7 +2175,7 @@ export class BrokerState {
 
   getRisk(userId = "usr_trader_demo"): RiskSnapshot {
     const wallet = this.getWallet(userId);
-    const exposure = this.getPositions().reduce((sum, position) => {
+    const exposure = this.getPositions(userId).reduce((sum, position) => {
       const mark = this.getQuote(position.symbol)?.mid ?? position.entryPrice;
       return sum + mark * position.quantity;
     }, 0);
@@ -2163,7 +2226,7 @@ export class BrokerState {
       users: this.users.size,
       openPositions: this.positions.size,
       ordersToday: this.orders.size,
-      revenueToday: this.getOrders().filter((order) => order.status === "FILLED").length * 4.5,
+      revenueToday: this.getAllOrders().filter((order) => order.status === "FILLED").length * 4.5,
       aum: accounts.reduce((sum, account) => sum + account.capital.allocated, 0),
       systemRisk: this.getRisk().riskScore,
       complianceQueue: accounts.reduce((sum, account) => sum + account.documents.filter((document) => document.status === "PENDING_REVIEW").length, 0),
@@ -2251,6 +2314,7 @@ export class BrokerState {
       createdAt: nowIso(),
     };
     this.orders.set(ack.id, ack);
+    this.ownerByOrderId.set(ack.id, actor);
     void this.persistRejectedOrder(ack, actor);
     this.recordAudit(actor, "trading.order_rejected", "order", ack);
 
