@@ -193,6 +193,27 @@ model Instrument {
   HedgeOrder        HedgeOrder[]
 }
 
+// PHASE C PENTEST (JWT/session/replay finding #1): Sumsub's webhook HMAC
+// (X-Payload-Digest = HMAC-SHA256(rawBody, SUMSUB_WEBHOOK_SECRET)) is bound
+// only to the body, with no timestamp/nonce -- a captured webhook (proxy
+// log, MITM before TLS termination, compromised monitoring pipeline) could
+// be replayed at any later time and re-apply its effect (e.g. flipping a
+// user's kycStatus back to "approved" after a legitimate later re-review
+// rejected them). Every processed webhook's raw-body hash is recorded here
+// with a UNIQUE constraint; processSumsubWebhook() atomically tries to
+// insert before applying any effect, so a byte-identical replay (whether
+// malicious or a benign Sumsub retry) is recognized and no-op'd regardless
+// of what the case's CURRENT state has since moved to.
+model SumsubWebhookEvent {
+  id          String   @id @default(uuid())
+  payloadHash String   @unique
+  applicantId String?
+  type        String
+  processedAt DateTime @default(now())
+
+  @@index([applicantId])
+}
+
 model KycCase {
   id                 String    @id @default(uuid())
   userId             String    @unique

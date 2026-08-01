@@ -8,7 +8,7 @@
  * Each step creates an immutable KycVerificationStep row.
  * Every admin action writes to AuditLog.
  */
-import { randomUUID }    from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { immutableAudit } from "../security/immutable.audit.js";
 import { ocrProvider, type OcrDocumentType } from "./ocr.provider.js";
@@ -83,6 +83,14 @@ export type KycStepSummary = {
 // ─── In-memory fallback for sandbox mode ─────────────────────────────────────
 
 const _sandboxCases = new Map<string, KycCaseSummary>();
+
+/** Prisma unique-constraint violation code (same pattern as order.lifecycle.ts). */
+function isPrismaUniqueViolation(err: unknown): boolean {
+  return (
+    typeof err === "object" && err !== null &&
+    "code" in err && (err as { code: string }).code === "P2002"
+  );
+}
 
 // ─── KycService ───────────────────────────────────────────────────────────────
 
@@ -476,6 +484,22 @@ export class KycService {
    *   reviewAnswer: GREEN → APPROVED
    *   reviewAnswer: RED   → REJECTED (with reject labels)
    */
+  /**
+   * PHASE C PENTEST (JWT/session/replay finding #1): Sumsub's HMAC
+   * (X-Payload-Digest) is bound only to the body, with no timestamp/nonce
+   * -- a captured webhook (proxy log, MITM before TLS termination,
+   * compromised monitoring pipeline) could otherwise be replayed at any
+   * later time and re-apply its effect, e.g. flipping a user's kycStatus
+   * back to "approved" after a legitimate later re-review rejected them.
+   * Every processed webhook's raw-body hash is recorded in
+   * SumsubWebhookEvent with a UNIQUE constraint; the insert below happens
+   * BEFORE any effect is applied, and a P2002 (duplicate) means this exact
+   * payload was already processed at some point -- treated as a replay
+   * and no-op'd regardless of what the case's CURRENT state has since
+   * moved to. A genuinely new review (even with the same outcome) gets a
+   * new inspectionId/timestamp/content and therefore a different hash, so
+   * legitimate re-reviews are unaffected.
+   */
   async processSumsubWebhook(rawBody: string, digestHeader: string): Promise<void> {
     // 1. Verify HMAC signature
     const valid = sumsubProvider.verifyWebhookSignature(rawBody, digestHeader);
@@ -493,6 +517,20 @@ export class KycService {
 
     if (!IS_PERSISTENT) return;
     const db = prisma as NonNullable<typeof prisma>;
+
+    // 2. Replay guard -- see this method's docstring.
+    const payloadHash = createHash("sha256").update(rawBody).digest("hex");
+    try {
+      await db.sumsubWebhookEvent.create({
+        data: { payloadHash, applicantId: applicantId ?? null, type },
+      });
+    } catch (err) {
+      if (isPrismaUniqueViolation(err)) {
+        console.warn(`[sumsub-webhook] duplicate/replayed payload for applicantId=${applicantId} (hash=${payloadHash.slice(0, 12)}…) — ignored`);
+        return;
+      }
+      throw err;
+    }
 
     // Find the KYC case by Sumsub applicant ID (or externalUserId = our userId)
     const kase = await db.kycCase.findFirst({
