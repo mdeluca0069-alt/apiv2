@@ -70,11 +70,6 @@ function hotp(secret: string, counter: number): string {
   return String(code % 1_000_000).padStart(6, "0");
 }
 
-function totpNow(secret: string, windowStep = 0): string {
-  const counter = Math.floor(Date.now() / 1000 / 30) + windowStep;
-  return hotp(secret, counter);
-}
-
 // ─── 2FA Service ──────────────────────────────────────────────────────────────
 
 export type TotpSetup = {
@@ -104,9 +99,27 @@ export class TwoFactorService {
 
   /** Verify a 6-digit TOTP code (accepts ±1 time window = 90s tolerance). */
   verifyToken(secret: string, token: string): boolean {
+    return this._matchCounter(secret, token) !== null;
+  }
+
+  /**
+   * PHASE C PENTEST (race-condition finding #1): returns the HOTP counter
+   * value that matched, or null. verify() uses this (instead of the plain
+   * boolean verifyToken()) so it can track and reject replay of an
+   * already-consumed counter -- see verify()'s docstring for the root
+   * cause this closes. Factored out so verifyToken() (used by enable2fa()'s
+   * one-time setup confirmation, where replay tracking doesn't apply) and
+   * verify() share one HOTP-window-matching implementation.
+   */
+  private _matchCounter(secret: string, token: string): number | null {
     const normalised = token.replace(/\s/g, "");
-    if (!/^\d{6}$/.test(normalised)) return false;
-    return [-1, 0, 1].some((w) => totpNow(secret, w) === normalised);
+    if (!/^\d{6}$/.test(normalised)) return null;
+    const nowCounter = Math.floor(Date.now() / 1000 / 30);
+    for (const w of [-1, 0, 1]) {
+      const counter = nowCounter + w;
+      if (hotp(secret, counter) === normalised) return counter;
+    }
+    return null;
   }
 
   /** Enable 2FA for a user — verifies one token first to confirm the secret works. */
@@ -138,7 +151,44 @@ export class TwoFactorService {
     return { ok: true };
   }
 
-  /** Verify a token or backup code for login. */
+  /**
+   * Verify a token or backup code for login.
+   *
+   * PHASE C PENTEST (race-condition findings #1-2): two distinct bugs, both
+   * fixed with the same atomic-conditional-UPDATE pattern used throughout
+   * this codebase's other money/security-critical mutations:
+   *
+   *   1. TOTP replay: verifyToken() only checked mathematical validity
+   *      against the current ±1 time-step window -- with no record of
+   *      which 30s-window counter had already been consumed, a single
+   *      correct 6-digit code authenticated successfully every time it was
+   *      presented within its ~90s validity window, not just once. A
+   *      captured/intercepted code (phishing relay, shoulder-surf,
+   *      malicious extension) could be replayed to open a second session
+   *      or mint a second withdrawal/security-change step-up token. Fixed
+   *      by tracking `lastUsedCounter` and rejecting any counter <= the
+   *      last one accepted, via a single conditional UPDATE ... WHERE
+   *      (the same row-level-lock-serializes-concurrent-writers principle
+   *      as H2/H4/H7/H9/H14's atomic CTEs elsewhere in this codebase) so
+   *      two concurrent submissions of the SAME code can't both pass the
+   *      check-then-write race that a separate SELECT-then-UPDATE would
+   *      have.
+   *   2. Backup-code lost-update / un-consume: the previous
+   *      findUnique-then-splice-then-update was a plain read-modify-write
+   *      with no transaction or conditional guard. Two concurrent requests
+   *      presenting the SAME code could both read it as still-present
+   *      before either wrote back (double-use of one single-use code);
+   *      two requests presenting DIFFERENT codes concurrently raced a lost
+   *      update, where whichever write committed last would silently
+   *      overwrite (un-consume) the other's already-applied removal. Fixed
+   *      with a single atomic `UPDATE ... SET value = jsonb_set(...) WHERE
+   *      value->'backupCodes' ? code` -- Postgres's jsonb `-` (remove
+   *      element) operates on the row's CURRENT committed value under the
+   *      UPDATE's own row lock, not a snapshot read earlier by the
+   *      application, so concurrent consumers of different codes can't
+   *      clobber each other and concurrent consumers of the SAME code
+   *      correctly leave only one of them successful.
+   */
   async verify(
     userId: string,
     token:  string,
@@ -148,31 +198,43 @@ export class TwoFactorService {
     }
 
     const db  = prisma as NonNullable<typeof prisma>;
-    const row = await db.brokerSetting.findUnique({ where: { key: `2fa:${userId}` } });
+    const key = `2fa:${userId}`;
+    const row = await db.brokerSetting.findUnique({ where: { key } });
     if (!row) return { valid: false };
 
-    const cfg = row.value as { secret: string; backupCodes: string[] };
+    const cfg = row.value as { secret: string; backupCodes: string[]; lastUsedCounter?: number };
 
-    // TOTP check
-    if (this.verifyToken(cfg.secret, token)) {
+    // ── TOTP check, with atomic replay protection ──────────────────────────
+    const matchedCounter = this._matchCounter(cfg.secret, token);
+    if (matchedCounter !== null) {
+      const claimed = await db.$queryRaw<Array<{ key: string }>>`
+        UPDATE "BrokerSetting"
+        SET value = jsonb_set(value, '{lastUsedCounter}', to_jsonb(${matchedCounter}::int))
+        WHERE key = ${key} AND COALESCE((value->>'lastUsedCounter')::int, -1) < ${matchedCounter}
+        RETURNING key
+      `;
+      if (claimed.length === 0) return { valid: false }; // replay of an already-consumed code
       return { valid: true, usedBackup: false };
     }
 
-    // Backup code check (consume on use)
+    // ── Backup code check, atomic conditional consume ──────────────────────
     const normalised = token.toUpperCase().replace(/\s/g, "");
-    const idx        = cfg.backupCodes.indexOf(normalised);
-    if (idx !== -1) {
-      cfg.backupCodes.splice(idx, 1);
-      await db.brokerSetting.update({
-        where: { key: `2fa:${userId}` },
-        data:  { value: cfg as object },
-      });
-      await immutableAudit.write({
-        actor: userId,
-        action: "auth.2fa.backup_code_used", entity: userId,
-        payload: { remaining: cfg.backupCodes.length } as object,
-      });
-      return { valid: true, usedBackup: true };
+    if (cfg.backupCodes.includes(normalised)) {
+      const consumed = await db.$queryRaw<Array<{ key: string }>>`
+        UPDATE "BrokerSetting"
+        SET value = jsonb_set(value, '{backupCodes}', (value->'backupCodes') - ${normalised})
+        WHERE key = ${key} AND value->'backupCodes' ? ${normalised}
+        RETURNING key
+      `;
+      if (consumed.length > 0) {
+        await immutableAudit.write({
+          actor: userId,
+          action: "auth.2fa.backup_code_used", entity: userId,
+          payload: { remainingApprox: cfg.backupCodes.length - 1 } as object,
+        });
+        return { valid: true, usedBackup: true };
+      }
+      // Lost the race to a concurrent consumer of the same code.
     }
 
     return { valid: false };
