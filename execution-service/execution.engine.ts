@@ -516,34 +516,55 @@ export class ExecutionEngine {
         return { ok: true as const, positionId, newFilledQty, originalQty, isNowFullyFilled, outboxId: outbox.id };
       });
     } catch (err) {
+      // PHASE E (failure-injection audit): these rejectOrder() calls are
+      // compensating actions running INSIDE the catch of the main fill
+      // transaction -- a real error has already happened. Unlike
+      // order.controller.ts's equivalent transactional-failure compensating
+      // calls (checkAndLockMargin/pendingOrderBook.add failure paths, both
+      // already `.catch(() => {})`-guarded), these were unguarded: if the DB
+      // is also unavailable right when we try to persist the rejection (a
+      // plausible correlated failure, not an independent coincidence), the
+      // resulting throw would replace the original `err` entirely and
+      // propagate out of execute() uncaught by anything here, skipping
+      // emitOrderRejected() and the REJECTED return -- the caller (the
+      // execution queue worker) would see an exception instead of a REJECTED
+      // result for an order that is now stuck ACCEPTED with no compensating
+      // record of why. `.catch()` ensures the REJECTED result is still
+      // returned even if this persistence step itself fails; the order is
+      // then swept up by settlement/recovery.service.ts's stuck-order sweep.
+      const _logRejectFailure = (cleanupErr: unknown) => {
+        console.error(`[execution.engine] rejectOrder() itself failed while compensating for order=${req.orderId}:`, (cleanupErr as Error).message);
+      };
       if (err instanceof ExecutionCancelledError) {
-        await orderLifecycle.rejectOrder(req.orderId, err.message);
+        await orderLifecycle.rejectOrder(req.orderId, err.message).catch(_logRejectFailure);
         emitOrderRejected(req, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: "EXECUTION_TIMEOUT" };
       }
       if (err instanceof ExposureHaltedError) {
-        await orderLifecycle.rejectOrder(req.orderId, err.message);
+        await orderLifecycle.rejectOrder(req.orderId, err.message).catch(_logRejectFailure);
         emitOrderRejected(req, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: "INSTRUMENT_HALTED" };
       }
       if (err instanceof RiskLimitExceededError) {
-        await orderLifecycle.rejectOrder(req.orderId, err.message);
+        await orderLifecycle.rejectOrder(req.orderId, err.message).catch(_logRejectFailure);
         emitOrderRejected(req, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: err.reason };
       }
       if (err instanceof FeeChargeFailedError) {
-        await orderLifecycle.rejectOrder(req.orderId, err.message);
+        await orderLifecycle.rejectOrder(req.orderId, err.message).catch(_logRejectFailure);
         emitOrderRejected(req, err.message);
         return { status: "REJECTED", orderId: req.orderId, reason: "FEE_CHARGE_FAILED" };
       }
       const reason = `Execution failed: ${(err as Error).message}`;
-      await orderLifecycle.rejectOrder(req.orderId, reason);
+      await orderLifecycle.rejectOrder(req.orderId, reason).catch(_logRejectFailure);
       emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "LP_UNAVAILABLE" };
     }
 
     if (!outcome.ok) {
-      await orderLifecycle.rejectOrder(req.orderId, outcome.reason);
+      await orderLifecycle.rejectOrder(req.orderId, outcome.reason).catch((cleanupErr: unknown) => {
+        console.error(`[execution.engine] rejectOrder() itself failed while compensating for order=${req.orderId}:`, (cleanupErr as Error).message);
+      });
       emitOrderRejected(req, outcome.reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "MARGIN_INSUFFICIENT" };
     }
