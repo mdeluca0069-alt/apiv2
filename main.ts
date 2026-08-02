@@ -131,6 +131,7 @@ import { feedHealthMonitor }     from "./market-data/feed.health.monitor.js";
 // ── Task 13: Horizontal Scaling ───────────────────────────────────────────────
 import { wsCluster }             from "./realtime-infra/websocket.cluster.js";
 import { nextConnectionSeq }     from "./realtime-infra/ws.sequence.js";
+import { isTokenExpired }        from "./realtime-infra/ws.token.expiry.js";
 import { distributedCache }      from "./realtime-infra/cache.layer.js";
 import { eventArchive }          from "./realtime-infra/event.archive.js";
 import { initReadReplica, disconnectReadReplica } from "./shared/read-replica.js";
@@ -422,10 +423,26 @@ interface AuthenticatedSocket extends WebSocket {
   // attached to every outbound message as `seq` -- see sendToSocket's
   // docstring for why this replaced a userId-keyed shared counter.
   seq?: number;
+  // PHASE C PENTEST (JWT/session finding #3): the authenticating JWT's
+  // `exp` claim (seconds, epoch) -- see the comment above WsAuthExtendedRequest.
+  exp?: number;
 }
 
 // ─── HTTP + WebSocket server ──────────────────────────────────────────────────
 const server = createApiServer({ state, routes, corsOrigin, rateLimiter });
+
+// PHASE C PENTEST (JWT/session finding #3): verifyClient() below validates
+// the JWT once, at handshake, but nothing thereafter re-checks token
+// validity for the life of the (potentially long-lived) WS connection --
+// a socket opened with a soon-to-expire access token kept socket.userId/
+// tenantId trusted (used to route pushToUser/pushToStaff) past the JWT's
+// own exp. `_jwtExp` (seconds, same unit as the JWT `exp` claim -- see
+// shared/security.ts's TokenPayload) carries the token's expiry from
+// verifyClient into the connection handler below, which stores it on the
+// socket; the keepalive loop then closes the socket once that time has
+// passed, bounding a stale/soon-to-be-logged-out connection's remaining
+// lifetime to the token's own expiry instead of the connection's.
+type WsAuthExtendedRequest = IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[]; _jwtExp?: number };
 
 const wss = new WebSocketServer({
   server,
@@ -433,6 +450,7 @@ const wss = new WebSocketServer({
   verifyClient(info: { req: IncomingMessage }, cb: (result: boolean, code?: number, message?: string) => void) {
     const url   = new URL(info.req.url ?? "/ws", "ws://local");
     const token = url.searchParams.get("token");
+    const extReq = info.req as WsAuthExtendedRequest;
 
     // In sandbox mode: always allow the connection — invalid/missing tokens
     // just mean the socket is unauthenticated (no user-specific pushes).
@@ -440,9 +458,10 @@ const wss = new WebSocketServer({
       if (token) {
         const payload = jwtKeyManager.verifyToken(token) ?? verifyToken(token, verifyKey);
         if (payload) {
-          (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtSub      = payload.sub;
-          (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtTenantId = payload.tenantId;
-          (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtRoles    = payload.roles;
+          extReq._jwtSub      = payload.sub;
+          extReq._jwtTenantId = payload.tenantId;
+          extReq._jwtRoles    = payload.roles;
+          extReq._jwtExp      = payload.exp;
         }
       }
       cb(true);
@@ -454,9 +473,10 @@ const wss = new WebSocketServer({
     const payload = jwtKeyManager.verifyToken(token) ?? verifyToken(token, verifyKey);
     if (!payload) { cb(false, 4001, "Invalid or expired JWT"); return; }
 
-    (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtSub      = payload.sub;
-    (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtTenantId = payload.tenantId;
-    (info.req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] })._jwtRoles    = payload.roles;
+    extReq._jwtSub      = payload.sub;
+    extReq._jwtTenantId = payload.tenantId;
+    extReq._jwtRoles    = payload.roles;
+    extReq._jwtExp      = payload.exp;
     cb(true);
   },
 });
@@ -503,6 +523,20 @@ setInterval(() => {
       client.terminate();
       continue;
     }
+    // PHASE C PENTEST (JWT/session finding #3): close a connection once
+    // its authenticating JWT's own exp has passed -- see
+    // WsAuthExtendedRequest's docstring above verifyClient(). Bounds a
+    // stale connection's lifetime to the token's real remaining validity
+    // instead of trusting the handshake-time auth forever; the client's
+    // own reconnect logic (api/websocket.ts) takes over immediately
+    // (fresh token if the user is still logged in, none if they logged
+    // out), same recovery path already used for a dead/backpressured
+    // socket below.
+    if (isTokenExpired(client.exp, Date.now())) {
+      console.log(`[ws] closing socket with expired JWT (userId=${client.userId ?? "anon"})`);
+      client.close(4001, "Token expired");
+      continue;
+    }
     // REALTIME_FREEZE.md H.4: forced-disconnect policy for a persistently
     // backpressured (alive, but not draining) socket -- see the constants'
     // docstring above.
@@ -523,12 +557,13 @@ setInterval(() => {
 
 wss.on("connection", (rawSocket: WebSocket, req: IncomingMessage) => {
   const socket = rawSocket as AuthenticatedSocket;
-  const extReq = req as IncomingMessage & { _jwtSub?: string; _jwtTenantId?: string; _jwtRoles?: string[] };
+  const extReq = req as WsAuthExtendedRequest;
 
   socket.isAlive      = true;
   socket.userId       = extReq._jwtSub;
   socket.tenantId     = extReq._jwtTenantId;
   socket.roles        = extReq._jwtRoles;
+  socket.exp          = extReq._jwtExp;
   socket.authenticated = Boolean(socket.userId);
   // PHASE2_REMEDIATION (H8): anchors this connection's seq series at 0 so
   // the first message it receives is seq=1 -- see sendToSocket's docstring.
