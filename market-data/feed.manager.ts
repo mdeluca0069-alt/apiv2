@@ -355,8 +355,16 @@ export class FeedManager {
       "New orders BLOCKED. Existing positions monitored on last known prices."
     );
 
-    // Emit CRITICAL alert
-    (eventBus.emit as (...args: unknown[]) => void)("risk.warning", {
+    // PHASE E (failure-injection audit): emitted directly, no type-bypass
+    // needed now that RiskWarningEvent.userId is optional -- see that
+    // type's docstring. main.ts's "risk.warning" handler routes CRITICAL
+    // severity to pushToStaff() regardless of userId, so this platform-
+    // wide alert actually reaches risk/admin staff now (it previously
+    // never could: the handler only ever called
+    // enqueueAndPush(event.userId, ...), which silently drops any event
+    // whose userId doesn't match a currently-connected client -- true for
+    // every connection when userId is absent).
+    eventBus.emit("risk.warning", {
       severity: "CRITICAL",
       reason:   "FEED_CIRCUIT_OPEN",
       message:  "All market data feeds offline — new orders blocked",

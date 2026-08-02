@@ -1329,8 +1329,23 @@ eventBus.on("signal.generated", (event) => {
 // FASE 7 CLOSURE, Phase A (M.6): risk.warning is now margin/liquidation-risk
 // only (settlement.engine.ts's post-liquidation summary) -- compliance
 // alerts moved to their own compliance.alert event below.
+//
+// PHASE E (failure-injection audit): this event now also has a userId-less,
+// platform-wide producer -- market-data/feed.manager.ts's FEED_CIRCUIT_OPEN
+// alert (all price feeds dead, new orders blocked). enqueueAndPush() requires
+// a real userId and only ever delivers to that one client's connections /
+// outbox, so it must be skipped when no userId is present (previously this
+// wasn't even possible to express -- see RiskWarningEvent's docstring in
+// events-bus/event.bus.ts). CRITICAL severity is additionally pushed to
+// risk/admin staff live, matching the established pattern at the sibling
+// compliance.alert/margin.warning handlers below.
 eventBus.on("risk.warning", (event) => {
-  enqueueAndPush(event.userId, "risk.warning", { warning: event });
+  if (event.userId) {
+    enqueueAndPush(event.userId, "risk.warning", { warning: event });
+  }
+  if (event.severity === "CRITICAL") {
+    pushToStaff("admin.risk_alert", event, ["super_admin", "admin", "risk"]);
+  }
 });
 // REALTIME_FREEZE.md H.2 (moved here under M.6's split, same logic):
 // compliance-engine's 4 producers (AML, sanctions, transaction monitoring,

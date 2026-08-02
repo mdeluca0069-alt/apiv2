@@ -100,14 +100,29 @@ export type SignalGeneratedEvent = {
  * that compliance alerts (AML/sanctions/transaction-monitoring) have their
  * own `compliance.alert` event below. Never carries `type` -- the field
  * (and the compliance-specific `payload`) moved to ComplianceAlertEvent.
- * Sole remaining producer: settlement.engine.ts's post-liquidation summary
- * (STOP_OUT/LIQUIDATION).
+ *
+ * PHASE E (failure-injection audit): `userId` is optional because this
+ * event has a second, platform-wide producer besides settlement.engine.ts's
+ * per-user post-liquidation summary -- market-data/feed.manager.ts's
+ * FEED_CIRCUIT_OPEN alert (all price feeds dead, new orders blocked) has
+ * no single affected user. That producer previously had to bypass this
+ * type entirely (`eventBus.emit as (...args: unknown[]) => void`) to force
+ * a userId-less payload through a userId-required type; the type-bypass
+ * meant main.ts's handler (which only ever called
+ * `enqueueAndPush(event.userId, ...)`, requiring a real connected client
+ * matching that exact userId) silently could never deliver a platform-wide
+ * CRITICAL alert to anyone -- see main.ts's "risk.warning" handler, which
+ * now also calls pushToStaff() for CRITICAL severity regardless of
+ * whether a userId is present, the same pattern already used by
+ * compliance.alert/margin.warning for their own most-severe cases.
  */
 export type RiskWarningEvent = {
-  userId: string;
+  userId?: string;
   severity: "INFO" | "WARNING" | "CRITICAL" | "LOW" | "MEDIUM" | "HIGH";
   marginLevel?: number;
   riskScore?: number;
+  /** feed.manager.ts's FEED_CIRCUIT_OPEN alert carries a machine-readable reason code. */
+  reason?: string;
   message: string;
   timestamp?: string;
 };

@@ -311,8 +311,14 @@ export class NotificationRouter {
       );
     });
 
-    // Risk warnings (margin/liquidation only, see FASE 7 CLOSURE M.6)
+    // Risk warnings (margin/liquidation only, see FASE 7 CLOSURE M.6).
+    // PHASE E (failure-injection audit): userId is now optional -- see
+    // RiskWarningEvent's docstring in events-bus/event.bus.ts. A per-user
+    // IN_APP notification requires a known recipient, so a userId-less,
+    // platform-wide event (feed.manager.ts's FEED_CIRCUIT_OPEN) is skipped
+    // here; it reaches staff live via main.ts's pushToStaff() instead.
     eventBus.on("risk.warning", (e) => {
+      if (!e.userId) return;
       void this.send({
         userId:   e.userId, channel: "IN_APP", category: "risk", priority: "HIGH",
         title:    "Risk alert",
