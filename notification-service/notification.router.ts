@@ -18,6 +18,7 @@ import { randomUUID }    from "node:crypto";
 import { prisma, IS_PERSISTENT } from "../shared/db.js";
 import { eventBus }      from "../events-bus/event.bus.js";
 import { emailSender }   from "./email.sender.js";
+import { immutableAudit } from "../security/immutable.audit.js";
 import { Prisma }        from "@prisma/client";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -44,42 +45,70 @@ export type NotifPayload = {
 
 export class NotificationRouter {
 
-  /** Queue a notification for a user on a specific channel. */
+  /**
+   * Queue a notification for a user on a specific channel.
+   *
+   * PHASE E FAILURE-INJECTION AUDIT: every call site of this method (via
+   * sendAll()/sendAllRich(), see subscribe() below) is `void`-fired --
+   * intentional, since a slow/failing notification must never block or
+   * roll back the business transaction that triggered it. But the
+   * un-awaited call site means any throw from this method becomes an
+   * unhandled promise rejection, which main.ts's unhandledRejection
+   * handler explicitly logs and discards as non-fatal (correct for
+   * process stability, but it meant a single transient DB error --
+   * plausible during exactly the kind of load spike a stop-out wave
+   * causes -- silently and permanently dropped a MARGIN_CALL, STOP_OUT,
+   * or KYC-rejection notification with zero record it was ever supposed
+   * to exist. This is the same durability gap FASE 2.6 already closed for
+   * order.filled/position.closed via a transactional OutboxEvent row +
+   * dedicated consumer; margin/KYC notifications don't yet have an
+   * equivalent durable queue of their own to migrate onto, so this method
+   * instead now guarantees it never throws past this point: any DB
+   * failure gets one retry, and if that also fails, a durable
+   * immutableAudit record captures the notification that was about to be
+   * lost (actor="notification-router", action=
+   * "notification.delivery_failed") so an ops sweep can find and manually
+   * redeliver it, instead of the failure vanishing into a discarded
+   * promise rejection with no trace anywhere.
+   */
   async send(n: NotifPayload): Promise<void> {
     if (!IS_PERSISTENT) return this._logConsole(n);
 
     const db = prisma as NonNullable<typeof prisma>;
 
-    // Check user preferences (skip if channel disabled)
-    const pref = await db.notificationPreference.findUnique({ where: { userId: n.userId } });
-    if (pref) {
-      if (n.channel === "EMAIL" && !pref.emailEnabled) return;
-      if (n.channel === "SMS"   && !pref.smsEnabled)   return;
-      if (n.channel === "PUSH"  && !pref.pushEnabled)   return;
-      if (n.channel === "IN_APP"&& !pref.inAppEnabled)  return;
+    try {
+      // Check user preferences (skip if channel disabled)
+      const pref = await db.notificationPreference.findUnique({ where: { userId: n.userId } });
+      if (pref) {
+        if (n.channel === "EMAIL" && !pref.emailEnabled) return;
+        if (n.channel === "SMS"   && !pref.smsEnabled)   return;
+        if (n.channel === "PUSH"  && !pref.pushEnabled)   return;
+        if (n.channel === "IN_APP"&& !pref.inAppEnabled)  return;
 
-      const cats = (pref.categories as Record<string, boolean>) ?? {};
-      if (cats[n.category] === false) return;
+        const cats = (pref.categories as Record<string, boolean>) ?? {};
+        if (cats[n.category] === false) return;
+      }
+
+      await this._createWithRetry(db, n);
+    } catch (err) {
+      console.error(`[notification] failed to persist notification for user=${n.userId} category=${n.category} (retries exhausted):`, (err as Error).message);
+      await immutableAudit.write({
+        actor:  "notification-router",
+        action: "notification.delivery_failed",
+        entity: n.userId,
+        payload: {
+          channel: n.channel, category: n.category, priority: n.priority,
+          title: n.title, body: n.body, error: (err as Error).message,
+        } as object,
+      }).catch(() => { /* last-resort: already console.error'd above */ });
+      return;
     }
-
-    await db.notification.create({
-      data: {
-        id:       randomUUID(),
-        userId:   n.userId,
-        channel:  n.channel,
-        category: n.category,
-        priority: n.priority,
-        title:    n.title,
-        body:     n.body,
-        payload:  n.payload as object ?? {},
-      },
-    });
 
     // Attempt immediate delivery for email
     if (n.channel === "EMAIL") {
       // emailSender falls back to a non-existent "<userId>@igfxpro.local" address
       // when no explicit `to` is given — always resolve the user's real email first.
-      const user = await db.user.findUnique({ where: { id: n.userId }, select: { email: true } });
+      const user = await db.user.findUnique({ where: { id: n.userId }, select: { email: true } }).catch(() => null);
       await emailSender.send({
         userId:  n.userId,
         to:      user?.email,
@@ -89,6 +118,27 @@ export class NotificationRouter {
       }).catch((err) => {
         console.error("[notification] email send failed:", (err as Error).message);
       });
+    }
+  }
+
+  /** One retry (after a short backoff) before giving up on the DB write — absorbs a single transient blip without a durable-audit fallback. */
+  private async _createWithRetry(db: NonNullable<typeof prisma>, n: NotifPayload): Promise<void> {
+    const data = {
+      id:       randomUUID(),
+      userId:   n.userId,
+      channel:  n.channel,
+      category: n.category,
+      priority: n.priority,
+      title:    n.title,
+      body:     n.body,
+      payload:  n.payload as object ?? {},
+    };
+    try {
+      await db.notification.create({ data });
+    } catch (err) {
+      console.warn(`[notification] first create() attempt failed for user=${n.userId}, retrying once:`, (err as Error).message);
+      await new Promise((r) => setTimeout(r, 200));
+      await db.notification.create({ data });
     }
   }
 
