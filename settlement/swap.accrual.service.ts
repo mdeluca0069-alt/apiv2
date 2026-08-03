@@ -43,13 +43,39 @@ export type AccrualSummary = {
 const TRIPLE_SWAP_CLASSES = new Set(["FX_MAJOR", "FX_MINOR", "COMMODITY"]);
 
 /**
- * Returns the number of nights to charge for TODAY's rollover.
- * Wednesday = 3 for FX/commodities (covers Saturday + Sunday settlement).
- * All other days = 1.
+ * PHASE H (fresh due-diligence audit): the only asset class that genuinely
+ * trades through the weekend -- every other class (FX, commodities,
+ * indices, equities) is closed Saturday, exactly as
+ * market-data/synthetic.seeder.ts already assumes ("FX trades 24h/5d, so
+ * skip weekends in generation") and as trading-service/swap.calculator.ts's
+ * own _countNights() already assumes (`if (dow !== 6)` -- "Skip Saturday
+ * rollover (markets closed)"). This function previously did NOT skip
+ * Saturday for anything, unconditionally charging 1 night of swap on every
+ * open non-crypto position every Saturday -- quoteCache never expires
+ * (see market-data/quote.cache.ts), so accruePosition()'s only guard
+ * (`midPrice <= 0`) never caught this: Friday's stale-but-positive closing
+ * price passed the check every time, so the charge was real, silent, and
+ * recurred every week for every open position, permanently.
  */
-function nightsForToday(symbol: string): number {
-  const utcDow   = new Date().getUTCDay();          // 0=Sun, 3=Wed, 6=Sat
-  const ac       = assetClassOf(symbol.toUpperCase());
+const TWENTY_FOUR_SEVEN_CLASSES = new Set(["CRYPTO"]);
+
+/**
+ * Returns the number of nights to charge for the given accrual date's
+ * rollover. Wednesday = 3 for FX/commodities (covers Saturday + Sunday
+ * settlement). Saturday = 0 for every class except the 24/7 ones (crypto).
+ * All other days = 1.
+ *
+ * PHASE H: takes `accrualDate` (the logical day being charged) instead of
+ * reading wall-clock `now` -- the reference/note text a few lines below
+ * this call site already derives from accrualDate specifically so a
+ * future catch-up run for a missed day charges the right day's rate; this
+ * function silently didn't honor that at all, always reading `new
+ * Date().getUTCDay()` regardless of which day was actually being charged.
+ */
+function nightsForAccrualDate(symbol: string, accrualDate: Date): number {
+  const utcDow = accrualDate.getUTCDay();            // 0=Sun, 3=Wed, 6=Sat
+  const ac     = assetClassOf(symbol.toUpperCase());
+  if (utcDow === 6 && !TWENTY_FOUR_SEVEN_CLASSES.has(ac)) return 0; // markets closed
   const isTriple = utcDow === 3 && TRIPLE_SWAP_CLASSES.has(ac);
   return isTriple ? 3 : 1;
 }
@@ -153,8 +179,13 @@ export class SwapAccrualService {
     const perNightRate = swapCalculator.preview(pos.symbol, side, qty, midPrice);
     if (perNightRate === 0) return 0;
 
-    // Apply Wednesday 3× rule for FX/commodities.
-    const nights      = nightsForToday(pos.symbol);
+    // Apply Wednesday 3× rule for FX/commodities; Saturday = 0 for
+    // everything but 24/7 asset classes (see nightsForAccrualDate's
+    // docstring) -- skip entirely rather than writing a $0 SwapAccrual/
+    // LedgerEntry row that would only add noise and needlessly consume
+    // this position's idempotency slot for the day.
+    const nights = nightsForAccrualDate(pos.symbol, accrualDate);
+    if (nights === 0) return 0;
     const chargeAmount = Number((perNightRate * nights).toFixed(8));
 
     const rateAnnual = swapCalculator.compute({
