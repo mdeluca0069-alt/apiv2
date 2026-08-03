@@ -39,6 +39,8 @@ export type LedgerType =
   | "COMMISSION"                // brokerage commission debit
   | "SWAP"                      // overnight financing charge
   | "ADJUSTMENT"                // manual admin correction
+  | "NBP_WRITEOFF"              // ESMA negative-balance protection write-off credit (settlement.engine.ts)
+  | "DEPOSIT_CREDIT"            // live PSP deposit credited to balance (payment-service webhook)
   // ── Other ─────────────────────────────────────────────────────────────────
   | "FEE"                       // generic fee (deprecated — use COMMISSION)
   | "DOCUMENT_EVENT";           // KYC/compliance document milestone

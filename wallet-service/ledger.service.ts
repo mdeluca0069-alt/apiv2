@@ -321,6 +321,23 @@ export class LedgerService {
         case "PNL_CREDIT":
         case "PNL_DEBIT":
         case "PNL_SETTLEMENT":
+        // PHASE H (fresh due-diligence audit): settlement.engine.ts writes this
+        // (a positive amount credited to the client, see its own docstring
+        // "residual is absorbed by the broker via an audited NBP_WRITEOFF
+        // ledger entry") whenever ESMA negative-balance protection caps a
+        // client's aggregate wallet balance at zero after a settlement that
+        // would otherwise have pushed it negative. It was missing from this
+        // switch entirely, so a period containing a write-off had
+        // netChange = realizedPnl-only (the settlement legs, without the
+        // compensating credit), making `openingBalance + netChange` diverge
+        // from the real `closingBalance` by exactly the write-off amount --
+        // the statement couldn't reconcile to itself, and understated the
+        // client's realized P&L by the amount the broker had absorbed on
+        // their behalf. Folded into realizedPnl (not a separate field)
+        // because it's economically a direct offset to the realized loss
+        // that triggered it, not an independent category like a deposit or
+        // adjustment.
+        case "NBP_WRITEOFF":
           realizedPnl += amt;
           break;
         case "COMMISSION":
