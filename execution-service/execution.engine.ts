@@ -112,6 +112,26 @@ async function releaseMarginWithRetry(
   }
 }
 
+// PHASE E (failure-injection audit): req.preLockedMargin is only ever set
+// for a resting-order fill -- order.controller.ts's _parkPendingOrder()
+// locks a MID-price estimate at order-PLACEMENT time, and execute()'s own
+// unified fill transaction (below) true-ups (releases the estimate, locks
+// the real fill-price amount) as its very first step. But every REJECTED
+// branch that returns BEFORE that transaction is reached -- kill switch,
+// KYC re-check, stale feed, requote, LP fill error, FOK-unfillable, and
+// cancel-before-lock -- never releases the estimate at all: the order is
+// now REJECTED, so it will never reach the transaction that would have
+// true-up'd/released it, and margin.controller.ts has no other trigger to
+// reclaim it. It self-heals via the periodic orphan-margin reconciliation
+// sweep (main.ts, every 5 min: wallet.locked with no corresponding open
+// position gets auto-released) but understates the client's free margin
+// for however long that takes. Called at each such early-return site so
+// the release happens immediately, not just eventually.
+async function releasePreLockedMarginIfAny(req: ExecutionRequest): Promise<void> {
+  if (req.preLockedMargin === undefined) return;
+  await releaseMarginWithRetry(req.userId, req.orderId, req.preLockedMargin);
+}
+
 export class ExecutionEngine {
   /**
    * Core execution pipeline.
@@ -154,6 +174,7 @@ export class ExecutionEngine {
     if (killSwitch.isActive()) {
       const ks = killSwitch.getState();
       const reason = `KILL_SWITCH_ACTIVE: ${ks.reason || "Admin kill switch active"}`;
+      await releasePreLockedMarginIfAny(req);
       await orderLifecycle.rejectOrder(req.orderId, reason);
       emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "KILL_SWITCH_ACTIVE" };
@@ -161,6 +182,7 @@ export class ExecutionEngine {
     const eligibility = await assertAccountEligibleToTrade(req.userId);
     if (!eligibility.eligible) {
       const reason = `KYC_NOT_APPROVED: ${eligibility.reason ?? "account not eligible to trade"}`;
+      await releasePreLockedMarginIfAny(req);
       await orderLifecycle.rejectOrder(req.orderId, reason);
       emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "KYC_NOT_APPROVED" };
@@ -193,6 +215,7 @@ export class ExecutionEngine {
     // uses for the same underlying condition at order-acceptance time.
     if (quoteCache.isStale(req.symbol)) {
       const reason = `NO_LIVE_MARKET_DATA: ${req.symbol} feed went stale while your order was queued`;
+      await releasePreLockedMarginIfAny(req);
       await orderLifecycle.rejectOrder(req.orderId, reason);
       emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "NO_LIVE_MARKET_DATA" };
@@ -203,6 +226,7 @@ export class ExecutionEngine {
       const rq = checkRequote(req.symbol, req.side, quote, freshQuote);
       if (rq.requoted) {
         const reason = `REQUOTE: price moved ${rq.movePct.toFixed(3)}% while your order was queued (tolerance ${rq.threshold}%) — please resubmit`;
+        await releasePreLockedMarginIfAny(req);
         await orderLifecycle.rejectOrder(req.orderId, reason);
         metrics.inc("requotes_total");
         emitOrderRejected(req, reason);
@@ -217,6 +241,7 @@ export class ExecutionEngine {
       fillResult = fillEngine.fill(req, quote);
     } catch (err) {
       const reason = "Internal LP fill error — no liquidity";
+      await releasePreLockedMarginIfAny(req);
       await orderLifecycle.rejectOrder(req.orderId, reason);
       emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "LP_UNAVAILABLE" };
@@ -234,6 +259,7 @@ export class ExecutionEngine {
     // it exists for correctness once a future LP can genuinely partial-fill.
     if (req.type === "FOK" && fillResult.partialFill && fillResult.remainingQuantity > 0) {
       const reason = `FOK_UNFILLABLE: only ${fillResult.filledQuantity}/${req.quantity} available immediately — Fill-Or-Kill requires the full quantity`;
+      await releasePreLockedMarginIfAny(req);
       await orderLifecycle.rejectOrder(req.orderId, reason);
       metrics.inc("fok_rejections_total");
       emitOrderRejected(req, reason);
@@ -244,6 +270,7 @@ export class ExecutionEngine {
     // Order is ACCEPTED, no money committed. Clean abort.
     if (cancelled()) {
       const reason = "EXECUTION_TIMEOUT: cancelled before margin lock";
+      await releasePreLockedMarginIfAny(req);
       await orderLifecycle.rejectOrder(req.orderId, reason);
       emitOrderRejected(req, reason);
       return { status: "REJECTED", orderId: req.orderId, reason: "EXECUTION_TIMEOUT" };
