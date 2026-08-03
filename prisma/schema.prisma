@@ -1,3 +1,23 @@
+// PHASE H (fresh production-certification due-diligence audit, 2026-08-04):
+// dozens of raw, hand-written performance indexes (plain composite,
+// partial WHERE-scoped, BRIN, and DESC-ordered) exist ONLY in migration
+// SQL -- prisma/migrations/20260601120000_production_hardening,
+// 20260602000000_production_hardening, 20260615000001_scalability_indexes,
+// and 20260601220000_phase_omega -- covering AuditLog, LedgerEntry,
+// TradeAudit, Session, Position, Order, Notification, WalletAccount,
+// OutboxEvent, OlosSignal, RiskWarning, ClientDocument, MarginSnapshot,
+// and NotificationPreference. None of them are declarable via this file's
+// `@@index` syntax (partial/BRIN/DESC indexes aren't representable in
+// Prisma's current declarative schema), so `prisma migrate dev`'s shadow-DB
+// diff will legitimately see them as "exist in the DB, absent from the
+// schema" and may propose DROPping them on some future unrelated model
+// change -- there is no CHECK-constraint-style hard failure to catch that
+// like there is for the raw constraints below. This is exactly the failure
+// mode already discovered live once in this project's history (see
+// 20260726000000_fix_missing_tables_and_columns_drift's own docstring) --
+// if `migrate dev` ever proposes dropping any index whose name isn't in a
+// `@@index`/`@@unique` line anywhere in this file, do NOT accept it without
+// first confirming it isn't one of the ones referenced above.
 generator client {
   provider      = "prisma-client-js"
   binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
