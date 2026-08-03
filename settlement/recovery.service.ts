@@ -207,13 +207,66 @@ export class RecoveryService {
     }
 
     // ── 4. Reject stuck orders and release their margin ────────────────────
-    //
-    // RECEIVED/ACCEPTED orders that are older than STUCK_ORDER_TTL_MS were
-    // never fully executed (the process crashed during execution).
-    //
-    // ACCEPTED orders may have margin locked (checkAndLockMargin succeeded
-    // but createPosition failed/never ran).  We release that margin here.
-    //
+    // PHASE E (failure-injection audit): extracted into its own method,
+    // callable both here (startup) and periodically (see sweepStuckOrders()'s
+    // own docstring for why this needed to stop being startup-only).
+    stuckOrdersRejected = (await this.sweepStuckOrders()).stuckOrdersRejected;
+
+    // ── 5. Full reconciliation sweep ──────────────────────────────────────
+    const report = await reconciliationEngine.runFull();
+
+    const suspendedUsers = tradingSuspension.getSuspendedUsers().map((s) => s.userId);
+
+    console.log(
+      `[recovery] complete — ` +
+      `positions=${positionsRecomputed} stuckOrders=${stuckOrdersRejected} ` +
+      `orphanMargin=${orphanMarginReleased.length} marginWarnings=${marginWarnings.length} ` +
+      `orphans=${orphanPositions.length} suspended=${suspendedUsers.length}`
+    );
+    console.log(`[recovery] reconciliation: ${report.summary}`);
+    if (suspendedUsers.length > 0) {
+      console.error(`[recovery] CRITICAL: ${suspendedUsers.length} user(s) suspended due to margin deficit: ${suspendedUsers.join(", ")}`);
+    }
+
+    return {
+      ranAt,
+      positionsRecomputed,
+      stuckOrdersRejected,
+      orphanMarginReleased,
+      marginWarnings,
+      orphanPositions,
+      suspendedUsers,
+      reconciliation: report.summary,
+    };
+  }
+
+  /**
+   * Reject RECEIVED/RISK_REVIEW/ACCEPTED orders older than STUCK_ORDER_TTL_MS
+   * and release any margin locked against them.
+   *
+   * PHASE E (failure-injection audit): run() -- and therefore this sweep --
+   * previously executed exactly ONCE, at process boot, before the server
+   * starts accepting connections (main.ts). That's correct for the other
+   * four startup checks (P&L recompute is a one-time catch-up after
+   * downtime; orphan margin already has its own separate periodic sweep --
+   * reconciliationEngine.runFullWithRepair(), every 5 min in main.ts; orphan
+   * positions are flag-only). But an order can get stuck in RECEIVED/
+   * ACCEPTED at ANY point during a long-running process's life, not just
+   * around a restart -- e.g. a caught-but-non-fatal exception somewhere in
+   * the execution path that leaves an order mid-flight without crashing the
+   * process. With no periodic coverage anywhere else in the codebase, such
+   * an order (and any margin locked against it) stayed frozen indefinitely
+   * until the next deploy/restart happened to trigger another startup run.
+   *
+   * Extracted into its own method so main.ts can also schedule it
+   * periodically, independent of the one-time startup call in run().
+   */
+  async sweepStuckOrders(): Promise<{ stuckOrdersRejected: number }> {
+    if (!IS_PERSISTENT || !prisma?.order) return { stuckOrdersRejected: 0 };
+    const db = prisma as NonNullable<typeof prisma>;
+
+    let stuckOrdersRejected = 0;
+
     const cutoff      = new Date(Date.now() - STUCK_ORDER_TTL_MS);
     const stuckOrders = await db.order.findMany({
       where: {
@@ -274,8 +327,8 @@ export class RecoveryService {
                     reference:     `RECOVERY:ORDER:${order.id}`,
                     status:        "COMPLETED",
                     note:          safeRelease < margReq
-                      ? `Startup recovery: margin released for stuck ACCEPTED order ${order.id} [PARTIAL: requested=${margReq.toFixed(2)} released=${safeRelease.toFixed(2)}]`
-                      : `Startup recovery: margin released for stuck ACCEPTED order ${order.id}`,
+                      ? `Recovery sweep: margin released for stuck ACCEPTED order ${order.id} [PARTIAL: requested=${margReq.toFixed(2)} released=${safeRelease.toFixed(2)}]`
+                      : `Recovery sweep: margin released for stuck ACCEPTED order ${order.id}`,
                     debitAccount:  `CLIENT_MARGIN:${order.userId}`,
                     creditAccount: `CLIENT_FREE:${order.userId}`,
                   },
@@ -325,32 +378,7 @@ export class RecoveryService {
       console.warn(`[recovery] auto-rejected ${stuckOrdersRejected} stuck order(s)`);
     }
 
-    // ── 5. Full reconciliation sweep ──────────────────────────────────────
-    const report = await reconciliationEngine.runFull();
-
-    const suspendedUsers = tradingSuspension.getSuspendedUsers().map((s) => s.userId);
-
-    console.log(
-      `[recovery] complete — ` +
-      `positions=${positionsRecomputed} stuckOrders=${stuckOrdersRejected} ` +
-      `orphanMargin=${orphanMarginReleased.length} marginWarnings=${marginWarnings.length} ` +
-      `orphans=${orphanPositions.length} suspended=${suspendedUsers.length}`
-    );
-    console.log(`[recovery] reconciliation: ${report.summary}`);
-    if (suspendedUsers.length > 0) {
-      console.error(`[recovery] CRITICAL: ${suspendedUsers.length} user(s) suspended due to margin deficit: ${suspendedUsers.join(", ")}`);
-    }
-
-    return {
-      ranAt,
-      positionsRecomputed,
-      stuckOrdersRejected,
-      orphanMarginReleased,
-      marginWarnings,
-      orphanPositions,
-      suspendedUsers,
-      reconciliation: report.summary,
-    };
+    return { stuckOrdersRejected };
   }
 }
 

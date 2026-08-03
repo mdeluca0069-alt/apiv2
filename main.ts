@@ -1712,6 +1712,32 @@ setInterval(() => {
   }
 }, 5 * 60 * 1_000);
 
+// Stuck-order sweep — every 2 minutes (STUCK_ORDER_TTL_MS is 5 min).
+// PHASE E (failure-injection audit): recoveryService.run() previously swept
+// stuck RECEIVED/RISK_REVIEW/ACCEPTED orders (and released their locked
+// margin) only once, at process boot. An order can get stuck mid-process
+// too -- a caught-but-non-fatal exception somewhere in the execution path,
+// not a crash -- and had no periodic path back to REJECTED with margin
+// released until the next deploy/restart happened to trigger another
+// startup run. jobCoordinator-gated (same as global-risk-supervisor above)
+// because, unlike the margin repair sweep's repairOrphanMargin() (safe for
+// concurrent callers via SELECT FOR UPDATE), two instances rejecting the
+// same stuck order at once would double-process it.
+setInterval(async () => {
+  if (!prisma) return;
+  if (!(await jobCoordinator.tryLead("recovery-stuck-order-sweep"))) return;
+  try {
+    const { stuckOrdersRejected } = await recoveryService.sweepStuckOrders();
+    if (stuckOrdersRejected > 0) {
+      console.warn(`[recovery] periodic sweep auto-rejected ${stuckOrdersRejected} stuck order(s)`);
+    }
+  } catch (err) {
+    console.error("[recovery] periodic stuck-order sweep failed:", (err as Error).message);
+  } finally {
+    await jobCoordinator.release("recovery-stuck-order-sweep");
+  }
+}, 2 * 60 * 1_000);
+
 // ─── Task 14: Data Retention + Enhanced Reconciliation ───────────────────────
 //
 // Data retention: daily at 03:30 UTC — after EOD snapshot (22:00) and swap
