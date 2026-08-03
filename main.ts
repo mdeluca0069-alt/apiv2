@@ -230,6 +230,17 @@ jobCoordinator.register({ id: "olos-self-optimizer",   ttlSeconds: 86_000,  inte
 jobCoordinator.register({ id: "autopilot-position-manager", ttlSeconds: 25, intervalMs: 30_000,             description: "Break-even/trailing/regime-exit/time-stop for autopilot positions" });
 jobCoordinator.register({ id: "global-risk-supervisor",     ttlSeconds: 25, intervalMs: 30_000,             description: "Platform-wide autopilot safety evaluation (SAFE/EMERGENCY/STOP modes)" });
 jobCoordinator.register({ id: "risk-warning-generator",      ttlSeconds: 25, intervalMs: 30_000,             description: "Fix #9: persists each active user's real risk-warning/dashboard state" });
+// CUTOVER READINESS AUDIT (2026-08-04): registration for the
+// recovery-stuck-order-sweep job below was never added when that job was
+// introduced -- jobCoordinator.tryLead()/.release() call _get(), which
+// throws `job "..." not registered` for any unregistered id. Since tryLead()
+// is called before the interval body's own try/catch, this became an
+// unhandled promise rejection every 2 minutes (non-fatal only because
+// main.ts's unhandledRejection handler logs and swallows it) -- and, more
+// importantly, meant the periodic sweep itself never actually ran past the
+// one-time startup call, silently regressing the exact gap PHASE E's fix
+// for this job was meant to close.
+jobCoordinator.register({ id: "recovery-stuck-order-sweep",  ttlSeconds: 100, intervalMs: 2 * 60_000,         description: "Periodic sweep for orders stuck mid-execution (RECEIVED/ACCEPTED past TTL) outside the one-time startup recovery run" });
 // Task 14: DB hardening jobs
 jobCoordinator.register({ id: "data-retention",           ttlSeconds: 3_500,   intervalMs: 24 * 60 * 60_000,     description: "Daily data retention sweep + partition auto-create"  });
 jobCoordinator.register({ id: "enhanced-recon-daily",     ttlSeconds: 23 * 60 * 60, intervalMs: 24 * 60 * 60_000, description: "Daily enhanced reconciliation (swap/deposit/PnL audit)" });
