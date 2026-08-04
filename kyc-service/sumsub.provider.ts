@@ -226,12 +226,34 @@ export class SumsubProvider {
   /**
    * Verify Sumsub webhook signature.
    * X-Payload-Digest: HMAC-SHA256(rawBody, SUMSUB_WEBHOOK_SECRET)
+   *
+   * FAIL-CLOSED (Lead Production Engineer directive, cutover remediation):
+   * this used to return `true` ("skip verification") whenever
+   * SUMSUB_WEBHOOK_SECRET was unset -- a real, live compliance gap. Unlike
+   * SUMSUB_APP_TOKEN/SUMSUB_SECRET_KEY (the OUTBOUND API credentials,
+   * which correctly throw "SUMSUB_NOT_CONFIGURED" and hard-block the whole
+   * integration if missing -- see kyc.service.ts), SUMSUB_WEBHOOK_SECRET
+   * is a separate, independent variable: an operator could configure the
+   * outbound credentials correctly (KYC submission/review works) while
+   * leaving this one unset, and every inbound webhook -- including a
+   * forged "GREEN"/approved decision for an applicant who never actually
+   * passed KYC -- would have been silently accepted. Every path below now
+   * returns false (missing digest header, missing secret, malformed/
+   * wrong-length digest, mismatched digest) -- there is no longer any
+   * configuration state under which this method accepts a webhook without
+   * a genuine, verified HMAC match. No legitimate webhook is affected:
+   * Sumsub always sends X-Payload-Digest, and a correctly-configured
+   * SUMSUB_WEBHOOK_SECRET verifies exactly as before.
    */
   verifyWebhookSignature(rawBody: string, digestHeader: string): boolean {
+    if (!digestHeader) {
+      console.error("[sumsub-webhook] rejected: no X-Payload-Digest header present");
+      return false;
+    }
     const secret = WEBHOOK_SECRET();
     if (!secret) {
-      console.warn("[sumsub-webhook] SUMSUB_WEBHOOK_SECRET not set — skipping verification");
-      return true; // allow in dev when no secret configured
+      console.error("[sumsub-webhook] rejected: SUMSUB_WEBHOOK_SECRET is not configured -- webhook signature cannot be verified, failing closed");
+      return false;
     }
     const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
     // Timing-safe comparison
