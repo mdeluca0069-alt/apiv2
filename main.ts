@@ -2,6 +2,8 @@
 import { config as dotenvConfig } from "dotenv";
 dotenvConfig({ path: new URL("../.env", import.meta.url).pathname });
 
+import { checkJwtCutoverConfig } from "./security/jwt.cutover.guard.js";
+
 // ─── Required-secret validation ───────────────────────────────────────────────
 // Runs before any service is initialised. Missing required secrets = hard exit.
 (function validateRequiredSecrets() {
@@ -43,14 +45,30 @@ dotenvConfig({ path: new URL("../.env", import.meta.url).pathname });
   }
 
   const missing = required.filter((r) => !r.present);
-  if (missing.length === 0) return;
-
-  console.error("[igfxpro-apiv2] STARTUP FAILED — missing required environment variables:");
-  for (const { key, hint } of missing) {
-    console.error(`  • ${key}${hint ? `  (${hint})` : ""}`);
+  if (missing.length > 0) {
+    console.error("[igfxpro-apiv2] STARTUP FAILED — missing required environment variables:");
+    for (const { key, hint } of missing) {
+      console.error(`  • ${key}${hint ? `  (${hint})` : ""}`);
+    }
+    console.error("[igfxpro-apiv2] Copy .env.example → .env and fill in all required values.");
+    process.exit(1);
   }
-  console.error("[igfxpro-apiv2] Copy .env.example → .env and fill in all required values.");
-  process.exit(1);
+
+  // CUTOVER REMEDIATION (Task 2): JWT_CUTOVER_MODE=true is an explicit,
+  // opt-in guard for the migration window described in CUTOVER_PLAYBOOK.md
+  // -- see security/jwt.cutover.guard.ts's own docstring for the full
+  // rationale. A misconfiguration here doesn't corrupt data, but it does
+  // force every currently-logged-in v1 user to re-login the instant this
+  // deploys, which is entirely avoidable by failing startup instead.
+  const jwtCutoverCheck = checkJwtCutoverConfig(process.env);
+  if (!jwtCutoverCheck.ok) {
+    console.error("[igfxpro-apiv2] STARTUP FAILED — JWT_CUTOVER_MODE configuration violation:");
+    console.error(`  • ${jwtCutoverCheck.error}`);
+    process.exit(1);
+  }
+  if (jwtCutoverCheck.cutoverModeActive) {
+    console.log("[igfxpro-apiv2] JWT_CUTOVER_MODE=true — HS256 legacy-compatibility mode confirmed, RSA disabled for the migration window.");
+  }
 })();
 
 import { IncomingMessage } from "node:http";
