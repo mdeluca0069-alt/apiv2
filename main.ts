@@ -3,6 +3,7 @@ import { config as dotenvConfig } from "dotenv";
 dotenvConfig({ path: new URL("../.env", import.meta.url).pathname });
 
 import { checkJwtCutoverConfig } from "./security/jwt.cutover.guard.js";
+import { validateProductionEnvironment } from "./security/production.env.validator.js";
 
 // ─── Required-secret validation ───────────────────────────────────────────────
 // Runs before any service is initialised. Missing required secrets = hard exit.
@@ -25,24 +26,6 @@ import { checkJwtCutoverConfig } from "./security/jwt.cutover.guard.js";
     present: Boolean(process.env.ANTHROPIC_API_KEY),
     hint: "console.anthropic.com/settings/keys",
   });
-
-  if (isProduction) {
-    required.push({
-      key: "DATABASE_URL",
-      present: Boolean(process.env.DATABASE_URL),
-      hint: "postgresql://user:password@host:5432/dbname",
-    });
-    required.push({
-      key: "TWELVEDATA_API_KEY",
-      present: Boolean(process.env.TWELVEDATA_API_KEY),
-      hint: "twelvedata.com/account/api-keys",
-    });
-    required.push({
-      key: "CORS_ORIGIN",
-      present: Boolean(process.env.CORS_ORIGIN),
-      hint: "https://www.igfxpro.com — must not default to a localhost dev URL in production",
-    });
-  }
 
   const missing = required.filter((r) => !r.present);
   if (missing.length > 0) {
@@ -68,6 +51,29 @@ import { checkJwtCutoverConfig } from "./security/jwt.cutover.guard.js";
   }
   if (jwtCutoverCheck.cutoverModeActive) {
     console.log("[igfxpro-apiv2] JWT_CUTOVER_MODE=true — HS256 legacy-compatibility mode confirmed, RSA disabled for the migration window.");
+  }
+
+  // CUTOVER REMEDIATION (Task 4): comprehensive production-dependency
+  // validation -- DATABASE_URL, TLS/CORS scheme, Redis auth, and every
+  // optional integration's all-or-nothing configuration consistency
+  // (Sumsub, Stripe, Nuvei, Praxis, SMTP, AWS). See
+  // security/production.env.validator.ts's own docstring for exactly what
+  // is hard-required vs. consistency-checked vs. informational-only, and
+  // why partial configuration (not mere absence) is what actually gets
+  // blocked for the optional integrations. Never allows a partially-
+  // configured production deployment to boot silently.
+  const envReport = validateProductionEnvironment(process.env, isProduction);
+  const envWarnings = envReport.issues.filter((i) => i.severity === "warning");
+  const envErrors   = envReport.issues.filter((i) => i.severity === "error");
+  for (const w of envWarnings) {
+    console.warn(`[igfxpro-apiv2] [production-env] WARNING (${w.integration}): ${w.message}`);
+  }
+  if (!envReport.ok) {
+    console.error("[igfxpro-apiv2] STARTUP FAILED — production environment validation failed:");
+    for (const e of envErrors) {
+      console.error(`  • [${e.integration}] ${e.message}`);
+    }
+    process.exit(1);
   }
 })();
 
