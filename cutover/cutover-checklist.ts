@@ -38,7 +38,19 @@ import { summarizeChecklist } from "./deployment.checks.js";
 async function runPreflightScript(): Promise<{ ok: boolean; output: string }> {
   try {
     const { execSync } = await import("node:child_process");
-    const output = execSync("npx tsx cutover/preflight-check.ts", { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    // Force production mode for this sub-check regardless of the parent
+    // process's own NODE_ENV -- a cutover checklist that reports readiness
+    // without ever exercising the production-only validation rules (real
+    // TWELVEDATA_API_KEY, https CORS_ORIGIN, etc.) would silently PASS this
+    // item while the checklist's own separate `twelvedata-key` item FAILS,
+    // which is exactly the self-contradictory report this produced before
+    // this fix: [FAIL] TWELVEDATA_API_KEY alongside embedded preflight
+    // "ALL AUTOMATED CHECKS PASSED".
+    const output = execSync("npx tsx cutover/preflight-check.ts", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, NODE_ENV: "production" },
+    });
     return { ok: true, output };
   } catch (err) {
     const e = err as { stdout?: string; message: string };

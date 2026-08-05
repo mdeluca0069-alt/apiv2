@@ -1060,8 +1060,18 @@ export class BrokerState {
     };
     this.users.set(user.email.toLowerCase(), user);
     this.clientAccounts.set(user.id, this.createClientAccount(user));
-    void this.persistUser(user);
-    void this.persistClientAccount(this.clientAccounts.get(user.id)!);
+    // Awaited, not fire-and-forget: a client that registers here and then
+    // immediately calls the DB-backed /auth/login/db (exactly what
+    // CUTOVER_PLAYBOOK.md's own smoke-test sequence does, steps 3->4) races
+    // this write when it isn't awaited -- reproduced live: register
+    // succeeds, an immediate login attempt with the correct password fails
+    // with INVALID_CREDENTIALS because db.user.findUnique() runs before
+    // this upsert commits. persistUser() re-hashes with real Argon2id and
+    // upserts to the real DB, so this does add real latency to the sandbox
+    // register response (one hash + one upsert) -- the correct trade versus
+    // a response that lies about the write being durable yet.
+    await this.persistUser(user);
+    await this.persistClientAccount(this.clientAccounts.get(user.id)!);
     this.recordAudit(user.id, "auth.register", "user", { email: user.email, country: input.country });
     return await this.login(input.email, input.password);
   }
