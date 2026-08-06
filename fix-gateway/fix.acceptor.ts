@@ -68,6 +68,7 @@ interface FixSession {
   senderCompID: string;   // their ID
   targetCompID: string;   // our ID (IGFXPRO)
   account:      string;   // userId extracted from Logon
+  remoteAddress: string;  // socket.remoteAddress at connect time, cached for lockout tracking + connection-limit bookkeeping
   inSeqNum:     number;
   outSeqNum:    number;
   heartBtInt:   number;   // seconds
@@ -83,8 +84,17 @@ export class FixAcceptor extends EventEmitter {
   private readonly port:      number;
   private readonly executor:  FixExecutor;
   private readonly canceller: FixCancelExecutor;
+  // FIX GATEWAY HARDENING: neither cap existed before -- onConnection()
+  // accepted every incoming TCP connection unconditionally before any
+  // credential check, making an exposed port a trivial resource-exhaustion
+  // target (see FIX_GATEWAY_EXPOSURE_REVIEW.md §5). Both are enforced
+  // before a session is even created, so a rejected connection never gets
+  // as far as the 10s no-Logon timer or a heartbeat timer.
+  private readonly maxConnectionsPerIp:   number;
+  private readonly maxTotalConnections:   number;
   private server: net.Server | null = null;
   private sessions = new Map<string, FixSession>();
+  private connectionsByIp = new Map<string, number>();
   private nextExecId = 1;
 
   constructor(opts: {
@@ -92,12 +102,16 @@ export class FixAcceptor extends EventEmitter {
     port:      number;
     executor:  FixExecutor;
     canceller: FixCancelExecutor;
+    maxConnectionsPerIp?: number;
+    maxTotalConnections?: number;
   }) {
     super();
     this.compId    = opts.compId;
     this.port      = opts.port;
     this.executor  = opts.executor;
     this.canceller = opts.canceller;
+    this.maxConnectionsPerIp = opts.maxConnectionsPerIp ?? 5;
+    this.maxTotalConnections = opts.maxTotalConnections ?? 50;
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -127,13 +141,34 @@ export class FixAcceptor extends EventEmitter {
       totalSessions:    sessions.length,
       port:             this.port,
       compId:           this.compId,
+      maxConnectionsPerIp: this.maxConnectionsPerIp,
+      maxTotalConnections: this.maxTotalConnections,
     };
   }
 
   // ── Connection handling ─────────────────────────────────────────────────────
 
   private onConnection(socket: net.Socket): void {
-    const id = `${socket.remoteAddress}:${socket.remotePort}`;
+    const remoteAddress = socket.remoteAddress ?? "unknown";
+    const id = `${remoteAddress}:${socket.remotePort}`;
+
+    // FIX GATEWAY HARDENING: enforced before a session is created and before
+    // any FIX data is even read from the socket -- a rejected connection
+    // costs the caller nothing but a closed TCP connection, no protocol
+    // parsing, no session bookkeeping.
+    if (this.sessions.size >= this.maxTotalConnections) {
+      console.warn(`[fix-acceptor] rejecting connection from ${id}: global connection limit (${this.maxTotalConnections}) reached`);
+      socket.destroy();
+      return;
+    }
+    const currentForIp = this.connectionsByIp.get(remoteAddress) ?? 0;
+    if (currentForIp >= this.maxConnectionsPerIp) {
+      console.warn(`[fix-acceptor] rejecting connection from ${id}: per-IP connection limit (${this.maxConnectionsPerIp}) reached for ${remoteAddress}`);
+      socket.destroy();
+      return;
+    }
+    this.connectionsByIp.set(remoteAddress, currentForIp + 1);
+
     console.log(`[fix-acceptor] new connection from ${id}`);
 
     const session: FixSession = {
@@ -142,6 +177,7 @@ export class FixAcceptor extends EventEmitter {
       senderCompID: "",
       targetCompID: this.compId,
       account:      "",
+      remoteAddress,
       inSeqNum:     0,
       outSeqNum:    1,
       heartBtInt:   30,
@@ -166,6 +202,16 @@ export class FixAcceptor extends EventEmitter {
         socket.destroy();
       }
     }, 10_000);
+  }
+
+  private releaseIpSlot(remoteAddress: string): void {
+    const current = this.connectionsByIp.get(remoteAddress);
+    if (current === undefined) return;
+    if (current <= 1) {
+      this.connectionsByIp.delete(remoteAddress);
+    } else {
+      this.connectionsByIp.set(remoteAddress, current - 1);
+    }
   }
 
   private onData(id: string, session: FixSession, data: string): void {
@@ -233,7 +279,7 @@ export class FixAcceptor extends EventEmitter {
       return;
     }
 
-    const verifiedUserId = await verifyFixCredentials(username, password).catch(() => null);
+    const verifiedUserId = await verifyFixCredentials(username, password, session.remoteAddress).catch(() => null);
     if (!verifiedUserId || verifiedUserId !== account) {
       console.warn(`[fix-acceptor] Logon rejected: invalid credentials or Account mismatch for username=${username}`);
       this.rejectLogon(session, senderCompID, "Logon rejected: invalid credentials");
@@ -431,6 +477,7 @@ export class FixAcceptor extends EventEmitter {
     session.state = "LOGGING_OUT";
     try { session.socket.destroy(); } catch { /* ignore */ }
     this.sessions.delete(id);
+    this.releaseIpSlot(session.remoteAddress);
     console.log(`[fix-acceptor] session ${id} closed: ${reason}`);
     this.emit("session.closed", { id, reason });
   }
@@ -460,6 +507,12 @@ export function initFixAcceptor(
     port:      Number(process.env.FIX_PORT ?? port),
     executor,
     canceller,
+    // FIX GATEWAY HARDENING — see .env.example for full documentation.
+    // Number(undefined) is NaN, not 0, so an unset var correctly falls
+    // through to the FixAcceptor constructor's own defaults (5 / 50) rather
+    // than silently applying a limit of 0 and rejecting every connection.
+    maxConnectionsPerIp: process.env.FIX_MAX_CONNECTIONS_PER_IP ? Number(process.env.FIX_MAX_CONNECTIONS_PER_IP) : undefined,
+    maxTotalConnections: process.env.FIX_MAX_TOTAL_CONNECTIONS ? Number(process.env.FIX_MAX_TOTAL_CONNECTIONS) : undefined,
   });
   _acceptor.start();
   return _acceptor;
