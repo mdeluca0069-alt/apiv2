@@ -2722,9 +2722,9 @@ export class BrokerState {
     return analysis ?? { worstCaseScenario: 0, marginCallProbability: 0, recommendedAction: "Monitor closely", urgency: "NORMAL" };
   }
 
-  async acknowledgeWarning(warningId: string) {
+  async acknowledgeWarning(warningId: string, userId: string) {
     if (!IS_PERSISTENT) return { acknowledged: true };
-    await riskWarningService.acknowledgeWarning(warningId);
+    await riskWarningService.acknowledgeWarning(warningId, userId);
     return { acknowledged: true };
   }
 

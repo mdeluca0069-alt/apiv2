@@ -2276,9 +2276,11 @@ export const routes: Route[] = [
     method: "POST",
     path: api("/risk/warning/:id/acknowledge"),
     auth: true,
-    handler: async ({ params, state }) => {
+    handler: async ({ params, authHeader, state }) => {
+      const principal = state.resolvePrincipal(authHeader);
+      if (!principal) return { ok: false, reason: "unauthenticated" };
       const warningId = (params as any)?.id;
-      return state.acknowledgeWarning(warningId);
+      return state.acknowledgeWarning(warningId, principal.sub);
     },
   },
   // ── KYC / Identity Verification ───────────────────────────────────────────────

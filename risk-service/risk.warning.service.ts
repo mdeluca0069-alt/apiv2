@@ -144,14 +144,34 @@ export class RiskWarningService {
   }
 
   // Riconosce un warning
-  async acknowledgeWarning(warningId: string) {
-    return await prisma.riskWarning.update({
-      where: { id: warningId },
+  // FRONTEND_MOBILE_HARDENING Phase 4 (KYC/compliance audit): this used to
+  // do an unconditional prisma.riskWarning.update({ where: { id: warningId } })
+  // with no userId check anywhere in the call chain (route handler didn't
+  // even resolve a principal). Any authenticated user could acknowledge
+  // ANY other user's RiskWarning by id -- including the mandatory MiFID II
+  // ESMA CFD risk disclosure surfaced via RiskWarningOverlay.tsx/
+  // CompliancePage.tsx -- silently marking it acknowledged (with a real
+  // server-recorded acknowledgedAt) without that account holder's consent,
+  // corrupting the regulatory evidentiary record. Now scoped to the caller
+  // via updateMany({ where: { id, userId } }) + count check, the same
+  // conditional-update idiom kyc.service.ts already uses for terminal-state
+  // protection -- a warning that doesn't belong to the caller (or doesn't
+  // exist) is indistinguishable (count === 0), avoiding resource enumeration.
+  async acknowledgeWarning(warningId: string, userId: string) {
+    const result = await prisma.riskWarning.updateMany({
+      where: { id: warningId, userId },
       data: {
         acknowledged: true,
         acknowledgedAt: new Date(),
       },
     });
+    if (result.count === 0) {
+      throw Object.assign(
+        new Error(`Risk warning ${warningId} not found`),
+        { statusCode: 404 },
+      );
+    }
+    return result;
   }
 
   // Analisi scenario - calcola il worst case
