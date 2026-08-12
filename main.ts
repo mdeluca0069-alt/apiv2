@@ -4,6 +4,7 @@ dotenvConfig({ path: new URL("../.env", import.meta.url).pathname });
 
 import { checkJwtCutoverConfig } from "./security/jwt.cutover.guard.js";
 import { validateProductionEnvironment } from "./security/production.env.validator.js";
+import { resolveLiveTradingEnabled } from "./security/live-trading.guard.js";
 
 // ─── Required-secret validation ───────────────────────────────────────────────
 // Runs before any service is initialised. Missing required secrets = hard exit.
@@ -171,7 +172,7 @@ import { shutdownTelemetry }             from "./shared/telemetry.js";
 // ─── Config ──────────────────────────────────────────────────────────────────
 const port               = Number(process.env.PORT ?? 3000);
 const corsOrigin         = process.env.CORS_ORIGIN ?? "http://localhost:5173";
-const liveTradingEnabled = process.env.LIVE_TRADING_ENABLED === "true";
+const liveTradingEnabled = resolveLiveTradingEnabled();
 const twelvedataKey      = process.env.TWELVEDATA_API_KEY ?? "";
 const quoteIntervalMs    = Number(process.env.QUOTE_INTERVAL_MS ?? 1000);
 const signalIntervalMs   = Number(process.env.SIGNAL_INTERVAL_MS ?? 60_000);

@@ -1144,7 +1144,20 @@ export class BrokerState {
       institutionalCharts: true,
       olosAi: true,
       sandboxExecution: false,
-      liveTrading: this._liveTradingEnabled || true,
+      // PRODUCTION_DEPLOYMENT_SAFETY_DECISION.md §D: this was
+      // `this._liveTradingEnabled || true`, which is unconditionally
+      // `true` in JavaScript regardless of the left operand -- every
+      // caller of GET /config/feature-flags and GET /api/license/validate
+      // (both public, no auth) always saw `liveTrading: true`, and the
+      // frontend's only client-side pre-submission guard for this exact
+      // scenario (TradingPage.tsx) trusted that value, so it could never
+      // actually fire. `=== true` (not just the bare field) is deliberate
+      // defense-in-depth: this._liveTradingEnabled is already a strict
+      // boolean by construction (BrokerState's constructor requires
+      // `liveTradingEnabled: boolean`, no optional/undefined path), but a
+      // safety-critical flag like this should not depend on truthiness
+      // coercion even where the type system already guarantees it.
+      liveTrading: this._liveTradingEnabled === true,
       negativeBalanceProtection: true,
       esmaRetailLeverage: true,
       kycRequiredBeforeLive: true,
