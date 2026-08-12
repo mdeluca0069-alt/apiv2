@@ -167,8 +167,21 @@ describe("AutopilotService.saveConfig", () => {
   });
 
   it("does not re-check eligibility/consent when autopilot is already enabled (e.g. a settings-only update)", async () => {
+    // Uses a userId not touched by any earlier test in this file (deliberately
+    // NOT "user-1"): AutopilotService.getConfig()/saveConfig() share a
+    // module-level _configCache Map (5s TTL) across every AutopilotService
+    // instance -- a real, intentional perf cache in production, invalidated
+    // on every successful write (see saveConfig()'s `_configCache.delete`).
+    // But the two tests above this one ("throws AUTOPILOT_NOT_ELIGIBLE" /
+    // "throws AUTOPILOT_CONSENT_REQUIRED") call saveConfig("user-1", ...)
+    // and THROW before reaching that delete -- leaving a stale
+    // `enabled: false` cache entry for "user-1" that outlives those tests
+    // (5s TTL >> a unit test's runtime) and corrupts this test's getConfig()
+    // read if it reused "user-1", causing a false-positive assertEligible
+    // call unrelated to any real production bug. A fresh userId sidesteps
+    // the shared-cache pollution entirely without touching production code.
     mockFindUnique.mockResolvedValue({
-      userId: "user-1", enabled: true, mode: "BALANCED", minConfidence: 0.7,
+      userId: "user-6", enabled: true, mode: "BALANCED", minConfidence: 0.7,
       maxRiskPerTrade: 0.05, maxOpenTrades: 3, maxExposurePct: 20,
       allowedSymbols: [], blockedSymbols: [], stopDrawdownPct: 10, capitalPct: 100,
       eventLockMinutes: 30, maxDailyTrades: 10,
@@ -176,10 +189,10 @@ describe("AutopilotService.saveConfig", () => {
       regimeExitEnabled: true, maxHoursOpen: 48, maxDailyLossPct: 5, maxSpreadBps: 15,
       tier: "STANDARD", lastDecision: null, updatedAt: new Date(),
     });
-    mockUpsert.mockResolvedValue({ userId: "user-1", enabled: true, mode: "AGGRESSIVE" });
+    mockUpsert.mockResolvedValue({ userId: "user-6", enabled: true, mode: "AGGRESSIVE" });
 
     const service = new AutopilotService();
-    await service.saveConfig("user-1", { enabled: true, mode: "AGGRESSIVE" }, "user-1");
+    await service.saveConfig("user-6", { enabled: true, mode: "AGGRESSIVE" }, "user-6");
 
     expect(mockAssertEligible).not.toHaveBeenCalled();
     expect(mockGetConsentStatus).not.toHaveBeenCalled();
