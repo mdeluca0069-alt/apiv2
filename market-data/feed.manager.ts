@@ -119,31 +119,85 @@ export class FeedManager {
   private healthTimer:   NodeJS.Timeout | null = null;
   private restBatchIdx   = 0;  // rotating batch pointer
 
-  private circuitOpen   = false;
+  private circuitOpen     = false;
   private allDeadSince: number | null = null;
-  private running       = false;
+  private running         = false;
+  private primaryRunning  = false;
 
   constructor(private readonly opts: FeedManagerOptions) {}
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
+  /**
+   * Starts the SECONDARY feed (Binance-WS, crypto — free, unauthenticated,
+   * no per-key plan limit, safe for every replica to run independently)
+   * plus the health monitor. Does NOT start the PRIMARY feed (TwelveData
+   * WS+REST) — call `startPrimary()` for that, and only after winning
+   * TwelveData feed leadership (market-data/feed.leader.election.ts).
+   *
+   * MULTI-REPLICA TWELVEDATA REMEDIATION: this used to also start the
+   * TwelveData WS+REST feeds unconditionally here, on every replica. With
+   * N replicas all authenticating to TwelveData with the same API key,
+   * their combined connect/subscribe/reconnect traffic exceeded
+   * TwelveData's free-plan per-key rate limit — confirmed live (Hostinger
+   * staging, 2026-08-17): TwelveData rejected the WS connections outright
+   * ("exceeds the limit of 100 events per minute"), and this app's own
+   * reconnect logic generated more of exactly the traffic being rejected,
+   * so the storm never settled on any replica. See
+   * feed.leader.election.ts's own docstring for the full fix.
+   */
   start(): void {
     if (this.running) return;
     this.running = true;
 
-    this._startWsFeed();
     this._startBinanceFeed();
-    this._startRestPolling();
     this._startHealthMonitor();
 
-    console.log("[feed-manager] started — primary=TwelveData-WS secondary=Binance-WS tertiary=TwelveData-REST");
+    console.log("[feed-manager] started — secondary=Binance-WS (primary=TwelveData-WS/REST gated by feed leadership)");
+  }
+
+  /**
+   * Starts the PRIMARY feed (TwelveData WS + REST tertiary). Call only
+   * when this replica currently holds TwelveData feed leadership. Safe to
+   * call multiple times (idempotent — a no-op if already running).
+   */
+  startPrimary(): void {
+    if (this.primaryRunning) return;
+    this.primaryRunning = true;
+
+    this._startWsFeed();
+    this._startRestPolling();
+
+    console.log("[feed-manager] primary (TwelveData WS+REST) started — this replica is feed leader");
+  }
+
+  /**
+   * Stops the PRIMARY feed. Call the instant this replica loses TwelveData
+   * feed leadership, so at most one replica ever holds an active
+   * TwelveData connection — never zero for long (another replica's
+   * `startPrimary()` fires around the same time via the same leadership
+   * transition) and never two at once.
+   */
+  stopPrimary(): void {
+    if (!this.primaryRunning) return;
+    this.primaryRunning = false;
+
+    this.wsFeed?.stop();
+    this.wsFeed = null;
+    if (this.restTimer) { clearInterval(this.restTimer); this.restTimer = null; }
+
+    console.log("[feed-manager] primary (TwelveData WS+REST) stopped — this replica is no longer feed leader");
+  }
+
+  /** Whether this replica currently runs the primary (TwelveData) feed. */
+  isPrimaryRunning(): boolean {
+    return this.primaryRunning;
   }
 
   stop(): void {
     this.running = false;
-    this.wsFeed?.stop();
+    this.stopPrimary();
     this.binanceFeed?.stop();
-    if (this.restTimer)   clearInterval(this.restTimer);
     if (this.healthTimer) clearInterval(this.healthTimer);
     console.log("[feed-manager] stopped");
   }

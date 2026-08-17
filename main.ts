@@ -96,6 +96,8 @@ import { RateLimiter }          from "./gateway/rate-limiter.js";
 import { quoteCache }               from "./market-data/quote.cache.js";
 import { fetchLiveQuotes }          from "./market-data/feeds/twelvedata.rest.js";
 import { FeedManager }              from "./market-data/feed.manager.js";
+import { FeedLeaderElection }       from "./market-data/feed.leader.election.js";
+import { applyRelayedTick }         from "./market-data/relay.tick.applier.js";
 import { virtualOrderbook }         from "./liquidity-engine/virtual.orderbook.js";
 import { assetClassOf }             from "./liquidity-engine/liquidity.provider.js";
 
@@ -889,6 +891,25 @@ feedManager.start();
 feedHealthMonitor.start(SYMBOLS);
 (globalThis as Record<string, unknown>).__feedManager = feedManager;
 
+// MULTI-REPLICA TWELVEDATA REMEDIATION: feedManager.start() above only
+// starts the secondary (Binance-WS) feed + health monitor now — every
+// replica runs those unconditionally, same as before. The primary feed
+// (TwelveData WS+REST) is gated behind distributed leadership so only ONE
+// replica ever holds a live TwelveData connection at a time (see
+// market-data/feed.leader.election.ts's own docstring for the full
+// rationale and the live incident that prompted this). Every replica
+// (leader included) still receives every symbol's ticks via the existing
+// Redis tick relay (onTickEvent below / MARKET_DATA_FREEZE.md §0.10) —
+// this was already fully wired before this change, just never load-bearing
+// for TwelveData-sourced symbols because every replica also had its own
+// (contention-causing) direct connection.
+const feedLeaderElection = new FeedLeaderElection();
+feedLeaderElection.start({
+  onBecomeLeader:   () => feedManager.startPrimary(),
+  onLoseLeadership: () => feedManager.stopPrimary(),
+});
+(globalThis as Record<string, unknown>).__feedLeaderElection = feedLeaderElection;
+
 // ─── Adaptive Intelligence: warm calendar + weights from DB ─────────────────
 await Promise.all([
   economicEventService.warmFromDB().catch((err) =>
@@ -1203,7 +1224,7 @@ function onBroadcastEvent(eventType: string, payload: Record<string, unknown>): 
 // haven't produced recently. Never re-published (see publishTick's own
 // doc comment) -- this is strictly a one-hop relay, not a chain.
 function onTickEvent(symbol: string, mid: number, bid?: number, ask?: number): void {
-  liquidityCore.ingestExternalPrice(symbol, mid, bid, ask, "redis-relay");
+  applyRelayedTick(liquidityCore, feedHealthMonitor, symbol, mid, bid, ask);
 }
 
 // CRITICAL_REMEDIATION (C11): applies a spread-widening event relayed from
@@ -1921,6 +1942,12 @@ async function shutdown(signal: string): Promise<void> {
   }
 
   // 3. Stop market data feeds (no more price ticks)
+  // Release TwelveData feed leadership FIRST, before stopping feedManager
+  // itself — a clean release frees the lease immediately (the next
+  // healthy replica can take over within one poll interval) instead of
+  // making every other replica wait out the full lock TTL for a graceful
+  // exit that could have told them right away.
+  await feedLeaderElection.stop().catch(() => { /* ignore */ });
   feedManager.stop();
   feedHealthMonitor.stop();
 

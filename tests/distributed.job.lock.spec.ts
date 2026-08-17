@@ -589,3 +589,60 @@ describe("Lua release script", () => {
     await expect(lock.release()).resolves.toBeUndefined(); // still non-fatal
   });
 });
+
+// ─── 9. isStillLeader() — MULTI-REPLICA TWELVEDATA REMEDIATION ────────────────
+// Read-only ownership probe added for market-data/feed.leader.election.ts's
+// long-lived leadership use case (as opposed to this class's original
+// one-shot "acquire, do work, release" job usage, where a missed renewal
+// silently just means the job skips a tick — no active external resource
+// to shut down, so no caller ever needed to be TOLD loss happened before
+// this).
+
+describe("isStillLeader()", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getRedisMock.mockReturnValue(mockRedis);
+  });
+
+  it("returns true when Redis still holds this instance's exact leaseId", async () => {
+    mockRedis.set.mockResolvedValue("OK");
+    const lock = new DistributedJobLock("test-job");
+    await lock.tryAcquire();
+
+    mockRedis.get.mockResolvedValue((lock as unknown as { leaseId: string }).leaseId);
+    await expect(lock.isStillLeader()).resolves.toBe(true);
+  });
+
+  it("returns false when Redis holds a DIFFERENT leaseId (another instance won a race / took over after expiry)", async () => {
+    mockRedis.set.mockResolvedValue("OK");
+    const lock = new DistributedJobLock("test-job");
+    await lock.tryAcquire();
+
+    mockRedis.get.mockResolvedValue("some-other-instances-lease-id");
+    await expect(lock.isStillLeader()).resolves.toBe(false);
+  });
+
+  it("returns false when this instance never successfully acquired (no leaseId)", async () => {
+    const lock = new DistributedJobLock("test-job");
+    // tryAcquire() never called — leaseId is null.
+    await expect(lock.isStillLeader()).resolves.toBe(false);
+  });
+
+  it("fails closed (returns false, not throws) when Redis errors on the ownership check — uncertainty must never be read as 'still leader'", async () => {
+    mockRedis.set.mockResolvedValue("OK");
+    const lock = new DistributedJobLock("test-job");
+    await lock.tryAcquire();
+
+    mockRedis.get.mockRejectedValue(new Error("Connection is closed."));
+    await expect(lock.isStillLeader()).resolves.toBe(false);
+  });
+
+  it("returns false when Redis is unavailable", async () => {
+    mockRedis.set.mockResolvedValue("OK");
+    const lock = new DistributedJobLock("test-job");
+    await lock.tryAcquire();
+
+    getRedisMock.mockReturnValue(null);
+    await expect(lock.isStillLeader()).resolves.toBe(false);
+  });
+});

@@ -126,6 +126,36 @@ export class DistributedJobLock {
   }
 
   /**
+   * Check whether this instance still holds the lock, WITHOUT renewing or
+   * attempting to acquire it. Read-only ownership probe.
+   *
+   * MULTI-REPLICA TWELVEDATA REMEDIATION (market-data/feed.leader.election.ts):
+   * startRenewal()'s own interval already no-ops safely once ownership is
+   * lost (it only extends the TTL "if (current === leaseId)"), but it never
+   * tells the CALLER that loss happened -- fine for the short-lived,
+   * one-shot jobs this class was originally written for (a missed renewal
+   * just means the job doesn't run next tick, no active resource to shut
+   * down), but not fine for a long-lived leader holding open an external
+   * connection (exactly one must ever be active at a time -- see
+   * FeedLeaderElection's own docstring). This lets a long-lived leader
+   * poll for silent loss and react (stop its own connection) instead of
+   * only ever finding out indirectly. Fails closed: any uncertainty
+   * (no lock, no lease, Redis error) reports "not leader", since assuming
+   * leadership was lost and briefly pausing is always safer here than
+   * assuming it's still held and risking two concurrent leaders.
+   */
+  async isStillLeader(): Promise<boolean> {
+    const redis = getRedis();
+    if (!redis || !this.leaseId) return false;
+    try {
+      const current = await redis.get(this.key);
+      return current === this.leaseId;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Release the lock.  Only deletes the key if this process still holds it
    * (atomic Lua script prevents releasing a lock acquired by a different worker
    * after a TTL expiry + re-acquisition).
