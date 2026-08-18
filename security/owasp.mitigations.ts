@@ -229,6 +229,7 @@ export const EXTERNAL_DOMAIN_ALLOWLIST = new Set([
   "api.sumsub.com",
   "api.twelvedata.com",
   "finnhub.io",
+  "ws.finnhub.io", // STAGING ONLY — market-data/feeds/finnhub.feed.ts's WebSocket host
   "www.investing.com",
   "api.exchangerate-api.com",
   "calendarific.com",

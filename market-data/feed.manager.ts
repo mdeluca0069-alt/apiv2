@@ -15,6 +15,17 @@
  * instead of via Finnhub's Binance passthrough, for the same reason: a more
  * reliable, plan-restriction-free source.
  *
+ * STAGING-ONLY Finnhub source (finnhub-ws / finnhub-rest, below): a
+ * SEPARATE, opt-in adapter used only to demonstrate this engine works
+ * end-to-end against a provider other than TwelveData, scoped to the 5 US
+ * equities Finnhub Free reliably streams (AAPL, MSFT, NVDA, TSLA, AMZN) —
+ * NOT a replacement for the PRIMARY/SECONDARY/TERTIARY lineup above, and
+ * inert unless MARKET_DATA_STAGING_PROVIDER=finnhub (main.ts). Gated behind
+ * its own FeedLeaderElection instance (jobId "market-data-finnhub",
+ * separate from TwelveData's lease) for the same reason TwelveData is
+ * leader-gated: avoid N replicas opening N redundant connections against
+ * one API key. See FINNHUB_STAGING_IMPLEMENTATION_REPORT.md.
+ *
  * Each feed independently calls `ingestExternalPrice()` on the liquidity core
  * so any live source keeps quotes fresh (STALE_THRESHOLD_MS resets on each tick).
  *
@@ -38,6 +49,11 @@ import { fetchCurrentPrices } from "./feeds/twelvedata.rest.js";
 import { eventBus }         from "../events-bus/event.bus.js";
 import { feedCircuit }      from "../shared/feed.circuit.js";
 import { immutableAudit }   from "../security/immutable.audit.js";
+// STAGING-ONLY (see this file's header comment) — only ever instantiated
+// when FeedManagerOptions.finnhub is set, which main.ts only does behind
+// MARKET_DATA_STAGING_PROVIDER=finnhub.
+import { FinnhubFeed }                                     from "./feeds/finnhub.feed.js";
+import { fetchCurrentPrices as fetchFinnhubCurrentPrices } from "./feeds/finnhub.rest.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -50,9 +66,16 @@ const HEALTH_CHECK_INTERVAL_MS = 5_000;     // How often to evaluate feed health
 const CIRCUIT_BREAK_MS         = 120_000;   // Time with ALL feeds dead → open circuit (2 min, up from 1 min)
 const FEED_DEAD_THRESHOLD_MS   = 60_000;    // A feed is "dead" if no quotes for this long (up from 30s)
 
+// STAGING ONLY — Finnhub Free has no batch /quote endpoint (one HTTP call
+// per symbol, see finnhub.rest.ts), so its tertiary poll interval is its
+// own separate constant, deliberately conservative: 5 symbols × one poll
+// every 60s is nowhere near the free-tier per-minute cap, and this feed's
+// role is fallback only — real-time coverage already comes from finnhub-ws.
+const FINNHUB_REST_ROTATION_MS = 60_000;
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type FeedName = "twelvedata-ws" | "binance-ws" | "twelvedata-rest";
+export type FeedName = "twelvedata-ws" | "binance-ws" | "twelvedata-rest" | "finnhub-ws" | "finnhub-rest";
 
 export type FeedHealth = {
   name:        FeedName;
@@ -83,6 +106,20 @@ export type FeedManagerOptions = {
    * priority one's more recent data purely by arriving later at the server.
    */
   ingestPrice: (symbol: string, mid: number, bid?: number, ask?: number, source?: FeedName) => void;
+  /**
+   * STAGING ONLY. When set, enables the Finnhub Free adapter (finnhub-ws +
+   * finnhub-rest) as an additional, leader-gated source — see this file's
+   * header comment. `undefined` (the default) leaves FeedManager's
+   * behavior byte-identical to before this option existed: no Finnhub
+   * class is ever constructed, no timer is ever started. main.ts only
+   * supplies this when MARKET_DATA_STAGING_PROVIDER=finnhub AND
+   * FINNHUB_API_KEY are both set.
+   */
+  finnhub?: {
+    apiKey:     string;
+    wsSymbols:  string[];
+    restSymbols: string[];
+  };
 };
 
 // ─── Per-feed stats ───────────────────────────────────────────────────────────
@@ -111,6 +148,8 @@ export class FeedManager {
     "twelvedata-ws":   new FeedStats(),
     "binance-ws":      new FeedStats(),
     "twelvedata-rest": new FeedStats(),
+    "finnhub-ws":      new FeedStats(),
+    "finnhub-rest":    new FeedStats(),
   };
 
   private wsFeed:        TwelveDataFeed | null = null;
@@ -119,10 +158,15 @@ export class FeedManager {
   private healthTimer:   NodeJS.Timeout | null = null;
   private restBatchIdx   = 0;  // rotating batch pointer
 
+  // STAGING ONLY — see FeedManagerOptions.finnhub's own docstring.
+  private finnhubFeed:      FinnhubFeed | null = null;
+  private finnhubRestTimer: NodeJS.Timeout | null = null;
+
   private circuitOpen     = false;
   private allDeadSince: number | null = null;
   private running         = false;
   private primaryRunning  = false;
+  private finnhubRunning  = false;
 
   constructor(private readonly opts: FeedManagerOptions) {}
 
@@ -194,9 +238,50 @@ export class FeedManager {
     return this.primaryRunning;
   }
 
+  /**
+   * STAGING ONLY. Starts the Finnhub WS + REST-tertiary adapter. Call only
+   * when this replica currently holds Finnhub feed leadership (jobId
+   * "market-data-finnhub", separate lease from TwelveData's — see
+   * main.ts). No-op if `opts.finnhub` was never supplied (the default) —
+   * mirrors startPrimary()'s idempotency/gating contract exactly.
+   */
+  startFinnhub(): void {
+    if (!this.opts.finnhub) return;
+    if (this.finnhubRunning) return;
+    this.finnhubRunning = true;
+
+    this._startFinnhubFeed();
+    this._startFinnhubRestPolling();
+
+    console.log("[feed-manager] Finnhub (STAGING) started — this replica is Finnhub feed leader");
+  }
+
+  /**
+   * STAGING ONLY. Stops the Finnhub adapter. Call the instant this
+   * replica loses Finnhub feed leadership — same invariant as
+   * stopPrimary(): at most one replica ever holds an active Finnhub
+   * connection at a time.
+   */
+  stopFinnhub(): void {
+    if (!this.finnhubRunning) return;
+    this.finnhubRunning = false;
+
+    this.finnhubFeed?.stop();
+    this.finnhubFeed = null;
+    if (this.finnhubRestTimer) { clearInterval(this.finnhubRestTimer); this.finnhubRestTimer = null; }
+
+    console.log("[feed-manager] Finnhub (STAGING) stopped — this replica is no longer Finnhub feed leader");
+  }
+
+  /** STAGING ONLY. Whether this replica currently runs the Finnhub adapter. */
+  isFinnhubRunning(): boolean {
+    return this.finnhubRunning;
+  }
+
   stop(): void {
     this.running = false;
     this.stopPrimary();
+    this.stopFinnhub();
     this.binanceFeed?.stop();
     if (this.healthTimer) clearInterval(this.healthTimer);
     console.log("[feed-manager] stopped");
@@ -238,7 +323,7 @@ export class FeedManager {
 
   getHealth(): FeedManagerHealth {
     const now    = Date.now();
-    const feeds  = (["twelvedata-ws", "binance-ws", "twelvedata-rest"] as FeedName[]).map((name) => {
+    const feeds  = (["twelvedata-ws", "binance-ws", "twelvedata-rest", "finnhub-ws", "finnhub-rest"] as FeedName[]).map((name) => {
       const s = this.stats[name];
       return {
         name,
@@ -367,6 +452,70 @@ export class FeedManager {
     }
   }
 
+  // ── STAGING ONLY: Finnhub WS + REST-tertiary (opt-in, leader-gated) ───────
+
+  private _startFinnhubFeed(): void {
+    const cfg = this.opts.finnhub;
+    if (!cfg) return;
+
+    this.finnhubFeed = new FinnhubFeed({
+      apiKey:  cfg.apiKey,
+      symbols: cfg.wsSymbols,
+      onQuote: (q) => {
+        this.stats["finnhub-ws"].record();
+        this._closeCircuit("finnhub-ws");
+        this.opts.ingestPrice(q.symbol, q.mid, q.bid, q.ask, "finnhub-ws");
+      },
+      onError: (err) => {
+        this.stats["finnhub-ws"].error();
+        console.warn("[feed-manager] Finnhub-WS (STAGING) error:", err.message);
+      },
+      onReconnect: (attempt) => {
+        console.warn(`[feed-manager] Finnhub-WS (STAGING) reconnect attempt #${attempt}`);
+      },
+    });
+
+    this.finnhubFeed.start();
+  }
+
+  private _startFinnhubRestPolling(): void {
+    const cfg = this.opts.finnhub;
+    if (!cfg) return;
+
+    // Call immediately, then every FINNHUB_REST_ROTATION_MS. No batching —
+    // Finnhub Free's /quote has no batch endpoint, and the staging symbol
+    // set (5 equities) is small enough that a single sequential pass per
+    // cycle is already well under the free-tier rate limit (see
+    // finnhub.rest.ts's own header comment).
+    void this._pollFinnhubRestBatch();
+    this.finnhubRestTimer = setInterval(() => void this._pollFinnhubRestBatch(), FINNHUB_REST_ROTATION_MS);
+    console.log(`[feed-manager] Finnhub-REST (STAGING) polling every ${FINNHUB_REST_ROTATION_MS}ms (${cfg.restSymbols.length} symbols, sequential)`);
+  }
+
+  private async _pollFinnhubRestBatch(): Promise<void> {
+    const cfg = this.opts.finnhub;
+    if (!cfg || !this.finnhubRunning) return;
+
+    try {
+      const prices = await fetchFinnhubCurrentPrices(cfg.apiKey, cfg.restSymbols);
+
+      if (prices.size === 0) {
+        this.stats["finnhub-rest"].error();
+        return;
+      }
+
+      for (const [sym, price] of prices) {
+        if (price > 0) {
+          this.stats["finnhub-rest"].record();
+          this._closeCircuit("finnhub-rest");
+          this.opts.ingestPrice(sym, price, undefined, undefined, "finnhub-rest");
+        }
+      }
+    } catch {
+      this.stats["finnhub-rest"].error();
+    }
+  }
+
   // ── Health monitor + circuit breaker ──────────────────────────────────────
 
   private _startHealthMonitor(): void {
@@ -375,7 +524,18 @@ export class FeedManager {
 
   private _checkHealth(): void {
     const now   = Date.now();
-    const allFeeds = ["twelvedata-ws", "binance-ws", "twelvedata-rest"] as FeedName[];
+    // NOTE: finnhub-ws/finnhub-rest are included here for completeness, but
+    // this does NOT change circuit-breaker behavior when Finnhub is
+    // disabled (the default/production path): .every() requires ALL
+    // listed feeds dead before opening the circuit, and finnhub-ws/
+    // finnhub-rest are PERMANENTLY "dead" (no lastQuoteAt ever recorded)
+    // whenever opts.finnhub is unset — two permanently-true entries added
+    // to an .every() check can only ever make the overall result depend
+    // on the OTHER three exactly as before; they can never be the reason
+    // the check flips from false to true, since they never contribute a
+    // "not dead" that would need offsetting. Proven by
+    // feed.manager.finnhub.gating.spec.ts's dedicated regression test.
+    const allFeeds = ["twelvedata-ws", "binance-ws", "twelvedata-rest", "finnhub-ws", "finnhub-rest"] as FeedName[];
     const allDead  = allFeeds.every((name) => this.stats[name].status(now) === "dead");
 
     if (allDead) {

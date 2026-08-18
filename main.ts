@@ -176,6 +176,14 @@ const port               = Number(process.env.PORT ?? 3000);
 const corsOrigin         = process.env.CORS_ORIGIN ?? "http://localhost:5173";
 const liveTradingEnabled = resolveLiveTradingEnabled();
 const twelvedataKey      = process.env.TWELVEDATA_API_KEY ?? "";
+// STAGING ONLY — activates market-data/feeds/finnhub.feed.ts +
+// finnhub.rest.ts as an additional, leader-elected market-data source (see
+// market-data/feed.manager.ts's header comment and
+// FINNHUB_STAGING_IMPLEMENTATION_REPORT.md). Absent, both consts below are
+// declared but never change any behavior below — TwelveData/Binance are
+// unaffected either way.
+const marketDataStagingProvider = process.env.MARKET_DATA_STAGING_PROVIDER ?? "";
+const finnhubKey                = process.env.FINNHUB_API_KEY ?? "";
 const quoteIntervalMs    = Number(process.env.QUOTE_INTERVAL_MS ?? 1000);
 const signalIntervalMs   = Number(process.env.SIGNAL_INTERVAL_MS ?? 60_000);
 
@@ -712,6 +720,16 @@ void _TWELVEDATA_SYMBOLS_ALL; // referenced by paid-plan upgrade comment above
 // Upgrade to TwelveData Basic ($8/mo) to unlock full real-time WS coverage.
 const TWELVEDATA_WS_SYMBOLS = ["EUR/USD", "XAU/USD", "BTC/USD", "AAPL"];
 
+// STAGING ONLY: Finnhub Free equities used to demonstrate the Market Data
+// Engine works end-to-end with a provider other than TwelveData. Active
+// only when MARKET_DATA_STAGING_PROVIDER=finnhub AND FINNHUB_API_KEY are
+// both set (see the `finnhub:` option passed to FeedManager below) — do
+// NOT assume EUR/USD, XAU/USD, US500, DE40, or any other forex/index/
+// commodity symbol is available on Finnhub's free plan without a live
+// verification (see FINNHUB_STAGING_IMPLEMENTATION_REPORT.md's
+// "Limitazioni Finnhub Free" section).
+const FINNHUB_STAGING_SYMBOLS = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"];
+
 const liquidityCore = new InternalLiquidityCore({
   symbols:  SYMBOLS,
   tickMs:   quoteIntervalMs,
@@ -849,10 +867,17 @@ if (twelvedataKey) {
 // Frankfurter integration exists — those were an earlier design replaced by
 // TwelveData+Binance. All feeds independently call ingestExternalPrice() so
 // any live source keeps quoteCache fresh (STALE_THRESHOLD_MS resets on each tick).
+const finnhubStagingEnabled = marketDataStagingProvider === "finnhub" && !!finnhubKey;
+
 const feedManager = new FeedManager({
   apiKey:        twelvedataKey,
   symbols:       SYMBOLS,               // all 22 instruments
   wsSymbols:     TWELVEDATA_WS_SYMBOLS, // WS limited to 8 on free plan
+  // STAGING ONLY — undefined (the default) leaves FeedManager's behavior
+  // byte-identical to before this option existed. See FeedManagerOptions.
+  finnhub: finnhubStagingEnabled
+    ? { apiKey: finnhubKey, wsSymbols: FINNHUB_STAGING_SYMBOLS, restSymbols: FINNHUB_STAGING_SYMBOLS }
+    : undefined,
   ingestPrice: (symbol, mid, bid, ask, source) => {
     // MARKET_DATA_FREEZE.md §0.2: normalize once, here, before handing the
     // symbol to EITHER consumer. feedHealthMonitor used to receive the raw
@@ -909,6 +934,23 @@ feedLeaderElection.start({
   onLoseLeadership: () => feedManager.stopPrimary(),
 });
 (globalThis as Record<string, unknown>).__feedLeaderElection = feedLeaderElection;
+
+// STAGING ONLY: a SEPARATE FeedLeaderElection instance, own jobId
+// ("market-data-finnhub" — distinct lease from TwelveData's
+// FEED_LEADER_JOB_ID, no shared state, no new lock mechanism, reuses
+// DistributedJobLock exactly as FeedLeaderElection already does). Only
+// constructed/started when finnhubStagingEnabled — when
+// MARKET_DATA_STAGING_PROVIDER is unset (or FINNHUB_API_KEY is missing),
+// `finnhubLeaderElection` stays null and every `?.` call below is a no-op:
+// no timer, no Redis key, no WebSocket connection, on every replica.
+const finnhubLeaderElection = finnhubStagingEnabled
+  ? new FeedLeaderElection("market-data-finnhub")
+  : null;
+finnhubLeaderElection?.start({
+  onBecomeLeader:   () => feedManager.startFinnhub(),
+  onLoseLeadership: () => feedManager.stopFinnhub(),
+});
+(globalThis as Record<string, unknown>).__finnhubLeaderElection = finnhubLeaderElection;
 
 // ─── Adaptive Intelligence: warm calendar + weights from DB ─────────────────
 await Promise.all([
@@ -1948,6 +1990,8 @@ async function shutdown(signal: string): Promise<void> {
   // making every other replica wait out the full lock TTL for a graceful
   // exit that could have told them right away.
   await feedLeaderElection.stop().catch(() => { /* ignore */ });
+  // STAGING ONLY — no-op when finnhubLeaderElection is null (the default).
+  await finnhubLeaderElection?.stop().catch(() => { /* ignore */ });
   feedManager.stop();
   feedHealthMonitor.stop();
 
